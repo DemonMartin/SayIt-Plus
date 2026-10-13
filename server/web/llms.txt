@@ -1,0 +1,74 @@
+# SayIt
+
+> SayIt is a free, open-source (AGPL-3.0) voice typing app for Windows 10 and 11. Press a shortcut in any app, speak, and SayIt transcribes, cleans up and types polished text at the cursor. Speech recognition runs locally on your PC, through your own cloud API keys, or on a SayIt server (the public trial server or one you host).
+
+SayIt 是一款免费开源的 Windows 语音输入法：在任何应用里按快捷键说话，整理好的文字直接输入到光标处。中文介绍：https://sayitapp.site/zh/
+
+## Key facts
+
+- Platform: Windows 10 and Windows 11 only. No macOS, Linux or mobile version.
+- Price: free, no account, no subscription. Licensed under AGPL-3.0.
+- Not an input method: it runs on a global shortcut next to whatever keyboard or IME you already use.
+- Default shortcut: press Right Alt once to start and again to finish; hold-to-talk is available on a separate shortcut.
+- Common use: dictating prompts to AI coding tools such as Claude Code, Codex, Kiro and Cursor. It types at the cursor, so terminals, IDEs, browsers and chat apps all work.
+- AI cleanup removes filler words, follows self-corrections, formats spoken lists and fixes names and terms. Every prompt is editable, prompts can switch per app, and cleanup can be turned off.
+- Local mode: seven GGUF models (Parakeet Unified EN, SenseVoice Small, Fun-ASR Nano, Nemotron 3.5 ASR with 32 languages, three Qwen3-ASR sizes). About 9 s of speech is transcribed in under a second on a CPU; a GPU is used when present.
+- Cloud API mode: speech recognition with your own keys for Doubao, Qwen, OpenAI, Gemini, OpenRouter, Xiaomi MiMo, Groq Whisper or any OpenAI-compatible endpoint; audio goes straight to the provider.
+- Cleanup prompts are fully editable: built-in styles (intent cleanup, faithful proofread, Chinese to English, conversational) can be changed, new ones written from scratch, and a different one picked automatically per app.
+- Server mode is the default and connects to the public trial server; teams can host their own with Docker Compose (FastAPI, WebSocket, Qwen3-ASR with vLLM, NVIDIA GPU with 16 GB+ VRAM recommended) so audio and text stay inside the company network.
+- Other features: context-aware writing (off by default), speak to edit a selection, hotwords, live captions in the overlay, searchable local history with re-transcribe.
+- App interface languages: English and Simplified Chinese.
+- Server benchmark (Qwen3-ASR-1.7B + vLLM, NVIDIA A10G 24 GB): 30 s audio ~0.8 s, 1 min ~1.6 s, 5 min ~3.0 s.
+
+## Links
+
+- [Download the latest Windows release](https://github.com/crosswk/SayIt/releases/latest)
+- [Source code on GitHub](https://github.com/crosswk/SayIt)
+- [README](https://github.com/crosswk/SayIt#readme): overview, modes, models and self-hosting
+- [README in Chinese](https://github.com/crosswk/SayIt/blob/main/README.zh-CN.md)
+- [Server guide](https://github.com/crosswk/SayIt/blob/main/server/README.md): configuration, deployment, security and API
+- [Changelog](https://github.com/crosswk/SayIt/blob/main/CHANGELOG.md)
+- [Speech recognition setup, in Chinese](https://github.com/crosswk/SayIt/blob/main/docs/SayIt%20%E8%AF%AD%E9%9F%B3%E8%AF%86%E5%88%AB%E9%85%8D%E7%BD%AE.md)
+- [AI cleanup provider setup, in Chinese](https://github.com/crosswk/SayIt/blob/main/docs/SayIt%20AI%20%E6%B6%A6%E8%89%B2%E4%BE%9B%E5%BA%94%E5%95%86%E9%85%8D%E7%BD%AE.md)
+
+## FAQ
+
+### Is it free?
+
+Yes. SayIt is free and open source, with no account to create. Only in Cloud API mode do you pay, and then you pay your provider directly for what you use.
+
+### Are my recordings kept?
+
+Your history and recordings stay on your own PC. In Local mode the audio never leaves it; in Cloud API mode it goes straight to your provider; in Server mode the server recognizes it and does not keep it.
+
+### Is there a Mac or phone version?
+
+Not yet. SayIt runs on Windows 10 and Windows 11 only.
+
+### Do I have to replace my keyboard or input method?
+
+No. SayIt only takes a shortcut. Keep typing as you do now, and press the shortcut when you want to talk.
+
+### Does it work in Claude Code, Codex and Kiro?
+
+Yes. Text lands at the cursor, so terminals, IDEs, browsers and chat apps all work. The built-in conversational preset is made for instructing AI tools, and presets can switch per app.
+
+### How does the shortcut work?
+
+Press Right Alt once to start and again to finish, and the cleaned-up text is typed for you. You can also set a separate hold-to-talk key, and either one can be another key or a mouse side button.
+
+### Do I need a powerful PC?
+
+No, and no GPU either. Server mode and Cloud API mode ask nothing of your PC. Local mode runs on the CPU and uses a GPU when there is one.
+
+### Which languages does it understand?
+
+English, Chinese and a mix of the two all work well. For other languages it depends on the model: Nemotron 3.5 on your PC covers 32, and cloud providers such as OpenAI and Gemini cover more.
+
+### How do we run it inside our company?
+
+Set up one NVIDIA GPU server with 16 GB of VRAM or more and start it with one Docker Compose command. Teammates enter its address under Voice engine → Server mode.
+
+### How does it compare with Typeless or Wispr Flow?
+
+It does the same job. They are subscription cloud services; SayIt is free and open source, lets you write your own prompts, and can recognize speech on your PC or your company’s network. It is Windows only for now.

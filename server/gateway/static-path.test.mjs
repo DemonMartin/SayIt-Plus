@@ -82,7 +82,22 @@ test("unknown paths keep falling back to index.html", () => {
   assert.deepEqual(resolveStaticRequest("/a/b/c", web), { status: 200, file: indexFile() });
 });
 
-test("requesting a directory stays 404 like before", () => {
+test("requesting a directory without index.html stays 404 like before", () => {
   rejected("/fonts", 404);
   rejected("/fonts/", 404);
+});
+
+test("a directory with index.html is served as a page", () => {
+  const zh = path.join(web, "zh");
+  fs.mkdirSync(zh, { recursive: true });
+  fs.writeFileSync(path.join(zh, "index.html"), "ZH");
+  assert.deepEqual(resolveStaticRequest("/zh/", web), { status: 200, file: fs.realpathSync(path.join(zh, "index.html")) });
+  assert.deepEqual(resolveStaticRequest("/zh/?utm=x", web), { status: 200, file: fs.realpathSync(path.join(zh, "index.html")) });
+});
+
+test("a page directory without the trailing slash redirects to it", () => {
+  assert.deepEqual(resolveStaticRequest("/zh", web), { status: 301, location: "/zh/" });
+  assert.deepEqual(resolveStaticRequest("/zh?utm=x", web), { status: 301, location: "/zh/?utm=x" });
+  // 原样拼接会得到 "//zh/"，浏览器会把它当成跳到名为 zh 的主机
+  assert.deepEqual(resolveStaticRequest("//zh", web), { status: 301, location: "/zh/" });
 });

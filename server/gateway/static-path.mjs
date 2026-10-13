@@ -50,8 +50,26 @@ export function resolveStaticRequest(rawUrl, rootDir) {
   }
   if (!isInside(real, realRoot)) return { status: 404 };
 
-  // 请求目录：原来的实现读目录会失败并回 404，保持一致
-  if (fs.statSync(real).isDirectory()) return { status: 404 };
+  if (fs.statSync(real).isDirectory()) {
+    // 目录只在里面有 index.html 时才当页面服务（/zh/ 是中文首页）；其余目录保持原来的 404。
+    const indexFile = path.join(real, "index.html");
+    if (!fs.existsSync(indexFile) || !fs.statSync(indexFile).isFile()) return { status: 404 };
+    if (!raw.endsWith("/")) {
+      // 补斜杠再跳，否则页面里的相对路径会按上一级解析。跳转地址由规范化后的路径段重建，
+      // 不直接拼原始路径：原样拼 "//zh" 会得到 "//zh/"，浏览器会把它当成跳到别的域名。
+      const segs = rel.split(/[\\/]+/).filter(Boolean).map(encodeURIComponent);
+      const query = String(rawUrl || "").includes("?") ? "?" + String(rawUrl).split("?")[1].split("#")[0] : "";
+      return { status: 301, location: "/" + segs.join("/") + "/" + query };
+    }
+    let realIndex;
+    try {
+      realIndex = fs.realpathSync(indexFile);
+    } catch {
+      return { status: 404 };
+    }
+    if (!isInside(realIndex, realRoot)) return { status: 404 };
+    return { status: 200, file: realIndex };
+  }
 
   return { status: 200, file: real };
 }

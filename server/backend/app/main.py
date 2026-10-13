@@ -1159,11 +1159,28 @@ async def ws_transcribe(ws: WebSocket):
 _WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 
 
+# Pages must be revalidated on every visit. Sent without Cache-Control, a browser caches them by
+# heuristic (a fraction of their age) and keeps showing the previous build after a deploy: a review
+# on 2026-10-19 reopened /zh/ with no request reaching the server at all. CSS and JS carry a content
+# hash in their URL, so only HTML needs this. The gateway already sends no-cache for everything.
+_PAGE_CACHE = {"Cache-Control": "no-cache"}
+
+
+class _SiteFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.media_type == "text/html" or response.headers.get("content-type", "").startswith("text/html"):
+            response.headers.update(_PAGE_CACHE)
+        return response
+
+
 @app.get("/")
 async def index():
-    return FileResponse(_WEB_DIR / "index.html")
+    return FileResponse(_WEB_DIR / "index.html", headers=_PAGE_CACHE)
 
 
-# Mount static assets (js, css, images) — must be after all API routes
+# Mount static assets (js, css, images) — must be after all API routes.
+# html=True serves a directory's index.html (the Chinese homepage is /zh/) and redirects /zh to /zh/.
+# The gateway (server/gateway/static-path.mjs) mirrors this; keep the two in step.
 if _WEB_DIR.is_dir():
-    app.mount("/", StaticFiles(directory=str(_WEB_DIR)), name="static")
+    app.mount("/", _SiteFiles(directory=str(_WEB_DIR), html=True), name="static")

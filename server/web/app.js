@@ -1,812 +1,1603 @@
-/* SayIt Web Demo */
-const PROMPTS = {
-  en: {
-    faithful: 'You are a speech-to-text post-processing assistant. Correct clear recognition errors while preserving the speaker\'s original wording.\n\nRules:\n1. Fix only obvious transcription errors, including names and technical terms.\n2. Add punctuation and sensible spacing.\n3. Keep filler words, repetition, hesitation, and sentence structure.\n4. Do not answer, explain, summarize, or continue the content.\n\nReturn only the corrected transcript.',
-    intent: 'You refine raw speech-to-text output into clean, ready-to-use writing. Preserve every meaningful detail while removing speech noise and recognition errors.\n\nRules:\n1. Remove filler words, empty repetition, and hesitation.\n2. Follow self-corrections and keep only the speaker\'s final wording.\n3. Fix obvious recognition errors, names, capitalization, numbers, and times.\n4. Add punctuation and paragraphs where useful.\n5. Turn clearly structured points into a numbered list.\n\nDo not add new information, change the core meaning, answer questions, explain, summarize, or continue the content.\n\nReturn only the refined text.',
-  },
-  'zh-CN': {
-    faithful: '你是语音转文字的后处理助手。输入是 ASR 语音识别的原始文本，你的任务是修正识别错误，尽量保留用户的原始表达。\n\n规则：\n1. 只修正明显的识别错误：错别字、同音字、音近字、专有名词。\n2. 添加标点符号。中英文混合时保留合理空格。\n3. 不要删除口头禅、重复或犹豫，不要改写句式。\n4. 不要回答、解释、总结或续写文本中的内容。\n\n只输出修正后的文本。',
-    intent: '你是语音文本精炼助手。输入是 ASR 语音识别的原始转写，你的任务是清洗为可直接使用的干净文本。\n核心原则：保留用户全部有效信息，只清除语音噪声和识别错误。\n\n处理规则：\n1. 移除口语填充词（嗯、啊、那个、就是说、然后呢）和无意义的重复、犹豫。\n2. 识别自我修正——"不对"、"不是"、"应该是"、"改到"后以最终表达为准，删除前序错误。\n3. 修正明显的语音识别错误：同音字、音近字、专有名词、英文大小写、数字和时间。\n4. 添加标点符号，必要时分段。中英文混合保留合理空格。\n5. 检测到"第一/第二/首先/然后"等结构化表达时，输出为有序列表。\n\n约束：\n- 不添加原文没有的内容，不改变用户核心语义\n- 不回答、解释、总结或续写文本中提到的问题\n\n只输出精炼后的文本。',
-  },
-}
+/* SayIt public site: download link, tabs, hero replay, and the browser demo.
+   All copy that crawlers should see lives in the HTML (server/site/build.mjs).
+   This file only holds strings for runtime states. */
+
+const LOCALE = (document.documentElement.lang || 'en').toLowerCase().startsWith('zh') ? 'zh-CN' : 'en'
 
 const MESSAGES = {
   en: {
-    'meta.title': '{app} — Just say it, and write well',
-    'meta.description': 'Open-source voice typing for Windows with local, cloud API, and self-hosted modes. Turn speech into polished text in any app.',
-    'nav.download': 'Download',
-    // The accessible name must be in the language of the page the reader is on.
-    // The visible label deliberately shows the *target* language, but a screen
-    // reader on the English page must not be handed a Chinese string.
-    'language.switch': 'Switch to Chinese',
-    'hero.headline': 'Just say it, and write well',
-    'hero.subheadline': 'Turn speech into polished, ready-to-use text—three times faster than typing.',
-    'modes.title': 'Three modes. Your choice.',
-    'modes.local.title': 'Local mode',
-    'modes.local.desc': 'Speech recognition runs on your device',
-    'modes.cloud.title': 'Cloud API mode',
-    'modes.cloud.desc': 'Use your own ASR and AI provider keys',
-    'modes.server.title': 'Server mode',
-    'modes.server.desc': 'Connect to a public or self-hosted SayIt backend',
-    'features.anywhere': 'Press a shortcut, speak, and the text lands in any app',
-    'features.cleanup': 'AI cleanup turns rough speech into clean writing',
-    'features.fast': 'Get polished text without breaking your flow',
-    'features.rust': 'Lightweight and built with Rust',
-    'demo.title': 'Try it online',
-    'demo.startAria': 'Start recording',
-    'demo.stopAria': 'Stop recording',
-    'demo.start': 'Click to start',
-    'demo.stop': 'Stop recording',
-    'playback.playAria': 'Play',
-    'playback.label': 'Recording',
-    'playback.download': 'Download recording',
-    'result.waiting': 'Waiting for a recording…',
-    'result.receiving': 'Receiving audio…',
-    // Not "no speech was recognized": an empty result can also mean the call failed
-    // on the way (quota exhausted, server closed the stream). Naming a cause we did
-    // not verify sends people off to debug a microphone that is working fine.
-    'result.empty': 'No text came back for this recording.',
-    'result.copy': 'Copy text',
-    'result.copied': 'Copied',
-    'result.rawAsr': 'Raw transcript',
-    'result.recordAgain': 'Record again',
-    'result.audioDuration': 'Audio {seconds}s',
-    'result.processingTime': 'Processed in {seconds}s',
-    'oss.title': 'Open source · Self-hosted · Privacy first',
-    'oss.desc': 'AGPL-3.0 licensed, Docker-ready, and fully under your control.',
-    'status.unavailable': 'Unavailable',
-    'status.connecting': 'Connecting',
-    'status.connectionFailed': 'Connection failed',
-    'status.disconnected': 'Disconnected',
+    'status.unavailable': 'Demo offline',
+    'status.connecting': 'Connecting…',
+    'status.connectionFailed': 'Could not connect',
+    'overlay.listening': 'Listening…',
+    'status.disconnected': 'Disconnected, retrying…',
+    'status.busy': 'Busy right now, retrying shortly…',
+    'status.retry': 'Could not connect. Press record to try again.',
+    'status.dropped': 'Connection lost while recording',
+    'status.rejected': 'Not available on this address',
+    'status.insecure': 'Needs an HTTPS page',
+    'status.quota': 'Demo limit reached for now',
     'status.ready': 'Ready',
     'status.requestFailed': 'Request failed',
-    'status.notReady': 'Service not ready',
-    'status.recording': 'Recording',
-    'status.processing': 'Processing',
-    'status.recordingFailed': 'Recording failed',
-    'status.initFailed': 'Could not initialize',
-    'error.noRecording': 'No recording to replay',
-    'error.wsMissing': 'WebSocket address is not configured',
-    'error.replayTimeout': 'Replay timed out',
-    'error.replayConnection': 'Replay connection failed',
-    'error.replayClosed': 'Replay connection closed',
-    'error.replayFailed': 'Replay failed',
-    'error.config': 'Config request returned {status}',
-    'error.websocket': 'WebSocket connection failed',
-    'error.audioContext': 'This browser does not support AudioContext',
-    'rerun.asrRunning': 'Transcribing again',
-    'rerun.asrFailed': 'Transcription failed',
-    'rerun.aiRunning': 'Cleaning up again',
-    'rerun.aiFailed': 'AI cleanup failed',
-    'rerun.noResult': 'No result was generated.',
+    'status.recording': 'Listening…',
+    'status.processing': 'Transcribing…',
+    'status.recordingFailed': 'Could not start recording',
+    'status.micDenied': 'Microphone access is blocked',
+    'status.initFailed': 'Could not load the demo',
+    'demo.start': 'Start recording',
+    'demo.stop': 'Stop recording',
+    'demo.offline': 'The online demo is offline right now. The desktop app works on its own.',
+    'demo.rejected': 'The online demo can’t be used from this address. The desktop app works on its own.',
+    'demo.insecure': 'Browsers only allow recording on HTTPS pages. Open this site from an https:// address to try it.',
+    'result.receiving': 'Receiving audio…',
+    // Not "no speech was recognized": an empty result can also mean the call failed on the way
+    // (quota exhausted, server closed the stream). Naming a cause we did not verify sends people
+    // off to debug a microphone that works fine.
+    'result.empty': 'No text came back for this recording.',
+    // The app's recording.remainingSeconds.
+    'timer.remaining': '{s}s left',
+    'result.labelRaw': 'Result',
+    'result.labelAi': 'Cleaned up by AI',
+    'result.aiFailed': 'AI cleanup did not go through this time, so this is the raw transcript.',
+    'result.audio': 'Audio {s} s',
+    'result.asr': 'Recognition {s} s',
+    'result.ai': 'AI cleanup {s} s',
+    'copy.copy': 'Copy text',
+    'copy.copied': 'Copied',
+    'error.audioContext': 'This browser cannot record audio here.',
   },
   'zh-CN': {
-    'meta.title': '{app} — 随口说，出色写',
-    'meta.description': '开源 Windows 语音输入工具，支持本地、云 API 和自部署模式，在任何应用中把口语变成可直接使用的文字。',
-    'nav.download': '下载',
-    'language.switch': '切换到英文',
-    'hero.headline': '随口说，出色写',
-    'hero.subheadline': '说话比打字快 3 倍，AI 实时把口语变成可以直接用的书面表达。',
-    'modes.title': '三种模式，按需选择',
-    'modes.local.title': '本地模式',
-    'modes.local.desc': '语音识别在本机运行，数据不出设备',
-    'modes.cloud.title': '云 API 模式',
-    'modes.cloud.desc': '无需 GPU，对接云端 ASR 和 AI',
-    'modes.server.title': '服务器模式',
-    'modes.server.desc': 'Docker 一键部署，GPU 加速推理',
-    'features.anywhere': '按下快捷键说话，文字直接落在任何应用里',
-    'features.cleanup': 'AI 自动去除口头禅，输出书面表达',
-    'features.fast': '说完即出稿，不打断工作流',
-    'features.rust': 'Rust 构建，轻量安全',
-    'demo.title': '在线体验',
-    'demo.startAria': '开始录音',
-    'demo.stopAria': '结束录音',
-    'demo.start': '点击录音体验',
-    'demo.stop': '结束录音',
-    'playback.playAria': '播放',
-    'playback.label': '本次录音',
-    'playback.download': '下载录音',
-    'result.waiting': '等待录音…',
-    'result.receiving': '正在接收语音…',
-    'result.empty': '本次没有识别到有效文本。',
-    'result.copy': '复制文本',
-    'result.copied': '已复制',
-    'result.rawAsr': 'ASR 原文',
-    'result.recordAgain': '重新录音',
-    'result.audioDuration': '语音 {seconds}s',
-    'result.processingTime': '识别 {seconds}s',
-    'oss.title': '开源 · 自托管 · 隐私优先',
-    'oss.desc': 'AGPL-3.0 开源协议，Docker 一键部署，数据完全自控。',
-    'status.unavailable': '未开放',
-    'status.connecting': '连接中',
+    'status.unavailable': '暂未开放',
+    'status.connecting': '连接中…',
     'status.connectionFailed': '连接失败',
-    'status.disconnected': '已断开',
+    'overlay.listening': '正在聆听…',
+    'status.disconnected': '已断开，正在重连…',
+    'status.busy': '体验的人有点多，稍后自动重试…',
+    'status.retry': '没连上，点录音按钮再试一次',
+    'status.dropped': '录音时连接断了',
+    'status.rejected': '当前网址用不了在线体验',
+    'status.insecure': '需要 HTTPS 页面',
+    'status.quota': '体验次数暂时用完了',
     'status.ready': '准备就绪',
     'status.requestFailed': '请求失败',
-    'status.notReady': '服务未就绪',
-    'status.recording': '录音中',
-    'status.processing': '处理中',
-    'status.recordingFailed': '录音失败',
-    'status.initFailed': '初始化失败',
-    'error.noRecording': '没有可回放的录音',
-    'error.wsMissing': 'WebSocket 地址未配置',
-    'error.replayTimeout': '回放请求超时',
-    'error.replayConnection': '回放连接出错',
-    'error.replayClosed': '回放连接已关闭',
-    'error.replayFailed': '回放失败',
-    'error.config': '配置接口返回 {status}',
-    'error.websocket': 'WebSocket 连接失败',
-    'error.audioContext': '浏览器不支持 AudioContext',
-    'rerun.asrRunning': '重新识别中',
-    'rerun.asrFailed': '识别失败',
-    'rerun.aiRunning': '重新润色中',
-    'rerun.aiFailed': '润色失败',
-    'rerun.noResult': '未生成结果。',
+    'status.recording': '正在听…',
+    'status.processing': '识别中…',
+    'status.recordingFailed': '录音没能开始',
+    'status.micDenied': '麦克风权限被拦住了',
+    'status.initFailed': '在线体验加载失败',
+    'demo.start': '开始录音',
+    'demo.stop': '结束录音',
+    'demo.offline': '在线体验暂时关闭了，桌面客户端不受影响。',
+    'demo.rejected': '当前网址暂时用不了在线体验，桌面客户端不受影响。',
+    'demo.insecure': '浏览器只允许在 HTTPS 页面里录音，换成 https:// 开头的网址再试。',
+    'result.receiving': '正在接收语音…',
+    'result.empty': '这次没有返回文字。',
+    'timer.remaining': '剩余 {s}s',
+    'result.labelRaw': '识别结果',
+    'result.labelAi': 'AI 整理后',
+    'result.aiFailed': '这次 AI 整理没成功，显示的是识别原文。',
+    'result.audio': '语音 {s} 秒',
+    'result.asr': '识别 {s} 秒',
+    'result.ai': 'AI 整理 {s} 秒',
+    'copy.copy': '复制文本',
+    'copy.copied': '已复制',
+    'error.audioContext': '这个浏览器在这里录不了音。',
   },
 }
 
-function detectLocale() {
-  const saved = localStorage.getItem('sayit.web.locale')
-  if (saved === 'en' || saved === 'zh-CN') return saved
-  const languages = navigator.languages?.length ? navigator.languages : [navigator.language]
-  return languages.some((tag) => String(tag).toLowerCase().startsWith('zh')) ? 'zh-CN' : 'en'
+const tr = (key, vars = {}) => {
+  const template = MESSAGES[LOCALE][key] ?? MESSAGES.en[key] ?? key
+  return template.replace(/\{(\w+)\}/g, (_, k) => String(vars[k] ?? ''))
+}
+const $ = (id) => document.getElementById(id)
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)')
+
+/* ── Tabs (selector bar, Settings nav, mode radio cards) ─────────────────── */
+
+function initTabs(list) {
+  const tabs = Array.from(list.querySelectorAll('[role="tab"]'))
+  const vertical = list.getAttribute('aria-orientation') === 'vertical'
+  const panelOf = (tab) => document.getElementById(tab.getAttribute('aria-controls'))
+  const select = (tab, focus) => {
+    tabs.forEach((t) => {
+      const on = t === tab
+      t.setAttribute('aria-selected', String(on))
+      t.tabIndex = on ? 0 : -1
+      const panel = panelOf(t)
+      if (panel) panel.hidden = !on
+    })
+    if (focus) tab.focus({ preventScroll: true })
+  }
+  // Keep the chosen item visible when the list scrolls sideways on small screens. Scroll only the
+  // list itself: scrollIntoView would also scroll the page, and on load that jumps past the hero.
+  const reveal = (tab) => {
+    if (list.scrollWidth <= list.clientWidth) return
+    const left = tab.offsetLeft - list.offsetLeft
+    const right = left + tab.offsetWidth
+    if (left < list.scrollLeft) list.scrollLeft = left - 8
+    else if (right > list.scrollLeft + list.clientWidth) list.scrollLeft = right - list.clientWidth + 8
+  }
+  // Without JavaScript every panel stays visible (and readable by crawlers); with it, one at a time.
+  select(tabs.find((t) => t.getAttribute('aria-selected') === 'true') || tabs[0], false)
+  list.addEventListener('click', (e) => {
+    const tab = e.target.closest('[role="tab"]')
+    if (!tab) return
+    select(tab, false)
+    reveal(tab)
+  })
+  list.addEventListener('keydown', (e) => {
+    const i = tabs.indexOf(document.activeElement)
+    if (i < 0) return
+    const next = vertical ? ['ArrowDown', 'ArrowRight'] : ['ArrowRight']
+    const prev = vertical ? ['ArrowUp', 'ArrowLeft'] : ['ArrowLeft']
+    let j = -1
+    if (next.includes(e.key)) j = (i + 1) % tabs.length
+    else if (prev.includes(e.key)) j = (i - 1 + tabs.length) % tabs.length
+    else if (e.key === 'Home') j = 0
+    else if (e.key === 'End') j = tabs.length - 1
+    if (j < 0) return
+    e.preventDefault()
+    select(tabs[j], true)
+    reveal(tabs[j])
+  })
+}
+
+/* ── Overlay waveform: client/src/services/waveform.ts computeBarsFromPCM, ported ──
+   Every bar is the RMS of one slice of the same audio frame, through an adaptive gain, a tanh
+   soft clip and a slight centre bias, then smoothed: fast attack (0.45), slow decay (0.12).
+   That is why the real bars rise together with the voice and sink gently; independent random
+   heights (the previous version) flicker instead. Keep the constants identical to the app. */
+const WAVE = { minHeight: 3, maxHeight: 18, attack: 0.45, decay: 0.12, centerShape: 0.15, gainTarget: 0.7, softClip: 1.5 }
+const makeWave = (n) => ({ prev: Array(n).fill(WAVE.minHeight), peak: 0.05 })
+const resetWave = (s) => {
+  s.prev.fill(WAVE.minHeight)
+  s.peak = 0.05
+}
+function stepWave(s, sliceRms, frameRms) {
+  if (frameRms > s.peak) s.peak += (frameRms - s.peak) * 0.3
+  else s.peak += (frameRms - s.peak) * 0.005
+  s.peak = Math.max(0.02, Math.min(0.5, s.peak))
+  const gain = WAVE.gainTarget / s.peak
+  const n = s.prev.length
+  const center = (n - 1) / 2
+  for (let i = 0; i < n; i++) {
+    const normalized = Math.tanh(sliceRms[i] * gain * WAVE.softClip)
+    const shape = Math.max(0.7, 1 - (Math.abs(i - center) / Math.max(1, center)) * WAVE.centerShape)
+    const target = Math.max(WAVE.minHeight, normalized * WAVE.maxHeight * shape)
+    const prev = s.prev[i]
+    s.prev[i] = target > prev ? prev + (target - prev) * WAVE.attack : prev + (target - prev) * WAVE.decay
+  }
+  return s.prev
+}
+function barsFromPcm(pcm, s) {
+  const n = s.prev.length
+  if (!pcm.length) return s.prev
+  let sum = 0
+  for (let i = 0; i < pcm.length; i++) sum += (pcm[i] / 32768) ** 2
+  const per = Math.max(1, Math.floor(pcm.length / n))
+  const slices = new Array(n)
+  for (let i = 0; i < n; i++) {
+    const start = i * per
+    const end = i === n - 1 ? pcm.length : Math.min(pcm.length, start + per)
+    let acc = 0
+    for (let j = start; j < end; j++) acc += (pcm[j] / 32768) ** 2
+    slices[i] = Math.sqrt(acc / Math.max(1, end - start))
+  }
+  return stepWave(s, slices, Math.sqrt(sum / pcm.length))
+}
+// Slices of one speech frame differ a lot (pitch periods fall across them); silence is flat noise.
+const synthSlices = (frame, n) => Array.from({ length: n }, () => frame * (0.45 + Math.random() * 1.1))
+function paintBars(els, heights) {
+  for (let i = 0; i < els.length; i++) {
+    const h = Math.round(heights[i] ?? WAVE.minHeight)
+    els[i].style.height = `${h}px`
+    els[i].style.opacity = (0.7 + (Math.min(18, h) / 18) * 0.3).toFixed(2)
+  }
+}
+
+/* ── Hero replay ─────────────────────────────────────────────────────────── */
+
+/* The stage replays what the app does, phase for phase (client/src/overlay/Overlay.tsx):
+   preparing (three dots in a 48px pill) -> listening (bars follow the voice; the live caption
+   grows a few characters at a time, the way streaming ASR delivers partial results) ->
+   processing (the progress track) -> the overlay hides and the clean text is pasted in one go.
+   The old version typed character by character into a growing, re-centring bubble with
+   strike-throughs; the owner found it jittery and unlike the app (2026-10-13).
+   Clicking a tab stops the replay and shows that tab's finished frame. */
+function initReplay() {
+  const fig = document.querySelector('[data-replay]')
+  if (!fig) return
+  const tabs = Array.from(fig.querySelectorAll('.switcher [role="tab"]'))
+  const panes = tabs.map((t) => document.getElementById(t.getAttribute('aria-controls')))
+  const cap = fig.querySelector('.ov-cap')
+  const capText = fig.querySelector('[data-cap-text]')
+  const bars = Array.from(fig.querySelectorAll('.ov-bars i'))
+  const timer = fig.querySelector('[data-timer]')
+  if (!tabs.length || panes.some((p) => !p) || !cap || !capText || !timer) return
+
+  const scripts = tabs.map((tab, i) => {
+    const typed = panes[i].querySelector('[data-typed]')
+    return { typedEl: typed, typed: typed.textContent || '', said: tab.dataset.said || '', secs: Number(tab.dataset.secs) || 0 }
+  })
+  const rest = bars.map((b) => [b.style.height, b.style.opacity])
+  const byChar = LOCALE === 'zh-CN'
+  const sim = makeWave(bars.length)
+  let run = 0
+  let tick = 0
+  let wave = 0
+  let level = 0
+  let speaking = false
+
+  // Partial results arrive two to four characters (or one or two words) at a time.
+  const chunks = (text) => {
+    const out = []
+    if (byChar) {
+      const ch = Array.from(text)
+      for (let i = 0; i < ch.length;) {
+        const n = 2 + Math.floor(Math.random() * 3)
+        out.push(ch.slice(i, i + n).join(''))
+        i += n
+      }
+    } else {
+      const words = text.split(/(?<=\s)/)
+      for (let i = 0; i < words.length;) {
+        const n = 1 + Math.floor(Math.random() * 2)
+        out.push(words.slice(i, i + n).join(''))
+        i += n
+      }
+    }
+    return out
+  }
+  // A synthetic voice fed through the app's own bar algorithm every 33ms (the app's frame rate):
+  // syllables at ~4 per second while speaking, near-silence in the pauses.
+  const startWave = () => {
+    clearInterval(wave)
+    resetWave(sim)
+    const t0 = performance.now()
+    wave = setInterval(() => {
+      const t = (performance.now() - t0) / 1000
+      const syllable = 0.35 + 0.65 * Math.abs(Math.sin(t * Math.PI * 4.2 + Math.sin(t * 1.7)))
+      const frame = speaking ? level * syllable * (0.85 + Math.random() * 0.3) : 0.002 + Math.random() * 0.002
+      paintBars(bars, stepWave(sim, synthSlices(frame, bars.length), frame))
+    }, 33)
+  }
+  const stopWave = (atRest) => {
+    clearInterval(wave)
+    bars.forEach((b, i) => {
+      b.style.height = atRest ? rest[i][0] : '3px'
+      b.style.opacity = atRest ? rest[i][1] : '0.75'
+    })
+  }
+  const show = (i) =>
+    tabs.forEach((t, j) => {
+      const on = j === i
+      t.setAttribute('aria-selected', String(on))
+      t.tabIndex = on ? 0 : -1
+      panes[j].hidden = !on
+    })
+  const finish = (i) => {
+    const s = scripts[i]
+    show(i)
+    cap.classList.remove('is-empty')
+    capText.textContent = s.said
+    s.typedEl.textContent = s.typed
+    timer.textContent = `${s.secs}s`
+    stopWave(true)
+  }
+
+  const wait = (ms, id) =>
+    new Promise((resolve, reject) => setTimeout(() => (id === run ? resolve() : reject(new Error('cancelled'))), ms))
+
+  async function playTab(i, id) {
+    const s = scripts[i]
+    show(i)
+    fig.dataset.state = 'idle'
+    s.typedEl.textContent = ''
+    s.typedEl.classList.remove('is-pasted')
+    cap.classList.add('is-empty')
+    capText.textContent = tr('overlay.listening')
+    timer.textContent = '0s'
+    stopWave(false)
+    await wait(700, id)
+    fig.dataset.state = 'preparing'
+    await wait(380, id)
+    fig.dataset.state = 'listening'
+    speaking = false
+    startWave()
+    const started = performance.now()
+    clearInterval(tick)
+    tick = setInterval(() => {
+      timer.textContent = `${Math.floor((performance.now() - started) / 1000)}s`
+    }, 250)
+    await wait(450, id)
+    let shown = ''
+    for (const c of chunks(s.said)) {
+      speaking = true
+      level = 0.05 + Math.random() * 0.04
+      await wait((byChar ? 200 : 220) + Math.random() * 120, id)
+      shown += c
+      cap.classList.remove('is-empty')
+      capText.textContent = shown
+      // A breath after each clause: the bars sink (slowly, as the app's decay does) before the next words.
+      if (/[，。、,.]\s*$/.test(c)) {
+        speaking = false
+        await wait(280, id)
+      }
+    }
+    speaking = false
+    await wait(650, id)
+    clearInterval(tick)
+    stopWave(false)
+    fig.dataset.state = 'thinking'
+    await wait(1300, id)
+    fig.dataset.state = 'done'
+    await wait(180, id)
+    s.typedEl.textContent = s.typed
+    s.typedEl.classList.add('is-pasted')
+    await wait(2600, id)
+  }
+
+  /* Plays Claude Code -> Codex -> Kiro and starts over, for as long as the page is open (owner,
+     2026-10-18: no replay button, keep cycling). It waits while the stage is off screen or the tab
+     is hidden, so a page left open in the background does not keep animating. */
+  let onScreen = false
+  let wake = null
+  const visible = () => onScreen && !document.hidden
+  const whenVisible = (id) =>
+    visible()
+      ? Promise.resolve()
+      : new Promise((resolve, reject) => {
+        wake = () => (id === run ? resolve() : reject(new Error('cancelled')))
+      })
+  const nudge = () => {
+    if (wake && visible()) {
+      const w = wake
+      wake = null
+      w()
+    }
+  }
+
+  async function play(from = 0) {
+    const id = ++run
+    if (wake) {
+      // A pending wait belongs to the run this one replaces.
+      const w = wake
+      wake = null
+      w()
+    }
+    try {
+      for (let i = from; ; i = (i + 1) % scripts.length) {
+        await whenVisible(id)
+        await playTab(i, id)
+      }
+    } catch (_) {
+      /* a newer run took over: a tab was clicked */
+    } finally {
+      if (id === run) {
+        clearInterval(tick)
+        clearInterval(wave)
+      }
+    }
+  }
+
+  // Picking a tool plays it now, then the loop carries on from there.
+  const pick = (i, focus) => {
+    clearInterval(tick)
+    if (focus) tabs[i].focus({ preventScroll: true })
+    if (reduceMotion.matches) {
+      run++
+      finish(i)
+      fig.dataset.state = 'summary'
+      return
+    }
+    void play(i)
+  }
+  tabs.forEach((t, i) => t.addEventListener('click', () => pick(i, false)))
+  fig.querySelector('.switcher').addEventListener('keydown', (e) => {
+    const i = tabs.indexOf(document.activeElement)
+    if (i < 0) return
+    const j = e.key === 'ArrowRight' ? (i + 1) % tabs.length : e.key === 'ArrowLeft' ? (i - 1 + tabs.length) % tabs.length : -1
+    if (j < 0) return
+    e.preventDefault()
+    pick(j, true)
+  })
+
+  if (reduceMotion.matches || !('IntersectionObserver' in window)) return
+  let started = false
+  const io = new IntersectionObserver(
+    (entries) => {
+      onScreen = entries.some((e) => e.isIntersecting)
+      if (onScreen && !started) {
+        started = true
+        void play()
+      }
+      nudge()
+    },
+    { threshold: 0.3 },
+  )
+  io.observe(fig)
+  document.addEventListener('visibilitychange', nudge)
+}
+
+/* ── Copy helpers ────────────────────────────────────────────────────────── */
+
+async function copyText(text, btn) {
+  if (!text) return
+  await navigator.clipboard.writeText(text)
+  btn.classList.add('is-copied')
+  btn.setAttribute('aria-label', tr('copy.copied'))
+  btn.title = tr('copy.copied')
+  setTimeout(() => {
+    btn.classList.remove('is-copied')
+    btn.setAttribute('aria-label', tr('copy.copy'))
+    btn.title = tr('copy.copy')
+  }, 1500)
+}
+
+function initTerminalCopy() {
+  const btn = document.querySelector('[data-copy-terminal]')
+  if (!btn || !navigator.clipboard) return
+  btn.hidden = false
+  btn.addEventListener('click', () => {
+    const lines = Array.from(document.querySelectorAll('.term-body .t-line'))
+      .filter((l) => !l.classList.contains('t-c'))
+      .map((l) => (l.textContent || '').replace(/^\$\s*/, ''))
+    void copyText(lines.join('\n'), btn).catch(() => { })
+  })
+}
+
+/* ── Browser demo ────────────────────────────────────────────────────────── */
+
+const els = {
+  recordButton: $('recordButton'),
+  stateText: $('stateText'),
+  stateDot: $('stateDot'),
+  timer: $('timer'),
+  bars: $('demoBars'),
+  resultText: $('resultText'),
+  resultLabel: $('resultLabel'),
+  resultNote: $('resultNote'),
+  resultMeta: $('resultMeta'),
+  resultDetails: $('resultDetails'),
+  asrText: $('asrText'),
+  copyResult: $('copyResult'),
+  playbackSection: $('playbackSection'),
+  playBtn: $('playBtn'),
+  trackInput: $('trackInput'),
+  playTime: $('playTime'),
+  dlAudioBtn: $('dlAudioBtn'),
+  clearBtn: $('clearBtn'),
 }
 
 const state = {
-  locale: detectLocale(), statusKey: 'status.ready', statusDot: '', lastResult: null,
-  config: null, ws: null, wsReady: false, recording: false,
-  mediaStream: null, audioCtx: null, workletNode: null, sourceNode: null,
+  config: null,
+  ws: null,
+  wsReady: false,
+  recording: false,
+  llmEnabled: false,
+  mediaStream: null,
+  audioCtx: null,
+  workletNode: null,
+  sourceNode: null,
   analyser: null,
-  timerId: null, startedAt: 0, blobFrame: 0, blobTime: 0, llmEnabled: false,
-  // Gooey orbs
-  orbs: [], barsData: [],
-  // PCM capture for replay
+  timerId: 0,
+  timerStarted: 0,
+  wave: null,
+  waveAt: 0,
   pcmChunks: [],
-  // Playback
-  wavBlob: null, audioEl: null, playRaf: 0,
-  // Prompt mode
-  promptMode: 'intent',
-  // Last results
-  lastAsrText: '', lastAiText: '',
+  wavBlob: null,
+  audioEl: null,
+  playRaf: 0,
+  connecting: null,
+  retry: 0,
+  retryTimer: 0,
+  stopped: false,
 }
 
-const $ = (id) => document.getElementById(id)
-const els = {
-  brandName: $('brandName'), headline: $('headline'), subheadline: $('subheadline'),
-  languageToggle: $('languageToggle'),
-  navDlBtn: $('navDlBtn'), dlBtn: $('dlBtn'), dlLabel: $('dlLabel'),
-  stateDot: $('stateDot'), stateText: $('stateText'), timer: $('timer'),
-  recordButton: $('recordButton'), recordLabel: $('recordLabel'),
-  micIcon: $('micIcon'), stopIcon: $('stopIcon'),
-  // Unified result
-  resultText: $('resultText'), resultMeta: $('resultMeta'),
-  resultDetails: $('resultDetails'), asrText: $('asrText'),
-  copyResult: $('copyResult'),
-  // Legacy compat (some code paths still reference these)
-  asrMeta: null, aiText: null, aiMeta: null, copyAsr: null, copyAi: null,
-  // Gooey blob
-  gooeyBlob: $('gooeyBlob'), blobGroup: $('blob-group'),
-  barsGroup: $('bars-group'), centerCore: $('center-core'),
-  gooeyMatrix: $('gooey-matrix'),
-  // Playback
-  playbackSection: $('playbackSection'), playBtn: $('playBtn'),
-  playIco: $('playIco'), pauseIco: $('pauseIco'),
-  playTime: $('playTime'), trackFill: $('trackFill'),
-  trackThumb: $('trackThumb'), trackInput: $('trackInput'),
-  // Result sections
-  resultSection: $('resultSection'), aiResultSection: null,
-  // Rerun
-  rerunAsr: null, rerunLlm: null,
-  // Hotword
-  hotwordBar: $('hotwordBar'), hotwordInput: $('hotwordInput'),
-  // Prompt
-  promptBar: $('promptBar'), mFaithful: $('mFaithful'), mIntent: $('mIntent'),
-  // Clear
-  clearWrap: $('clearWrap'), clearBtn: $('clearBtn'),
-}
+// Close codes the backend uses (server/backend/app/main.py, _WS_CLOSE_*).
+const WS_CLOSE = { idle: 4000, rejected: 4003, perIp: 4029, full: 1013 }
+const RETRY_MAX = 5
 
-/* ── Helpers ── */
-const tr = (key, vars = {}) => {
-  const template = MESSAGES[state.locale]?.[key] ?? MESSAGES.en[key] ?? key
-  return template.replace(/\{(\w+)\}/g, (_, name) => String(vars[name] ?? `{${name}}`))
-}
-
-function applyBranding() {
-  const appName = state.config?.app_name || 'SayIt'
-  document.title = tr('meta.title', { app: appName })
-  document.querySelector('meta[name="description"]')?.setAttribute('content', tr('meta.description'))
-  document.querySelector('meta[property="og:title"]')?.setAttribute('content', document.title)
-  document.querySelector('meta[property="og:description"]')?.setAttribute('content', tr('meta.description'))
-  els.brandName.textContent = appName
-  const useCustomChinese = state.locale === 'zh-CN'
-  els.headline.textContent = useCustomChinese && state.config?.headline
-    ? state.config.headline
-    : tr('hero.headline')
-  els.subheadline.textContent = useCustomChinese && state.config?.subheadline
-    ? state.config.subheadline
-    : tr('hero.subheadline')
-}
-
-function applyLocale() {
-  document.documentElement.lang = state.locale
-  document.querySelectorAll('[data-i18n]').forEach((el) => { el.textContent = tr(el.dataset.i18n) })
-  document.querySelectorAll('[data-i18n-aria]').forEach((el) => { el.setAttribute('aria-label', tr(el.dataset.i18nAria)) })
-  document.querySelectorAll('[data-i18n-title]').forEach((el) => { el.setAttribute('title', tr(el.dataset.i18nTitle)) })
-  document.querySelectorAll('[data-i18n-tooltip]').forEach((el) => { el.dataset.tooltip = tr(el.dataset.i18nTooltip) })
-  els.languageToggle.textContent = state.locale === 'en' ? '中文' : 'EN'
-  els.languageToggle.setAttribute('aria-label', tr('language.switch'))
-  applyBranding()
-  setRecordUI(state.recording)
-  setStateText(state.statusKey, state.statusDot)
-  if (state.lastResult) updateResult(state.lastResult)
-}
-
-const setStateText = (key, dotClass) => {
-  state.statusKey = key
-  state.statusDot = dotClass
+function setStatus(key, dot = '') {
+  if (!els.stateText) return
   els.stateText.textContent = tr(key)
-  els.stateDot.className = 'state-dot' + (dotClass ? ' ' + dotClass : '')
+  els.stateDot.className = 'state-dot' + (dot ? ' ' + dot : '')
 }
-const setResultText = (el, text, placeholder) => {
-  if (!el) return
-  const v = String(text || '')
-  el.textContent = v || placeholder
-  el.classList.toggle('placeholder', !v)
+
+function setRecordUI(recording) {
+  els.recordButton.classList.toggle('is-recording', recording)
+  els.recordButton.setAttribute('aria-label', tr(recording ? 'demo.stop' : 'demo.start'))
+  els.recordButton.setAttribute('aria-pressed', String(recording))
 }
-/* Unified result card updater */
-function updateResult(opts) {
-  state.lastResult = opts
-  const primary = opts.llmText || opts.asrText || ''
-  const asr = opts.asrText || ''
-  setResultText(els.resultText, primary, opts.placeholder || tr(opts.placeholderKey || 'result.waiting'))
-  if (els.asrText && asr && opts.llmText) { els.resultDetails.classList.remove('hidden'); els.asrText.textContent = asr }
-  else if (els.resultDetails) els.resultDetails.classList.add('hidden')
-  if (!els.resultMeta) return
-  const am = opts.asrMs || 0, lm = opts.llmMs || 0, total = am + lm
-  const tags = []
-  if (opts.asrModel) { const short = opts.asrModel.includes('/') ? opts.asrModel.split('/').pop() : opts.asrModel; tags.push(`ASR: ${short}`) }
-  if (opts.llmModel) tags.push(`AI: ${opts.llmProvider ? opts.llmProvider + ' / ' : ''}${opts.llmModel}`)
-  const addMeta = (className, text) => {
+
+/* The site-wide rule (owner, 2026-10-13 / 10-18): a line never holds just one or two characters.
+   build.mjs glues the end of every static paragraph; text set here at runtime gets the same
+   treatment: the last four characters of the last line (two words in English) in one nowrap run. */
+const CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/
+const NO_LINE_START = '，、；：。！？）」』》,.;:!?)'
+function setGlued(el, text) {
+  const s = String(text ?? '')
+  const nl = s.lastIndexOf('\n') + 1
+  const ch = Array.from(s.slice(nl))
+  el.replaceChildren()
+  let cut = -1
+  if (CJK_RE.test(ch.join('')) && ch.length > 3) {
+    cut = ch.length - (ch.length <= 12 ? 4 : 6)
+    while (cut > 0 && /[A-Za-z0-9.\-+]/.test(ch[cut - 1]) && /[A-Za-z0-9.\-+]/.test(ch[cut])) cut--
+    while (cut < ch.length - 1 && NO_LINE_START.includes(ch[cut])) cut++
+  } else if (ch.length) {
+    const sp = ch.join('').trimEnd().lastIndexOf(' ')
+    const sp2 = sp > 0 ? ch.join('').lastIndexOf(' ', sp - 1) : -1
+    if (sp2 > 0) cut = Array.from(ch.join('').slice(0, sp2 + 1)).length
+  }
+  if (cut <= 0) {
+    el.textContent = s
+    return
+  }
+  const span = document.createElement('span')
+  span.className = 'nb'
+  span.textContent = ch.slice(cut).join('')
+  el.append(s.slice(0, nl) + ch.slice(0, cut).join(''), span)
+}
+
+function setResult(text, { placeholder = false } = {}) {
+  const value = String(text || '')
+  const empty = placeholder || !value
+  setGlued(els.resultText, empty ? value || els.resultText.dataset.placeholder : value)
+  els.resultText.classList.toggle('is-placeholder', empty)
+  els.copyResult.hidden = empty || !navigator.clipboard
+}
+
+// Timings only. Model and provider names are server internals and mean nothing to a visitor
+// (owner, 2026-10-19).
+function setMeta(opts) {
+  els.resultMeta.replaceChildren()
+  const add = (text) => {
     const span = document.createElement('span')
-    span.className = className
+    span.className = 'meta-text'
     span.textContent = text
     els.resultMeta.appendChild(span)
   }
-  els.resultMeta.replaceChildren()
-  if (opts.statusKey) { addMeta('meta-text', tr(opts.statusKey)); return }
-  if (opts.durationSec) addMeta('meta-text', tr('result.audioDuration', { seconds: opts.durationSec.toFixed(1) }))
-  if (total) {
-    addMeta('meta-sep', '|')
-    addMeta('meta-text', `${tr('result.processingTime', { seconds: (total / 1000).toFixed(1) })} (ASR ${am}ms${lm ? ' + LLM ' + lm + 'ms' : ''})`)
-  }
-  tags.forEach((tag) => addMeta('meta-tag', tag))
-}
-const fmtClock = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
-const fmtTime = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
-const setRecordUI = (rec) => {
-  els.micIcon.style.display = rec ? 'none' : ''
-  els.stopIcon.style.display = rec ? '' : 'none'
-  els.recordButton.classList.toggle('stop', rec)
-  els.recordLabel.textContent = tr(rec ? 'demo.stop' : 'demo.start')
-  els.recordButton.setAttribute('aria-label', tr(rec ? 'demo.stopAria' : 'demo.startAria'))
-}
-const updateDownloadLinks = (url) => {
-  ;[els.navDlBtn, els.dlBtn].forEach(el => { if (el) el.href = url || '#download' })
+  const sec = (ms) => (ms / 1000).toFixed(1)
+  if (opts.durationSec) add(tr('result.audio', { s: Number(opts.durationSec).toFixed(1) }))
+  if (opts.asrMs) add(tr('result.asr', { s: sec(opts.asrMs) }))
+  if (opts.llmMs) add(tr('result.ai', { s: sec(opts.llmMs) }))
 }
 
-/* ── Gooey Blob Visualization ── */
-const BLOB_CFG = {
-  bars: 10, barWidth: 8, barGap: 8, barMaxHeight: 160, barMinHeight: 8,
-  envelope: [0.1, 0.3, 0.65, 0.95, 1.0, 1.0, 0.95, 0.65, 0.3, 0.1],
-  lerpSpeed: 0.15, centerX: 250, centerY: 250,
-  orbCount: 6, amplitude: 3, speed: 1.0,
+function showRaw(asr, llm) {
+  const show = Boolean(asr && llm && asr !== llm)
+  els.resultDetails.hidden = !show
+  setGlued(els.asrText, show ? asr : '')
 }
 
-function lerp(a, b, t) { return (1 - t) * a + t * b }
-
-function initBars() {
-  els.barsGroup.innerHTML = ''
-  const totalW = (BLOB_CFG.bars * BLOB_CFG.barWidth) + ((BLOB_CFG.bars - 1) * BLOB_CFG.barGap)
-  const startX = BLOB_CFG.centerX - (totalW / 2) + (BLOB_CFG.barWidth / 2)
-  for (let i = 0; i < BLOB_CFG.bars; i++) {
-    const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect")
-    rect.setAttribute('x', startX + i * (BLOB_CFG.barWidth + BLOB_CFG.barGap) - (BLOB_CFG.barWidth / 2))
-    rect.setAttribute('width', BLOB_CFG.barWidth)
-    rect.setAttribute('height', BLOB_CFG.barMinHeight)
-    rect.setAttribute('y', BLOB_CFG.centerY - BLOB_CFG.barMinHeight / 2)
-    rect.setAttribute('rx', BLOB_CFG.barWidth / 2)
-    rect.setAttribute('ry', BLOB_CFG.barWidth / 2)
-    els.barsGroup.appendChild(rect)
-  }
-  state.barsData = new Array(BLOB_CFG.bars).fill(BLOB_CFG.barMinHeight)
+// The label says what the text is: cleaned up by AI, or the raw transcript. When cleanup was on but
+// failed, the server still returns the transcript; say so instead of passing it off as cleaned up.
+function setResultKind(kind) {
+  if (els.resultLabel) els.resultLabel.textContent = tr(kind === 'ai' ? 'result.labelAi' : 'result.labelRaw')
+  if (!els.resultNote) return
+  els.resultNote.hidden = kind !== 'aiFailed'
+  setGlued(els.resultNote, kind === 'aiFailed' ? tr('result.aiFailed') : '')
 }
 
-function initOrbs(count) {
-  Array.from(els.blobGroup.children).forEach(child => {
-    if (child.id !== 'center-core') els.blobGroup.removeChild(child)
-  })
-  state.orbs = []
-  const orbitRadius = 65
-  for (let i = 0; i < count; i++) {
-    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle")
-    circle.setAttribute('fill', '#1a1a1a')
-    els.blobGroup.appendChild(circle)
-    const angle = (Math.PI * 2 / count) * i
-    state.orbs.push({
-      el: circle,
-      x: BLOB_CFG.centerX + Math.cos(angle) * orbitRadius,
-      y: BLOB_CFG.centerY + Math.sin(angle) * orbitRadius,
-      baseRadius: 60 + Math.random() * 15,
-      phase: Math.random() * Math.PI * 2,
-      pulseSpeed: 1.2 + Math.random() * 0.8,
-    })
+/* The demo's bars are computed exactly as the app computes them: from each microphone PCM frame
+   (barsFromPcm, the port of computeBarsFromPCM), at most every 33ms. Not from the analyser's
+   frequency bins, which looked nothing like the app. Out of recording the bars rest at 3px. */
+function renderBars() {
+  const bars = els.bars ? Array.from(els.bars.children) : []
+  if (!state.recording) {
+    if (state.wave) resetWave(state.wave)
+    paintBars(bars, [])
   }
 }
-
-function renderGooey() {
-  state.blobTime += 0.015 * BLOB_CFG.speed
-  const t = state.blobTime
-
-  // Animate orbs breathing
-  state.orbs.forEach(orb => {
-    orb.el.setAttribute('cx', orb.x)
-    orb.el.setAttribute('cy', orb.y)
-    const r = orb.baseRadius + Math.sin(t * orb.pulseSpeed + orb.phase) * BLOB_CFG.amplitude
-    orb.el.setAttribute('r', Math.max(20, r))
-  })
-  els.centerCore.setAttribute('r', 110 + Math.sin(t * 0.8) * (BLOB_CFG.amplitude * 0.5))
-
-  // Animate bars from audio or idle
-  let volume = 0
-  if (state.recording && state.analyser) {
-    const dataArray = new Uint8Array(state.analyser.frequencyBinCount)
-    state.analyser.getByteFrequencyData(dataArray)
-    let sum = 0
-    for (let i = 0; i < 25; i++) sum += dataArray[i]
-    volume = (sum / 25) / 255
-  }
-
-  const rects = els.barsGroup.children
-  for (let i = 0; i < BLOB_CFG.bars; i++) {
-    if (!rects[i]) continue
-    let targetH = BLOB_CFG.barMinHeight
-    if (volume > 0.02) {
-      targetH = BLOB_CFG.barMinHeight + (volume * BLOB_CFG.barMaxHeight * BLOB_CFG.envelope[i])
-    } else {
-      targetH = BLOB_CFG.barMinHeight + (Math.sin(t * 2.5 + i * 0.5) * 0.5 + 0.5) * 6
-    }
-    state.barsData[i] = lerp(state.barsData[i], targetH, BLOB_CFG.lerpSpeed)
-    rects[i].setAttribute('height', state.barsData[i])
-    rects[i].setAttribute('y', BLOB_CFG.centerY - state.barsData[i] / 2)
-  }
-
-  state.blobFrame = requestAnimationFrame(renderGooey)
+function pushPcmBars(pcm) {
+  if (!els.bars) return
+  const bars = Array.from(els.bars.children)
+  if (!state.wave || state.wave.prev.length !== bars.length) state.wave = makeWave(bars.length)
+  const view = pcm instanceof ArrayBuffer ? new Int16Array(pcm) : new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2))
+  const heights = barsFromPcm(view, state.wave)
+  const now = performance.now()
+  if (now - (state.waveAt || 0) < 33) return
+  state.waveAt = now
+  paintBars(bars, heights)
 }
 
-function startBlob() {
-  cancelAnimationFrame(state.blobFrame)
-  state.blobTime = 0
-  state.blobFrame = requestAnimationFrame(renderGooey)
+/* The app's overlay timer (formatRecordingTimer, client/src/services/recorder/types.ts): whole
+   seconds as "7s", the time left in the last minute ("剩余 47s"), and at the limit the recording
+   stops by itself, as the app does at MAX_RECORDING_SEC = 300 (owner, 2026-10-19: five minutes, the
+   same as the app). The limit is the server's web_demo.max_duration_sec, which rejects anything
+   longer; without stopping here a visitor could talk past it and only then be told it was too long.
+   It stops half a second early because the audio runs a tick behind the clock. */
+const COUNTDOWN_SEC = 60
+const demoLimitSec = () => Number(state.config?.web_demo?.max_duration_sec) || 300
+function resetTimer() {
+  els.timer.textContent = '0s'
+  els.timer.classList.remove('is-countdown', 'is-urgent')
 }
-function stopBlob() {
-  cancelAnimationFrame(state.blobFrame)
-  state.blobFrame = 0
+/* Once stopped, the app's overlay leaves the timer for the processing bar; this pill stays, so it
+   settles on the length of the take. A pulsing "剩余 1s" left behind would read as still counting. */
+function freezeTimer() {
+  if (!state.timerStarted) return
+  // Rounded, so the take that hit the limit (stopped 0.5s early) reads "300s", not "299s".
+  els.timer.textContent = `${Math.round((performance.now() - state.timerStarted) / 1000)}s`
+  els.timer.classList.remove('is-countdown', 'is-urgent')
+  state.timerStarted = 0
 }
-
-/* ── Timer ── */
-function resetTimer() { clearInterval(state.timerId); state.timerId = null; state.startedAt = 0; els.timer.textContent = '00:00' }
 function startTimer() {
-  state.startedAt = performance.now(); els.timer.textContent = '00:00'
-  state.timerId = setInterval(() => { els.timer.textContent = fmtClock(Math.floor((performance.now() - state.startedAt) / 1000)) }, 250)
+  const started = performance.now()
+  const limit = demoLimitSec()
+  resetTimer()
+  state.timerStarted = started
+  state.timerId = setInterval(() => {
+    const ms = performance.now() - started
+    const elapsed = Math.floor(ms / 1000)
+    const left = Math.max(0, limit - elapsed)
+    const countdown = left <= COUNTDOWN_SEC
+    els.timer.textContent = countdown ? tr('timer.remaining', { s: left }) : `${elapsed}s`
+    els.timer.classList.toggle('is-countdown', countdown)
+    els.timer.classList.toggle('is-urgent', countdown && left <= 10)
+    if (ms >= limit * 1000 - 500 && state.recording) stopRecording()
+  }, 250)
 }
 
-/* ── WAV creation from PCM chunks ── */
-function writeStr(view, offset, str) { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)) }
+/* WAV from captured 16 kHz PCM, for playback and download. */
 function createWavBlob(chunks, sampleRate) {
-  const totalLen = chunks.reduce((sum, c) => sum + c.byteLength, 0)
-  if (totalLen <= 0) return null
-  const pcmData = new Uint8Array(totalLen)
-  let offset = 0
-  for (const chunk of chunks) { pcmData.set(new Uint8Array(chunk), offset); offset += chunk.byteLength }
-  const buffer = new ArrayBuffer(44 + totalLen)
+  const total = chunks.reduce((n, c) => n + c.byteLength, 0)
+  if (total <= 0) return null
+  const buffer = new ArrayBuffer(44 + total)
   const view = new DataView(buffer)
-  writeStr(view, 0, 'RIFF'); view.setUint32(4, 36 + totalLen, true)
-  writeStr(view, 8, 'WAVE'); writeStr(view, 12, 'fmt ')
-  view.setUint32(16, 16, true); view.setUint16(20, 1, true)
-  view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true)
-  view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true)
-  view.setUint16(34, 16, true); writeStr(view, 36, 'data')
-  view.setUint32(40, totalLen, true)
-  new Uint8Array(buffer, 44).set(pcmData)
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)) }
+  str(0, 'RIFF'); view.setUint32(4, 36 + total, true); str(8, 'WAVE'); str(12, 'fmt ')
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true)
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true)
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true); str(36, 'data'); view.setUint32(40, total, true)
+  const out = new Uint8Array(buffer, 44)
+  let offset = 0
+  for (const c of chunks) { out.set(new Uint8Array(c), offset); offset += c.byteLength }
   return new Blob([buffer], { type: 'audio/wav' })
 }
 
-/* ── Playback ── */
+const fmtTime = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
 function setupPlayback() {
-  const totalBytes = state.pcmChunks.reduce((s, c) => s + c.byteLength, 0)
-  if (!state.pcmChunks.length || totalBytes === 0) return
   const blob = createWavBlob(state.pcmChunks, 16000)
   if (!blob) return
   state.wavBlob = blob
   if (state.audioEl) { state.audioEl.pause(); URL.revokeObjectURL(state.audioEl.src) }
-  const url = URL.createObjectURL(blob)
-  const audio = new Audio()
+  const audio = new Audio(URL.createObjectURL(blob))
   audio.preload = 'auto'
-  audio.src = url
+  const rate = document.querySelector('.rate[aria-pressed="true"]')
+  audio.playbackRate = rate ? Number(rate.dataset.rate) : 1
   state.audioEl = audio
-  els.playbackSection.classList.remove('hidden')
+  els.playbackSection.hidden = false
+  els.trackInput.value = '0'
   els.playTime.textContent = '0:00 / 0:00'
-  els.trackFill.style.width = '0'
-  els.trackThumb.style.left = '0'
-  els.trackInput.value = 0
-  audio.addEventListener('loadedmetadata', () => {
-    els.playTime.textContent = `0:00 / ${fmtTime(audio.duration)}`
-  })
-  audio.addEventListener('ended', () => { setPlayUI(false) })
+  audio.addEventListener('loadedmetadata', () => { els.playTime.textContent = `0:00 / ${fmtTime(audio.duration)}` })
+  audio.addEventListener('ended', () => setPlaying(false))
 }
-
-function setPlayUI(playing) {
-  els.playIco.style.display = playing ? 'none' : ''
-  els.pauseIco.style.display = playing ? '' : 'none'
-  if (playing) startPlaybackTrack(); else stopPlaybackTrack()
-}
-
-function startPlaybackTrack() {
+function setPlaying(playing) {
+  els.playBtn.classList.toggle('is-playing', playing)
   cancelAnimationFrame(state.playRaf)
-  const tick = () => {
-    const a = state.audioEl; if (!a) return
-    const pct = a.duration ? a.currentTime / a.duration : 0
-    els.trackFill.style.width = (pct * 100) + '%'
-    els.trackThumb.style.left = (pct * 100) + '%'
+  if (!playing) return
+  const step = () => {
+    const a = state.audioEl
+    if (!a) return
+    els.trackInput.value = String(a.duration ? Math.round((a.currentTime / a.duration) * 1000) : 0)
     els.playTime.textContent = `${fmtTime(a.currentTime)} / ${fmtTime(a.duration || 0)}`
-    if (!a.paused) state.playRaf = requestAnimationFrame(tick)
+    if (!a.paused) state.playRaf = requestAnimationFrame(step)
   }
-  state.playRaf = requestAnimationFrame(tick)
+  state.playRaf = requestAnimationFrame(step)
 }
-function stopPlaybackTrack() { cancelAnimationFrame(state.playRaf) }
 
-/* ── Replay via new WebSocket ── */
-function getWsUrl() {
+/* Server connection.
+   The old loop reconnected every 2 s forever, whatever the reason for the close. When the server
+   refuses this page (guard: Origin not on the allow-list, code 4003) that is an endless
+   "Disconnected, retrying…" that also hammers the server. Now: a refusal stops for good, an idle
+   close waits for the next click, anything else backs off and gives up after RETRY_MAX tries. */
+function wsUrl() {
   const demo = state.config && state.config.web_demo
   if (!demo || !demo.ws_url) return null
   const target = new URL(demo.ws_url, window.location.origin)
-  target.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  target.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   return target.toString()
 }
 
-function replayAudio(options) {
-  const chunks = state.pcmChunks
-  if (!chunks.length) return Promise.reject(new Error(tr('error.noRecording')))
-  const wsUrl = getWsUrl()
-  if (!wsUrl) return Promise.reject(new Error(tr('error.wsMissing')))
+function canRecordHere() {
+  return Boolean(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia)
+}
 
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(wsUrl)
-    socket.binaryType = 'arraybuffer'
-    let finished = false, finalResult = null
-    const timeout = setTimeout(() => {
-      if (finished) return; finished = true
-      try { socket.close() } catch (_) {}
-      reject(new Error(tr('error.replayTimeout')))
-    }, 30000)
-    const cleanup = () => { clearTimeout(timeout); try { socket.close() } catch (_) {} }
+function setOffline(statusKey, messageKey) {
+  state.stopped = true
+  els.recordButton.disabled = true
+  setStatus(statusKey)
+  setResult(tr(messageKey), { placeholder: true })
+}
 
-    socket.onerror = () => { if (!finished) { finished = true; cleanup(); reject(new Error(tr('error.replayConnection'))) } }
-    socket.onclose = () => { if (!finished && finalResult) { finished = true; cleanup(); resolve(finalResult) } else if (!finished) { finished = true; cleanup(); reject(new Error(tr('error.replayClosed'))) } }
-    socket.onmessage = (event) => {
-      if (typeof event.data !== 'string') return
-      let p; try { p = JSON.parse(event.data) } catch (_) { return }
-      const t = String(p.type || '')
-      if (t === 'ready') {
-        const startPayload = { cmd: 'start' }
-        if (options.systemPrompt) startPayload.system_prompt = options.systemPrompt
-        if (options.hotwords && options.hotwords.length) startPayload.hotwords = options.hotwords
-        if (options.disableAi) startPayload.disable_ai = true
-        socket.send(JSON.stringify(startPayload))
-        for (const chunk of chunks) socket.send(chunk.slice(0))
-        socket.send(JSON.stringify({ cmd: 'stop' }))
-        return
-      }
-      if (t === 'final') {
-        finalResult = { asrText: String(p.asr_text || ''), llmText: String(p.llm_text || ''), asrMs: Number(p.asr_ms || 0), llmMs: Number(p.llm_ms || 0) }
-        return
-      }
-      if (t === 'done') { if (finalResult) { finished = true; cleanup(); resolve(finalResult) } return }
-      if (t === 'error') { finished = true; cleanup(); reject(new Error(String(p.message || tr('error.replayFailed')))) }
+function scheduleReconnect(code) {
+  clearTimeout(state.retryTimer)
+  if (state.stopped) return
+  if (code === WS_CLOSE.idle) {
+    // Reaped after minutes of silence. Reconnect when the visitor actually presses record.
+    els.recordButton.disabled = false
+    setStatus('status.ready', 'ready')
+    return
+  }
+  if (state.retry >= RETRY_MAX) {
+    els.recordButton.disabled = false
+    setStatus('status.retry')
+    return
+  }
+  const busy = code === WS_CLOSE.perIp || code === WS_CLOSE.full
+  const delay = Math.min(20000, (busy ? 5000 : 1500) * 2 ** state.retry)
+  state.retry += 1
+  setStatus(busy ? 'status.busy' : 'status.disconnected', 'busy')
+  const run = () => {
+    if (document.hidden) {
+      document.addEventListener('visibilitychange', run, { once: true })
+      return
     }
-  })
+    connect().catch(() => { })
+  }
+  state.retryTimer = setTimeout(run, delay)
 }
 
-/* ── Config ── */
-async function loadConfig() {
-  const res = await fetch('/api/public/config', { cache: 'no-store' })
-  if (!res.ok) throw new Error(tr('error.config', { status: res.status }))
-  state.config = await res.json()
-  applyBranding()
-  updateDownloadLinks(state.config.download_url)
-  if (els.dlLabel && state.config.download_version) els.dlLabel.textContent = `Windows v${state.config.download_version}`
-  const wd = state.config.web_demo || {}
-  state.llmEnabled = Boolean(wd.llm_enabled)
-  if (!wd.enabled) { els.recordButton.disabled = true; setStateText('status.unavailable', ''); return }
-  setStateText('status.connecting', '')
-}
-
-/* ── WebSocket ── */
-function scheduleReconnect() {
-  setTimeout(() => {
-    if (!state.ws || state.ws.readyState === WebSocket.CLOSED)
-      connectWebSocket().catch(() => setStateText('status.connectionFailed', ''))
-  }, 2000)
-}
-async function connectWebSocket() {
-  const wsUrl = getWsUrl()
-  if (!wsUrl) return
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(wsUrl)
+/* Resolves once the server says "ready", not merely when the socket opens. */
+function connect() {
+  const url = wsUrl()
+  if (!url) return Promise.reject(new Error('no ws url'))
+  if (state.ws && state.ws.readyState === WebSocket.OPEN && state.wsReady) return Promise.resolve()
+  if (state.connecting) return state.connecting
+  setStatus('status.connecting', 'busy')
+  state.connecting = new Promise((resolve, reject) => {
+    const socket = new WebSocket(url)
     socket.binaryType = 'arraybuffer'
     state.ws = socket
-    socket.onopen = () => resolve()
-    socket.onerror = () => { state.wsReady = false; reject(new Error(tr('error.websocket'))) }
-    socket.onclose = () => {
+    const done = (err) => {
+      state.connecting = null
+      clearTimeout(timeout)
+      err ? reject(err) : resolve()
+    }
+    const timeout = setTimeout(() => { done(new Error('timeout')); try { socket.close() } catch (_) { } }, 10000)
+    socket.onerror = () => { state.wsReady = false }
+    socket.onclose = (ev) => {
+      if (state.ws !== socket) return
+      const wasRecording = state.recording
       state.wsReady = false
-      if (!state.recording) setStateText('status.disconnected', '')
-      scheduleReconnect()
+      els.recordButton.disabled = true
+      done(new Error(`closed ${ev.code}`))
+      if (wasRecording) {
+        // The audio is still in memory: stop cleanly so it can be played back and downloaded.
+        state.recording = false
+        setRecordUI(false)
+        clearInterval(state.timerId)
+        freezeTimer()
+        renderBars()
+        setupPlayback()
+        els.clearBtn.hidden = false
+      }
+      if (ev.code === WS_CLOSE.rejected) {
+        setOffline('status.rejected', 'demo.rejected')
+        return
+      }
+      scheduleReconnect(ev.code)
+      if (wasRecording) setStatus('status.dropped')
     }
     socket.onmessage = (event) => {
       if (typeof event.data !== 'string') return
-      let p; try { p = JSON.parse(event.data) } catch (_) { return }
-      const t = String(p.type || '')
-      if (t === 'ready') {
-        state.wsReady = true; state.llmEnabled = Boolean(p.llm)
-        setStateText('status.ready', 'ready')
-        return
-      }
-      if (t === 'asr') {
-        const text = String(p.text || '')
-        updateResult({ asrText: text, asrMs: p.asr_ms, durationSec: p.duration_sec, placeholderKey: 'result.receiving' })
-        return
-      }
-      if (t === 'final') {
-        const asr = String(p.asr_text || ''), llm = String(p.llm_text || '')
-        const am = Number(p.asr_ms || 0), lm = Number(p.llm_ms || 0)
-        const ld = p.llm_debug || {}
-        state.lastAsrText = asr; state.lastAiText = llm
-        updateResult({
-          asrText: asr, llmText: state.llmEnabled ? llm : '', asrMs: am, llmMs: state.llmEnabled ? lm : 0,
-          durationSec: p.duration_sec, placeholderKey: 'result.empty',
-          asrModel: p.asr_model, llmProvider: ld.provider, llmModel: ld.model,
+      let p
+      try { p = JSON.parse(event.data) } catch (_) { return }
+      const type = String(p.type || '')
+      if (type === 'ready') {
+        state.wsReady = true
+        state.retry = 0
+        state.llmEnabled = Boolean(p.llm)
+        els.recordButton.disabled = false
+        setStatus('status.ready', 'ready')
+        done()
+      } else if (type === 'asr') {
+        setResult(String(p.text || '') || tr('result.receiving'), { placeholder: !p.text })
+        setMeta({ asrMs: p.asr_ms, durationSec: p.duration_sec })
+      } else if (type === 'final') {
+        const asr = String(p.asr_text || '')
+        const llm = state.llmEnabled ? String(p.llm_text || '') : ''
+        const debug = p.llm_debug || {}
+        if (llm || asr) setResult(llm || asr)
+        else setResult(tr('result.empty'), { placeholder: true })
+        showRaw(asr, llm)
+        // llm_debug.provider is only set when cleanup ran; .error when it was tried and failed.
+        setResultKind(!asr ? 'raw' : debug.provider ? 'ai' : state.llmEnabled && debug.error ? 'aiFailed' : 'raw')
+        setMeta({
+          asrMs: Number(p.asr_ms || 0),
+          llmMs: state.llmEnabled ? Number(p.llm_ms || 0) : 0,
+          durationSec: p.duration_sec,
         })
-        return
+      } else if (type === 'error') {
+        // "rejected" is followed by a 4003 close, handled above. Quota messages from the server
+        // are Chinese only, so the English page uses its own wording.
+        if (p.code === 'quota') {
+          setStatus('status.quota')
+          if (LOCALE === 'zh-CN' && p.message) setResult(String(p.message), { placeholder: true })
+        } else if (p.code !== 'rejected') {
+          setStatus('status.requestFailed')
+        }
+      } else if (type === 'done' && !state.recording) {
+        setStatus('status.ready', 'ready')
+        els.clearBtn.hidden = false
       }
-      if (t === 'error') { setStateText('status.requestFailed', ''); return }
-      if (t === 'done' && !state.recording) setStateText('status.ready', 'ready')
     }
   })
+  return state.connecting
 }
 
-/* ── Audio ── */
-function hasLiveMic(stream) { return stream && stream.getAudioTracks().some(t => t.readyState === 'live') }
-function createAudioCtx(Ctor) {
-  try { return new Ctor({ latencyHint: 'interactive' }) } catch (_) {}
-  return new Ctor()
-}
+/* Audio capture */
+const hasLiveMic = (s) => s && s.getAudioTracks().some((t) => t.readyState === 'live')
 async function teardownAudio() {
-  if (state.workletNode) { try { state.workletNode.port.onmessage = null } catch (_) {}; try { state.workletNode.disconnect() } catch (_) {}; state.workletNode = null }
-  if (state.sourceNode) { try { state.sourceNode.disconnect() } catch (_) {}; state.sourceNode = null }
-  if (state.analyser) { try { state.analyser.disconnect() } catch (_) {}; state.analyser = null }
-  if (state.mediaStream) { state.mediaStream.getTracks().forEach(t => t.stop()); state.mediaStream = null }
-  if (state.audioCtx) { try { if (state.audioCtx.state !== 'closed') await state.audioCtx.close() } catch (_) {}; state.audioCtx = null }
+  try { if (state.workletNode) { state.workletNode.port.onmessage = null; state.workletNode.disconnect() } } catch (_) { }
+  try { if (state.sourceNode) state.sourceNode.disconnect() } catch (_) { }
+  try { if (state.analyser) state.analyser.disconnect() } catch (_) { }
+  if (state.mediaStream) state.mediaStream.getTracks().forEach((t) => t.stop())
+  try { if (state.audioCtx && state.audioCtx.state !== 'closed') await state.audioCtx.close() } catch (_) { }
+  Object.assign(state, { workletNode: null, sourceNode: null, analyser: null, mediaStream: null, audioCtx: null })
 }
 async function ensureAudio() {
   const cs = state.audioCtx ? state.audioCtx.state : 'none'
-  const reusable = state.audioCtx && state.workletNode && hasLiveMic(state.mediaStream) && cs !== 'closed' && cs !== 'interrupted'
-  if (reusable) { if (cs === 'suspended') await state.audioCtx.resume(); return }
+  if (state.audioCtx && state.workletNode && hasLiveMic(state.mediaStream) && cs !== 'closed' && cs !== 'interrupted') {
+    if (cs === 'suspended') await state.audioCtx.resume()
+    return
+  }
   await teardownAudio()
   state.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: true } })
   const Ctor = window.AudioContext || window.webkitAudioContext
   if (!Ctor) throw new Error(tr('error.audioContext'))
-  state.audioCtx = createAudioCtx(Ctor)
+  try { state.audioCtx = new Ctor({ latencyHint: 'interactive' }) } catch (_) { state.audioCtx = new Ctor() }
   await state.audioCtx.audioWorklet.addModule('/pcm-worklet.js')
   state.sourceNode = state.audioCtx.createMediaStreamSource(state.mediaStream)
   state.analyser = state.audioCtx.createAnalyser()
   state.analyser.fftSize = 128
-  state.analyser.smoothingTimeConstant = 0.85
+  state.analyser.smoothingTimeConstant = 0.8
   state.sourceNode.connect(state.analyser)
   state.workletNode = new AudioWorkletNode(state.audioCtx, 'pcm-processor', {
-    numberOfInputs: 1, numberOfOutputs: 0,
+    numberOfInputs: 1,
+    numberOfOutputs: 0,
     processorOptions: { targetRate: 16000, inputRate: state.audioCtx.sampleRate },
   })
   state.workletNode.port.onmessage = (e) => {
     if (!state.recording) return
-    const pcmBuffer = e.data.pcm
-    if (!pcmBuffer || pcmBuffer.byteLength === 0) return
-    state.pcmChunks.push(pcmBuffer.slice(0))
-    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-      state.ws.send(pcmBuffer)
-    }
+    const pcm = e.data && e.data.pcm
+    if (!pcm || pcm.byteLength === 0) return
+    state.pcmChunks.push(pcm.slice(0))
+    pushPcmBars(pcm)
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) state.ws.send(pcm)
   }
   state.sourceNode.connect(state.workletNode)
   if (state.audioCtx.state === 'suspended') await state.audioCtx.resume()
 }
 
-/* ── Recording ── */
 async function startRecording() {
-  if (!state.config?.web_demo?.enabled || state.recording) return
+  if (!state.config?.web_demo?.enabled || state.recording || state.stopped) return
   if (!state.wsReady || !state.ws || state.ws.readyState !== WebSocket.OPEN) {
-    setStateText('status.notReady', ''); return
+    // After an idle close or a run of failed retries, pressing record is the retry.
+    state.retry = 0
+    els.recordButton.disabled = true
+    try {
+      await connect()
+    } catch (_) {
+      if (!state.stopped) {
+        els.recordButton.disabled = false
+        setStatus('status.retry')
+      }
+      return
+    }
   }
   await ensureAudio()
   state.pcmChunks = []
   state.recording = true
-  state.lastAsrText = ''; state.lastAiText = ''
   setRecordUI(true)
-  setStateText('status.recording', 'recording')
-  // Show result section, hide playback & clear
-  els.resultSection.classList.remove('hidden')
-  if (els.aiResultSection) els.aiResultSection.classList.remove('hidden')
-  els.playbackSection.classList.add('hidden')
-  els.clearWrap.classList.add('hidden')
-  // Reset results
-  updateResult({ placeholderKey: 'result.receiving' })
-  resetTimer(); startTimer(); startBlob()
+  setStatus('status.recording', 'recording')
+  els.playbackSection.hidden = true
+  els.clearBtn.hidden = true
+  els.resultDetails.hidden = true
+  els.resultMeta.replaceChildren()
+  setResult(tr('result.receiving'), { placeholder: true })
+  setResultKind('raw')
+  clearInterval(state.timerId)
+  startTimer()
+  if (state.wave) resetWave(state.wave)
   state.ws.send(JSON.stringify({ cmd: 'start', disable_ai: !state.llmEnabled }))
 }
-async function stopRecording() {
+
+function stopRecording() {
   if (!state.recording) return
   state.recording = false
   setRecordUI(false)
-  setStateText('status.processing', '')
-  clearInterval(state.timerId); state.timerId = null
+  setStatus('status.processing', 'busy')
+  clearInterval(state.timerId)
+  freezeTimer()
+  renderBars()
   if (state.ws && state.ws.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify({ cmd: 'stop' }))
   setupPlayback()
-  // Show clear button
-  els.clearWrap.classList.remove('hidden')
+  els.clearBtn.hidden = false
 }
 
-/* ── Clear / Reset ── */
 function clearResults() {
-  // Hide all result sections
-  els.resultSection.classList.add('hidden')
-  if (els.aiResultSection) els.aiResultSection.classList.add('hidden')
-  els.playbackSection.classList.add('hidden')
-  els.clearWrap.classList.add('hidden')
-  // Reset state
+  els.playbackSection.hidden = true
+  els.clearBtn.hidden = true
+  els.resultDetails.hidden = true
+  els.resultMeta.replaceChildren()
+  setResult('', { placeholder: true })
+  setResultKind('raw')
   state.pcmChunks = []
-  state.lastAsrText = ''; state.lastAiText = ''
-  state.lastResult = null
   if (state.audioEl) { state.audioEl.pause(); URL.revokeObjectURL(state.audioEl.src); state.audioEl = null }
-  // Reset timer display
-  els.timer.textContent = '00:00'
-  setStateText('status.ready', 'ready')
+  setPlaying(false)
+  resetTimer()
+  if (state.wsReady) setStatus('status.ready', 'ready')
 }
 
-/* ── Copy ── */
-async function copyCard(textEl, btn) {
-  const text = String(textEl.textContent || '').trim()
-  if (!text || textEl.classList.contains('placeholder')) return
-  await navigator.clipboard.writeText(text)
-  btn.dataset.tooltip = tr('result.copied')
-  btn.classList.add('copied')
-  setTimeout(() => { btn.classList.remove('copied'); btn.dataset.tooltip = tr('result.copy') }, 1500)
-}
+function initDemo() {
+  if (!els.recordButton) return
+  setRecordUI(false)
+  setStatus('status.connecting', 'busy')
 
-/* ── Rerun ASR ── */
-async function rerunAsr() {
-  if (!state.pcmChunks.length) return
-  updateResult({ placeholderKey: 'result.receiving', statusKey: 'rerun.asrRunning' })
-  try {
-    const hwText = (els.hotwordInput.value || '').trim()
-    const hotwords = hwText ? hwText.split(/[,，]/).map(s => s.trim()).filter(Boolean) : undefined
-    const result = await replayAudio({ hotwords, disableAi: true })
-    state.lastAsrText = result.asrText
-    updateResult({ asrText: result.asrText, asrMs: result.asrMs, durationSec: result.durationSec, placeholderKey: 'result.empty' })
-  } catch (e) {
-    updateResult({ placeholder: e.message, statusKey: 'rerun.asrFailed' })
-  }
-}
-
-/* ── Rerun LLM ── */
-async function rerunLlm() {
-  if (!state.pcmChunks.length) return
-  updateResult({ placeholderKey: 'result.receiving', statusKey: 'rerun.aiRunning' })
-  try {
-    const hwText = (els.hotwordInput.value || '').trim()
-    const hotwords = hwText ? hwText.split(/[,，]/).map(s => s.trim()).filter(Boolean) : undefined
-    const localePrompts = PROMPTS[state.locale] || PROMPTS.en
-    const systemPrompt = localePrompts[state.promptMode] || localePrompts.faithful
-    const result = await replayAudio({ hotwords, systemPrompt })
-    state.lastAiText = result.llmText
-    state.lastAsrText = result.asrText
-    updateResult({ asrText: result.asrText, llmText: result.llmText, asrMs: result.asrMs, llmMs: result.llmMs, durationSec: result.durationSec, placeholderKey: 'rerun.noResult' })
-  } catch (e) {
-    updateResult({ placeholder: e.message, statusKey: 'rerun.aiFailed' })
-  }
-}
-
-/* ── Prompt mode ── */
-function setPromptMode(mode) {
-  state.promptMode = mode
-  els.mFaithful.classList.toggle('active', mode === 'faithful')
-  els.mIntent.classList.toggle('active', mode === 'intent')
-}
-
-/* ── Boot ── */
-async function boot() {
-  applyLocale()
-
-  // Init gooey blob
-  initBars()
-  initOrbs(BLOB_CFG.orbCount)
-  startBlob()
-
-  // Copy buttons
-  if (els.copyResult) els.copyResult.addEventListener('click', () => void copyCard(els.resultText, els.copyResult).catch(() => {}))
-
-  els.languageToggle.addEventListener('click', () => {
-    state.locale = state.locale === 'en' ? 'zh-CN' : 'en'
-    localStorage.setItem('sayit.web.locale', state.locale)
-    applyLocale()
-  })
-
-  // Record button
   els.recordButton.addEventListener('click', () => {
-    void (state.recording ? stopRecording() : startRecording()).catch(e => {
-      state.recording = false; setRecordUI(false)
-      clearInterval(state.timerId); state.timerId = null
-      setStateText('status.recordingFailed', '')
+    const action = state.recording ? Promise.resolve(stopRecording()) : startRecording()
+    action.catch((e) => {
+      state.recording = false
+      setRecordUI(false)
+      clearInterval(state.timerId)
+      freezeTimer()
+      setStatus(e && e.name === 'NotAllowedError' ? 'status.micDenied' : 'status.recordingFailed')
       console.error('Recording error:', e)
     })
   })
-
-  // Clear button
+  els.copyResult.addEventListener('click', () => {
+    if (els.resultText.classList.contains('is-placeholder')) return
+    void copyText(els.resultText.textContent.trim(), els.copyResult).catch(() => { })
+  })
   els.clearBtn.addEventListener('click', clearResults)
-
-  // Playback controls
   els.playBtn.addEventListener('click', () => {
-    const a = state.audioEl; if (!a) return
-    if (a.paused) { a.play(); setPlayUI(true) } else { a.pause(); setPlayUI(false) }
+    const a = state.audioEl
+    if (!a) return
+    if (a.paused) { void a.play(); setPlaying(true) } else { a.pause(); setPlaying(false) }
   })
   els.trackInput.addEventListener('input', () => {
-    const a = state.audioEl; if (!a || !a.duration) return
-    a.currentTime = parseFloat(els.trackInput.value) * a.duration
-    const pct = parseFloat(els.trackInput.value) * 100
-    els.trackFill.style.width = pct + '%'
-    els.trackThumb.style.left = pct + '%'
+    const a = state.audioEl
+    if (!a || !a.duration) return
+    a.currentTime = (Number(els.trackInput.value) / 1000) * a.duration
     els.playTime.textContent = `${fmtTime(a.currentTime)} / ${fmtTime(a.duration)}`
   })
-
-  // Playback rate buttons
-  document.getElementById('rateBtns')?.addEventListener('click', (e) => {
-    const btn = e.target.closest('.rate-btn'); if (!btn) return
-    const rate = parseFloat(btn.dataset.rate)
-    document.querySelectorAll('.rate-btn').forEach(b => b.classList.toggle('active', b === btn))
-    if (state.audioEl) state.audioEl.playbackRate = rate
+  document.querySelector('.rates')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('.rate')
+    if (!btn) return
+    document.querySelectorAll('.rate').forEach((b) => b.setAttribute('aria-pressed', String(b === btn)))
+    if (state.audioEl) state.audioEl.playbackRate = Number(btn.dataset.rate)
   })
-
-  // Download audio
-  document.getElementById('dlAudioBtn')?.addEventListener('click', () => {
+  els.dlAudioBtn.addEventListener('click', () => {
     if (!state.wavBlob) return
     const a = document.createElement('a')
     a.href = URL.createObjectURL(state.wavBlob)
-    a.download = `sayit_${new Date().toISOString().slice(0,19).replace(/[T:]/g,'-')}.wav`
+    a.download = `sayit_${new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')}.wav`
     a.click()
-    URL.revokeObjectURL(a.href)
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000)
+  })
+}
+
+/* ── Config: direct download link, version, and whether the demo is open ─── */
+
+async function loadConfig() {
+  const res = await fetch('/api/public/config', { cache: 'no-store', headers: { Accept: 'application/json' } })
+  if (!res.ok) throw new Error(`config ${res.status}`)
+  const cfg = await res.json()
+  state.config = cfg
+  // Static HTML points at the GitHub release so crawlers and offline copies still work.
+  // The server's own download endpoint is faster for most visitors, so prefer it when offered.
+  if (cfg.download_url) document.querySelectorAll('[data-download]').forEach((a) => { a.href = cfg.download_url })
+  if (cfg.download_version) {
+    document.querySelectorAll('[data-version]').forEach((el) => {
+      el.textContent = el.dataset.template.replace('{v}', `v${cfg.download_version}`)
+      el.hidden = false
+    })
+  }
+  return cfg
+}
+
+/* ── The clickable app (build.mjs appMock) ───────────────────────────────── */
+
+const WAVE_THEME = {
+  rainbow: { bar: (t) => `hsl(${140 - Math.round(t * 110)} 95% ${64 - Math.round(Math.abs(t - 0.5) * 12)}%)`, timer: '#fef08a' },
+  blue: { bar: (t) => `hsl(${190 + Math.round(t * 30)} 90% ${62 - Math.round(Math.abs(t - 0.5) * 14)}%)`, timer: '#bae6fd' },
+  white: { bar: () => '#f1f5f9', timer: '#e5e7eb' },
+}
+const WAVE_BARS = { short: 12, medium: 18, long: 24 }
+
+function initAppMock() {
+  const root = document.querySelector('[data-am]')
+  if (!root) return
+  const $$ = (sel, el = root) => Array.from(el.querySelectorAll(sel))
+  const pages = $$('[data-am-page]')
+  const main = root.querySelector('.am-main')
+  const modal = root.querySelector('[data-am-modal]')
+
+  const go = (id) => {
+    pages.forEach((p) => { p.hidden = p.dataset.amPage !== id })
+    $$('.am-nav-item').forEach((n) => {
+      const on = n.dataset.amNav === id
+      n.classList.toggle('is-on', on)
+      if (on) n.setAttribute('aria-current', 'page')
+      else n.removeAttribute('aria-current')
+    })
+    if (main) main.scrollTop = 0
+  }
+
+  // The settings preview pill follows the wave theme, length and the two switches, live.
+  const preview = root.querySelector('[data-am-preview]')
+  let previewWave = 0
+  const pick = (attr) => root.querySelector(`[${attr}].is-on`)?.getAttribute(attr)
+  const switchOn = (sync) => root.querySelector(`.am-switch[data-am-sync="${sync}"]`)?.getAttribute('aria-checked') === 'true'
+  const paintPreview = () => {
+    if (!preview) return
+    const theme = WAVE_THEME[pick('data-am-wave')] || WAVE_THEME.rainbow
+    const count = WAVE_BARS[pick('data-am-len')] || 12
+    const bars = preview.querySelector('.ov-bars')
+    bars.replaceChildren(
+      ...Array.from({ length: count }, (_, i) => {
+        const b = document.createElement('i')
+        b.style.background = theme.bar(i / Math.max(1, count - 1))
+        // A resting speech shape, so the preview is not flat before (or without) the animation.
+        const h = 3 + Math.round(Math.abs(Math.sin(i * 1.3 + 0.5)) * 13)
+        b.style.height = `${h}px`
+        b.style.opacity = (0.7 + (h / 18) * 0.3).toFixed(2)
+        return b
+      }),
+    )
+    const time = preview.querySelector('.ov-time')
+    time.style.color = theme.timer
+    time.hidden = !switchOn('duration')
+    preview.querySelector('.ov-cap').hidden = !switchOn('stream')
+  }
+  // The preview talks with the same synthetic voice and the app's bar algorithm as the hero.
+  const animatePreview = (on) => {
+    clearInterval(previewWave)
+    if (!on || reduceMotion.matches || !preview) return
+    let sim = null
+    const t0 = performance.now()
+    previewWave = setInterval(() => {
+      const els = Array.from(preview.querySelectorAll('.ov-bars i'))
+      if (!sim || sim.prev.length !== els.length) sim = makeWave(els.length)
+      const t = (performance.now() - t0) / 1000
+      const talking = t % 4 < 3.2
+      const frame = talking ? 0.07 * (0.35 + 0.65 * Math.abs(Math.sin(t * Math.PI * 4.2))) * (0.85 + Math.random() * 0.3) : 0.003
+      paintBars(els, stepWave(sim, synthSlices(frame, els.length), frame))
+    }, 33)
+  }
+  const setPages = $$('[data-am-set-page]')
+  const showSetPage = (id) => {
+    setPages.forEach((p) => { p.hidden = p.dataset.amSetPage !== id })
+    $$('[data-am-set-nav]').forEach((b) => b.classList.toggle('is-on', b.dataset.amSetNav === id))
+    animatePreview(id === 'appearance')
+    modal?.querySelector('.am-modal-body')?.scrollTo(0, 0)
+  }
+  // The gear opens the sheet on its first page, as the app does.
+  const openSettings = (open) => {
+    if (!modal) return
+    modal.hidden = !open
+    if (open) {
+      showSetPage('general')
+      modal.querySelector('[data-am-close]')?.focus({ preventScroll: true })
+    } else {
+      animatePreview(false)
+    }
+  }
+  // The chips above the window (build.mjs appMock) jump to a page, or to a page of the settings sheet.
+  document.querySelectorAll('[data-am-go]').forEach((chip) =>
+    chip.addEventListener('click', () => {
+      const [page, sub] = chip.dataset.amGo.split(':')
+      if (page === 'settings') {
+        openSettings(true)
+        if (sub) showSetPage(sub)
+      } else {
+        openSettings(false)
+        go(page)
+      }
+    }),
+  )
+
+  // History: search, starred filter, expand a record.
+  const histSearch = root.querySelector('[data-am-hist-search]')
+  const histEmpty = root.querySelector('[data-am-hist-empty]')
+  let starredOnly = false
+  const filterHistory = () => {
+    const q = (histSearch?.value || '').trim().toLowerCase()
+    let shown = 0
+    $$('[data-am-hist-item]').forEach((li) => {
+      const starred = li.querySelector('.am-star')?.getAttribute('aria-pressed') === 'true'
+      const ok = (!q || li.textContent.toLowerCase().includes(q)) && (!starredOnly || starred)
+      li.hidden = !ok
+      if (ok) shown++
+    })
+    if (histEmpty) histEmpty.hidden = shown > 0
+  }
+  histSearch?.addEventListener('input', filterHistory)
+
+  // Latency badges re-measure with a short wait, as "Test all" does in the app.
+  const tone = (v) => (v >= 2000 ? 'is-slow' : v >= 900 ? 'is-mid' : 'is-fast')
+  const fmtMs = (v) => (v >= 1000 ? `${(v / 1000).toFixed(1)}s` : `${v}ms`)
+  const testAll = (block) =>
+    block.querySelectorAll('[data-am-ms]').forEach((el) => {
+      const base = Number(el.dataset.amMs) || 600
+      el.className = 'am-ms is-testing'
+      el.textContent = '…'
+      setTimeout(() => {
+        const v = Math.round(base * (0.8 + Math.random() * 0.4))
+        el.className = `am-ms ${tone(v)}`
+        el.textContent = fmtMs(v)
+      }, 400 + Math.random() * 1100)
+    })
+
+  root.addEventListener('click', (e) => {
+    const t = e.target
+    const nav = t.closest('[data-am-nav]')
+    if (nav) return go(nav.dataset.amNav)
+    if (t.closest('[data-am-open-settings]')) return openSettings(true)
+    if (t.closest('[data-am-close]') || t === modal) return openSettings(false)
+
+    const sw = t.closest('.am-switch')
+    if (sw) {
+      const next = sw.getAttribute('aria-checked') !== 'true'
+      const sync = sw.dataset.amSync
+        ; (sync ? $$(`.am-switch[data-am-sync="${sync}"]`) : [sw]).forEach((s) => s.setAttribute('aria-checked', String(next)))
+      if (sync === 'duration' || sync === 'stream') paintPreview()
+      return
+    }
+
+    const edit = t.closest('[data-am-edit]')
+    if (edit) {
+      const box = edit.closest('.am-preset')?.querySelector('.am-preset-edit')
+      if (box) {
+        box.hidden = !box.hidden
+        if (!box.hidden) box.querySelector('textarea')?.focus({ preventScroll: true })
+      }
+      return
+    }
+
+    const seg = t.closest('[data-am-seg], [data-am-hist-tab]')
+    if (seg) {
+      seg.parentElement.querySelectorAll('button').forEach((b) => b.classList.toggle('is-on', b === seg))
+      if (seg.dataset.amHistTab) {
+        starredOnly = seg.dataset.amHistTab === '1'
+        filterHistory()
+      }
+      return
+    }
+
+    const star = t.closest('.am-star')
+    if (star) {
+      star.setAttribute('aria-pressed', String(star.getAttribute('aria-pressed') !== 'true'))
+      return filterHistory()
+    }
+
+    const hist = t.closest('.am-hist-main')
+    if (hist) {
+      const li = hist.closest('[data-am-hist-item]')
+      const open = !li.classList.contains('is-open')
+      li.classList.toggle('is-open', open)
+      hist.setAttribute('aria-expanded', String(open))
+      return
+    }
+
+    const remove = t.closest('[data-am-hot-list] button')
+    if (remove) return remove.closest('li')?.remove()
+
+    const test = t.closest('[data-am-test]')
+    if (test) return testAll(test.closest('.am-block'))
+
+    const setNav = t.closest('[data-am-set-nav]')
+    if (setNav) return showSetPage(setNav.dataset.amSetNav)
+
+    // Diagnostics: refresh re-checks each row in turn; log tabs filter by level.
+    const refresh = t.closest('[data-am-diag-refresh]')
+    if (refresh && !refresh.disabled) {
+      const label = refresh.querySelector('span')
+      const original = label.textContent
+      const rows = $$('[data-am-health] li')
+      refresh.disabled = true
+      label.textContent = refresh.dataset.checking
+      rows.forEach((r) => r.classList.add('is-checking'))
+      rows.forEach((r, i) => setTimeout(() => r.classList.remove('is-checking'), 350 + i * 220))
+      setTimeout(() => {
+        refresh.disabled = false
+        label.textContent = original
+      }, 350 + rows.length * 220)
+      return
+    }
+    const logTab = t.closest('[data-am-log]')
+    if (logTab) {
+      logTab.parentElement.querySelectorAll('button').forEach((b) => b.classList.toggle('is-on', b === logTab))
+      const lvl = logTab.dataset.amLog
+      $$('[data-am-log-view] [data-lv]').forEach((l) => {
+        l.hidden = lvl !== 'all' && l.dataset.lv !== lvl
+      })
+      return
+    }
+
+    // Microphone test: the level meter moves for a couple of seconds.
+    const micTest = t.closest('[data-am-mic-test]')
+    if (micTest && !micTest.classList.contains('is-testing')) {
+      const label = micTest.querySelector('span')
+      const original = label.textContent
+      const meter = root.querySelector('.am-meter i')
+      micTest.classList.add('is-testing')
+      label.textContent = micTest.dataset.testing
+      const id = setInterval(() => { if (meter) meter.style.transform = `scaleX(${(0.15 + Math.random() * 0.75).toFixed(2)})` }, 90)
+      setTimeout(() => {
+        clearInterval(id)
+        if (meter) meter.style.transform = 'scaleX(0)'
+        micTest.classList.remove('is-testing')
+        label.textContent = original
+      }, 2400)
+      return
+    }
+
+    // Shortcut boxes: click, then press a key to rebind, as in the app (Esc keeps the old one).
+    const keyBtn = t.closest('[data-am-key]')
+    if (keyBtn) {
+      $$('[data-am-key].is-listening').forEach((k) => k.classList.remove('is-listening'))
+      keyBtn.classList.add('is-listening')
+      keyBtn.dataset.old = keyBtn.textContent
+      keyBtn.textContent = '…'
+      return
+    }
+
+    const choice = t.closest('[data-am-choice]')
+    if (choice && !t.closest('textarea')) {
+      const group = choice.closest('[data-am-choices]')
+      Array.from(group.children).forEach((c) => {
+        const on = c === choice
+        c.classList.toggle('is-on', on)
+        if (c.hasAttribute('aria-pressed')) c.setAttribute('aria-pressed', String(on))
+      })
+      if (choice.dataset.amTheme) root.dataset.theme = choice.dataset.amTheme
+      if (choice.dataset.amWave || choice.dataset.amLen) paintPreview()
+      // The sidebar's status icon follows the mode, as in the app (cpu / cloud / wifi).
+      if (choice.dataset.amMode) $$('[data-am-conn] [data-conn]').forEach((c) => { c.hidden = c.dataset.conn !== choice.dataset.amMode })
+    }
   })
 
-  // Rerun buttons
-  if (els.rerunAsr) els.rerunAsr.addEventListener('click', () => void rerunAsr())
-  if (els.rerunLlm) els.rerunLlm.addEventListener('click', () => void rerunLlm())
+  // Editing a prompt updates the one-line summary under its name, as the app's list does.
+  root.addEventListener('input', (e) => {
+    const area = e.target.closest('.am-preset-edit textarea')
+    if (!area) return
+    const line = area.closest('.am-preset')?.querySelector('.am-preset-line')
+    if (line) line.textContent = area.value.split('\n')[0]
+  })
 
-  // Prompt mode buttons
-  if (els.mFaithful) els.mFaithful.addEventListener('click', () => setPromptMode('faithful'))
-  if (els.mIntent) els.mIntent.addEventListener('click', () => setPromptMode('intent'))
+  const hotForm = root.querySelector('[data-am-hot-form]')
+  hotForm?.addEventListener('submit', (e) => {
+    e.preventDefault()
+    const input = hotForm.querySelector('[data-am-hot-input]')
+    const list = root.querySelector('[data-am-hot-list]')
+    const word = (input.value || '').trim()
+    if (!word || !list) return
+    const li = document.createElement('li')
+    li.className = 'is-new'
+    const span = document.createElement('span')
+    span.textContent = word
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.setAttribute('aria-label', `${list.dataset.remove || ''} ${word}`.trim())
+    btn.innerHTML = list.querySelector('li button')?.innerHTML || '×'
+    li.append(span, btn)
+    list.prepend(li)
+    input.value = ''
+  })
 
-  try {
-    await loadConfig()
-    if (state.config?.web_demo?.enabled) await connectWebSocket()
-  } catch (e) {
-    setStateText('status.initFailed', '')
-    console.error('Boot error:', e)
+  const keyName = (e) => {
+    const parts = []
+    if (e.ctrlKey) parts.push('Ctrl')
+    if (e.altKey) parts.push(e.code === 'AltRight' ? (LOCALE === 'zh-CN' ? '右 Alt' : 'Right Alt') : 'Alt')
+    if (e.shiftKey) parts.push('Shift')
+    if (e.metaKey) parts.push('Win')
+    if (!['Control', 'Alt', 'Shift', 'Meta', 'AltGraph'].includes(e.key)) parts.push(e.key.length === 1 ? e.key.toUpperCase() : e.key)
+    return [...new Set(parts)].join(' + ')
   }
+  root.addEventListener('keydown', (e) => {
+    const listening = root.querySelector('[data-am-key].is-listening')
+    if (listening) {
+      e.preventDefault()
+      listening.textContent = e.key === 'Escape' ? listening.dataset.old : keyName(e) || listening.dataset.old
+      listening.classList.remove('is-listening')
+      return
+    }
+    if (e.key === 'Escape' && modal && !modal.hidden) openSettings(false)
+  })
+  paintPreview()
 }
+
+/* ── The app's cleanup-preset card (AI cleanup section) ──────────────────── */
+
+// Behaves like PromptPresetSection.tsx: New opens a blank form, a template copies in a built-in
+// prompt (the real text, embedded by build.mjs), the pencil edits a preset (built-in names are
+// fixed and "Restore default" brings their prompt back), Save adds or updates the row, the trash
+// removes a custom one, and the shortcut box only accepts a modifier + key combination.
+function initPresetCard() {
+  const root = document.querySelector('[data-pp]')
+  if (!root) return
+  const data = JSON.parse(root.querySelector('[data-pp-data]').textContent)
+  const s = data.s
+  const q = (sel) => root.querySelector(sel)
+  const form = q('[data-pp-form]')
+  const title = q('[data-pp-form-title]')
+  const name = q('[data-pp-name]')
+  const prompt = q('[data-pp-prompt]')
+  const tplField = q('[data-pp-template-field]')
+  const tpl = q('[data-pp-template]')
+  const key = q('[data-pp-key]')
+  const missing = q('[data-pp-missing]')
+  const restore = q('[data-pp-restore]')
+  const save = q('[data-pp-save]')
+  const list = q('[data-pp-list]')
+  const rowTpl = q('[data-pp-tpl]')
+  const custom = new Map() // id -> { name, prompt }
+  const edited = {} // built-in id -> the prompt as the visitor changed it
+  const shortcuts = {} // preset id -> "Alt+4"
+  let editing = null // null while creating
+  let shortcut = ''
+  let listening = false
+  let seq = 0
+  const lang = () => root.dataset.lang
+  const rowOf = (id) => list.querySelector(`[data-pp-row="${CSS.escape(id)}"]`)
+  const isBuiltin = (id) => Boolean(id && rowOf(id)?.hasAttribute('data-builtin'))
+
+  const renderKey = () => {
+    key.classList.toggle('is-listening', listening)
+    key.textContent = ''
+    if (listening) {
+      const hint = document.createElement('span')
+      hint.textContent = s.pressKeys
+      key.append(hint)
+      return
+    }
+    ; (shortcut ? shortcut.split('+') : [s.notSet]).forEach((part, i) => {
+      if (i) {
+        const plus = document.createElement('span')
+        plus.className = 'pp-plus'
+        plus.textContent = '+'
+        key.append(plus)
+      }
+      const cap = document.createElement('kbd')
+      cap.textContent = part
+      key.append(cap)
+    })
+  }
+  // The app explains why Save is unavailable instead of just greying it out.
+  const validate = () => {
+    const noName = !name.value.trim()
+    const noPrompt = !prompt.value.trim()
+    save.disabled = noName || noPrompt
+    missing.hidden = !(noName || noPrompt)
+    missing.textContent = noName && noPrompt ? s.missingBoth : noName ? s.missingName : s.missingPrompt
+  }
+  const open = (id) => {
+    editing = id
+    const builtin = isBuiltin(id)
+    if (!id) {
+      title.textContent = s.createTitle
+      name.value = ''
+      prompt.value = ''
+    } else if (builtin) {
+      title.textContent = s.editTitle.replace('{name}', data.names[id])
+      name.value = data.names[id]
+      prompt.value = edited[id] ?? data.prompts[lang()][id]
+    } else {
+      const preset = custom.get(id)
+      title.textContent = s.editTitle.replace('{name}', preset.name)
+      name.value = preset.name
+      prompt.value = preset.prompt
+    }
+    shortcut = (id && shortcuts[id]) || ''
+    listening = false
+    name.disabled = builtin
+    tplField.hidden = Boolean(id)
+    tpl.value = ''
+    restore.hidden = !builtin
+    form.hidden = false
+    renderKey()
+    validate()
+    prompt.scrollTop = 0
+    if (!builtin) name.focus({ preventScroll: true })
+  }
+  const close = () => {
+    form.hidden = true
+    listening = false
+    editing = null
+  }
+  const select = (row) =>
+    list.querySelectorAll('.pp-row').forEach((r) => {
+      r.classList.toggle('is-on', r === row)
+      r.querySelector('.pp-pick').setAttribute('aria-pressed', String(r === row))
+    })
+  const setBadge = (id, value) => {
+    const nameRow = rowOf(id)?.querySelector('.pp-row-name')
+    if (!nameRow) return
+    let badge = nameRow.querySelector('.pp-sc')
+    if (!value) return void badge?.remove()
+    if (!badge) {
+      badge = document.createElement('span')
+      badge.className = 'pp-sc'
+      nameRow.append(badge)
+    }
+    badge.textContent = value
+  }
+
+  root.addEventListener('click', (e) => {
+    const t = e.target
+    if (!(t instanceof Element)) return
+    const langBtn = t.closest('[data-pp-lang]')
+    if (langBtn) {
+      const prev = lang()
+      root.dataset.lang = langBtn.dataset.ppLang
+      root.querySelectorAll('[data-pp-lang]').forEach((b) => b.setAttribute('aria-checked', String(b === langBtn)))
+      // A built-in being edited follows the language, as long as the visitor has not changed it.
+      if (editing && isBuiltin(editing) && prompt.value === data.prompts[prev][editing]) prompt.value = data.prompts[lang()][editing]
+      return
+    }
+    if (t.closest('[data-pp-new]')) return open(null)
+    if (t.closest('[data-pp-cancel]')) return close()
+    if (t.closest('[data-pp-restore]')) {
+      prompt.value = data.prompts[lang()][editing]
+      delete edited[editing]
+      return validate()
+    }
+    if (t.closest('[data-pp-key]')) {
+      listening = !listening
+      return renderKey()
+    }
+    if (t.closest('[data-pp-key-clear]')) {
+      shortcut = ''
+      listening = false
+      return renderKey()
+    }
+    if (t.closest('[data-pp-save]')) {
+      if (save.disabled) return
+      let id = editing
+      if (!id) {
+        id = `custom-${++seq}`
+        custom.set(id, { name: name.value.trim(), prompt: prompt.value })
+        const row = rowTpl.content.firstElementChild.cloneNode(true)
+        row.dataset.ppRow = id
+        row.querySelector('b').textContent = name.value.trim()
+        list.append(row)
+        select(row)
+      } else if (isBuiltin(id)) {
+        if (prompt.value === data.prompts[lang()][id]) delete edited[id]
+        else edited[id] = prompt.value
+      } else {
+        custom.set(id, { name: name.value.trim(), prompt: prompt.value })
+        rowOf(id).querySelector('b').textContent = name.value.trim()
+      }
+      // A combination belongs to one preset at a time, as in the app.
+      Object.keys(shortcuts).forEach((other) => {
+        if (shortcut && other !== id && shortcuts[other] === shortcut) {
+          delete shortcuts[other]
+          setBadge(other, '')
+        }
+      })
+      if (shortcut) shortcuts[id] = shortcut
+      else delete shortcuts[id]
+      setBadge(id, shortcut)
+      return close()
+    }
+    const row = t.closest('.pp-row')
+    if (!row) return
+    const id = row.dataset.ppRow
+    if (t.closest('[data-pp-edit]')) return open(id)
+    if (t.closest('[data-pp-delete]')) {
+      const wasOn = row.classList.contains('is-on')
+      custom.delete(id)
+      delete shortcuts[id]
+      if (editing === id) close()
+      row.remove()
+      if (wasOn) select(list.querySelector('.pp-row'))
+      return
+    }
+    if (t.closest('.pp-pick')) select(row)
+  })
+  tpl.addEventListener('change', () => {
+    if (tpl.value) prompt.value = data.prompts[lang()][tpl.value]
+    prompt.scrollTop = 0
+    validate()
+  })
+  name.addEventListener('input', validate)
+  prompt.addEventListener('input', validate)
+  // comboOnly: a bare key keeps listening; Esc gives up; leaving the box stops listening.
+  document.addEventListener('keydown', (e) => {
+    if (!listening) return
+    e.preventDefault()
+    if (e.key === 'Escape') {
+      listening = false
+      return renderKey()
+    }
+    if (['Control', 'Alt', 'Shift', 'Meta', 'AltGraph'].includes(e.key)) return
+    const mods = [e.ctrlKey && 'Ctrl', e.altKey && 'Alt', e.shiftKey && 'Shift', e.metaKey && 'Win'].filter(Boolean)
+    if (!mods.length) return
+    shortcut = [...mods, e.key.length === 1 ? e.key.toUpperCase() : e.key].join('+')
+    listening = false
+    renderKey()
+  })
+  document.addEventListener('click', (e) => {
+    if (listening && !(e.target instanceof Element && e.target.closest('[data-pp-key]'))) {
+      listening = false
+      renderKey()
+    }
+  })
+  validate()
+}
+
+/* ── Top nav: lift the section in view ────────────────────────────────────── */
+
+function initScrollSpy() {
+  const links = Array.from(document.querySelectorAll('.topnav [data-spy]'))
+  const targets = links.map((a) => document.getElementById(a.dataset.spy)).filter(Boolean)
+  if (!targets.length) return
+  let queued = false
+  const update = () => {
+    queued = false
+    // A section counts once its top has passed just under the bar and its bottom has not.
+    const line = 96
+    const active = targets.filter((el) => {
+      const r = el.getBoundingClientRect()
+      return r.top <= line && r.bottom > line
+    }).pop()
+    links.forEach((a) => {
+      if (active && a.dataset.spy === active.id) a.setAttribute('aria-current', 'true')
+      else a.removeAttribute('aria-current')
+    })
+  }
+  window.addEventListener(
+    'scroll',
+    () => {
+      if (queued) return
+      queued = true
+      requestAnimationFrame(update)
+    },
+    { passive: true },
+  )
+  update()
+}
+
+async function boot() {
+  document.querySelectorAll('[data-tabs]').forEach(initTabs)
+  initScrollSpy()
+  initReplay()
+  initTerminalCopy()
+  initDemo()
+  initAppMock()
+  initPresetCard()
+  let cfg
+  try {
+    cfg = await loadConfig()
+  } catch (e) {
+    setOffline('status.initFailed', 'demo.offline')
+    console.error('Boot error:', e)
+    return
+  }
+  const demo = cfg.web_demo || {}
+  state.llmEnabled = Boolean(demo.llm_enabled)
+  if (!demo.enabled) return setOffline('status.unavailable', 'demo.offline')
+  // Browsers only expose the microphone on HTTPS (and localhost). On a plain-http address the
+  // demo cannot work at all, so say so instead of connecting.
+  if (!canRecordHere()) return setOffline('status.insecure', 'demo.insecure')
+  // Connect only when the demo is about to be seen: most visitors never scroll this far, and every
+  // open socket counts against the server's per-IP limits. A failed attempt is rescheduled by onclose.
+  const section = document.getElementById('demo')
+  const start = () => connect().catch(() => { })
+  if (!section || !('IntersectionObserver' in window)) return void start()
+  const io = new IntersectionObserver(
+    (entries) => {
+      if (!entries.some((e) => e.isIntersecting)) return
+      io.disconnect()
+      void start()
+    },
+    { rootMargin: '400px 0px' },
+  )
+  io.observe(section)
+}
+
 boot()

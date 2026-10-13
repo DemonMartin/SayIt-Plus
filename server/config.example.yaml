@@ -92,7 +92,7 @@ public_site:
 # --- Browser Demo ---
 web_demo:
   enabled: true
-  max_duration_sec: 600              # Max recording length per session (sec)
+  max_duration_sec: 300              # Max recording length per session (sec), same as the desktop app
   max_concurrency_per_ip: 3
 
 # --- Admin Dashboard ---

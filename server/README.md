@@ -153,7 +153,7 @@ llm:
 
 web_demo:
   enabled: true
-  max_duration_sec: 600              # Max recording per session
+  max_duration_sec: 300              # Max recording per session, same as the desktop app
   max_concurrency_per_ip: 3
 
 admin:

@@ -127,7 +127,8 @@ class PublicSiteConfig:
 @dataclass(slots=True)
 class WebDemoConfig:
     enabled: bool = True
-    max_duration_sec: int = 600
+    # Same as the desktop app's per-take limit (client MAX_RECORDING_SEC = 300); the site says 5 minutes.
+    max_duration_sec: int = 300
     max_concurrency_per_ip: int = 3
     llm: LLMProfile = field(default_factory=LLMProfile)
 
