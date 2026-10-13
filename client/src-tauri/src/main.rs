@@ -11,6 +11,7 @@ mod context;
 mod inject;
 mod providers;
 mod models;
+mod defaults;
 mod net_policy;
 mod path_guard;
 
@@ -254,12 +255,11 @@ fn main() {
 
     // Read PTT setting before moving storage into managed state
     let ptt_setting_val = storage.get("shortcutPTT", None);
-    // 兜底键与 storage 种子、前端 defaults.ts 保持一致；绝不能是 Shift（会触发筛选键）
-    let ptt_str = ptt_setting_val.as_str().unwrap_or("ControlRight").to_string();
+    let ptt_str = ptt_setting_val.as_str().unwrap_or(defaults::SHORTCUT_PTT).to_string();
     let hf_setting_val = storage.get("shortcutHandsFree", None);
-    let hf_str = hf_setting_val.as_str().unwrap_or("AltRight").to_string();
+    let hf_str = hf_setting_val.as_str().unwrap_or(defaults::SHORTCUT_HANDS_FREE).to_string();
     let ai_toggle_setting_val = storage.get("shortcutToggleAi", None);
-    let ai_toggle_str = ai_toggle_setting_val.as_str().unwrap_or("").to_string();
+    let ai_toggle_str = ai_toggle_setting_val.as_str().unwrap_or(defaults::SHORTCUT_TOGGLE_AI).to_string();
     log::info!("PTT setting from DB: raw={:?} parsed={:?}", ptt_setting_val, ptt_str);
     log::info!("HF setting from DB: raw={:?} parsed={:?}", hf_setting_val, hf_str);
 
@@ -628,14 +628,11 @@ fn main() {
 
             Ok(())
         })
+        // 前端只用 shell(open) 和 dialog；global-shortcut、autostart 是 Rust 自己在用。
+        // 更新走自己的 download_update / install_downloaded_update（system.rs），不用 updater 插件。
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        // updater plugin disabled until signing keys are generated
-        // .plugin(tauri_plugin_updater::Builder::new().build())
-        // .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),

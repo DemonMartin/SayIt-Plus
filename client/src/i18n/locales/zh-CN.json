@@ -622,8 +622,6 @@
   "local.downloadSourceAria": "下载源",
   "local.openModelFolder": "打开模型文件夹",
   "local.openModelFolderAria": "打开 {name} 的模型文件夹",
-  "local.archiveNote": "压缩包，下载后解压到上面的模型文件夹（解压出 .onnx 等文件直接放入该目录即可）。",
-  "local.archiveLabel": "模型压缩包 (.tar.bz2)",
   "local.pickDirTitle": "选择模型存储位置",
   "local.storageTitle": "模型存储位置",
   "local.storageHelp": "本地模型体积较大，可以选择其他路径存放。已下载的模型在更换目录后会自动迁移。",

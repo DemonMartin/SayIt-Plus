@@ -622,8 +622,6 @@
   "local.downloadSourceAria": "Download source",
   "local.openModelFolder": "Open model folder",
   "local.openModelFolderAria": "Open the folder for {name}",
-  "local.archiveNote": "archive. Download it and extract into the model folder above (put the .onnx and other extracted files straight into that directory).",
-  "local.archiveLabel": "model archive (.tar.bz2)",
   "local.pickDirTitle": "Choose where to store models",
   "local.storageTitle": "Model storage location",
   "local.storageHelp": "Local models are large, so you can keep them elsewhere. Anything already downloaded is moved for you when you change the directory.",

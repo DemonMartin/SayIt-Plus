@@ -406,9 +406,8 @@ impl PttKeyConfig {
 /// 机器开箱就绑在那个键上（前端也一样，见 services/defaults.ts）。
 /// 右 Ctrl 位置相近、没有辅助功能陷阱，也不和免提的默认键（右 Alt）撞。
 ///
-/// ⚠️ 改这里要同步：src/services/defaults.ts、storage/mod.rs 的种子默认值、
-/// main.rs 读设置时的兜底。
-const DEFAULT_PTT_SETTING: &str = "ControlRight";
+/// 值在 crate::defaults，那里有与前端 defaults.ts 的对账测试。
+const DEFAULT_PTT_SETTING: &str = crate::defaults::SHORTCUT_PTT;
 const DEFAULT_PTT_VK: u32 = 0xA3;
 
 /// 解析向后兼容的 PTT 物理键格式。旧单键仍是单成员；组合成员用 `+` 分隔。

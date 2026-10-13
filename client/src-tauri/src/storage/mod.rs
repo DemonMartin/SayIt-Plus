@@ -4,11 +4,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// Default settings values (mirrors electron-app/electron/store.ts)
-const DEFAULT_SETTINGS: &[(&str, &str)] = &[
-    // 按住说话的默认键。不能是 Shift：长按右 Shift 会触发 Windows 筛选键，
-    // 导致松开后录音停不下来。与 src/services/defaults.ts、keyboard/mod.rs 的
-    // DEFAULT_PTT_SETTING 保持一致。
+/// 新库的种子值。JSON 字面量用不了常量，快捷键几项与 crate::defaults 的对账在 defaults.rs 的测试里。
+pub(crate) const DEFAULT_SETTINGS: &[(&str, &str)] = &[
     ("shortcutPTT", r#""ControlRight""#),
     ("shortcutPTTCombo", r#""Alt+Q""#),
     ("shortcutHandsFree", r#""AltRight""#),
