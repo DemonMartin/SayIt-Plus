@@ -82,7 +82,7 @@ pub fn mute_system_output() -> Result<bool, String> {
 
             // 仅在首次静音时保存原状态，避免重复调用覆盖真实原值
             {
-                let mut saved = SAVED_MUTE_STATE.lock().unwrap();
+                let mut saved = SAVED_MUTE_STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 if saved.is_none() {
                     *saved = Some(was_muted);
                 }
@@ -113,7 +113,7 @@ pub fn restore_system_output() -> Result<bool, String> {
     #[cfg(windows)]
     unsafe {
         let saved = {
-            let mut s = SAVED_MUTE_STATE.lock().unwrap();
+            let mut s = SAVED_MUTE_STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             s.take()
         };
 

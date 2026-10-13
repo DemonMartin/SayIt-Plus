@@ -209,7 +209,7 @@ pub fn set_ptt_lab_config(data: Value, app: AppHandle) -> Result<(), String> {
             }
             LAB_RUNNING.store(false, Ordering::SeqCst);
             LAB_THREAD_ID.store(0, Ordering::SeqCst);
-            *LAB_APP.lock().unwrap() = None;
+            *LAB_APP.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             // Small delay to let old thread exit
             thread::sleep(std::time::Duration::from_millis(100));
             log::info!("[ptt-lab] stopped lab hook");
@@ -225,7 +225,7 @@ pub fn set_ptt_lab_config(data: Value, app: AppHandle) -> Result<(), String> {
             .map(|v| v as u32)
             .unwrap_or(0xA3); // VK_RCONTROL
 
-        *LAB_APP.lock().unwrap() = Some(app.clone());
+        *LAB_APP.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(app.clone());
         LAB_RUNNING.store(true, Ordering::SeqCst);
 
         thread::spawn(move || {

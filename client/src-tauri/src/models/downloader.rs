@@ -240,6 +240,27 @@ pub fn model_dir(model_id: &str) -> PathBuf {
     models_dir().join(model_id)
 }
 
+/// 模型 id 会直接拼进路径。来自前端的 id 必须先过这一关：
+/// `..\..` 能跳出模型目录，绝对路径会让 join 把前缀整个换掉 —— 而 delete_model 拿它去
+/// `remove_dir_all`，传一个 `C:\Users\<name>` 就是删掉整个用户目录。
+/// 目录里的 id 都是字母、数字、`-`、`.`、`_` 组成的短串。
+pub fn is_valid_model_id(model_id: &str) -> bool {
+    !model_id.is_empty()
+        && model_id.len() <= 96
+        && !model_id.starts_with('.')
+        && !model_id.contains("..")
+        && model_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// 校验过的 model_dir：id 不合规就报错，不碰磁盘。
+pub fn checked_model_dir(model_id: &str) -> Result<PathBuf, String> {
+    if is_valid_model_id(model_id) {
+        Ok(model_dir(model_id))
+    } else {
+        Err(format!("Invalid model id: {}", crate::providers::diag::truncate(model_id, 60)))
+    }
+}
+
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1623,6 +1644,22 @@ pub async fn download_file(
             );
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod model_id_tests {
+    use super::{checked_model_dir, is_valid_model_id};
+
+    #[test]
+    fn catalog_style_ids_pass_and_paths_are_rejected() {
+        for ok in ["sensevoice-small-gguf", "qwen3-asr-0.6b", "fun_asr.nano"] {
+            assert!(is_valid_model_id(ok), "{ok}");
+        }
+        for bad in ["", "..", "../x", r"..\..", r"C:\Users\someone", "/etc", "a/b", r"a\b", ".hidden", "x..y"] {
+            assert!(!is_valid_model_id(bad), "{bad}");
+            assert!(checked_model_dir(bad).is_err(), "{bad}");
+        }
     }
 }
 

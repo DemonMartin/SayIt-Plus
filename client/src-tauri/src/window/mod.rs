@@ -177,7 +177,7 @@ impl WindowState {
     /// 对外公开是给托盘菜单窗口用的：它是同一个 WebView2 环境、同一个 origin，OS 文本
     /// 缩放和页面缩放都是共享的，所以没必要让它再单独测一遍（它也没有 render ack 通道）。
     pub fn css_zoom(&self) -> f64 {
-        *self.overlay_css_zoom.lock().unwrap()
+        *self.overlay_css_zoom.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 记录渲染端上报的 devicePixelRatio，换算成 css_zoom 缓存起来。
@@ -200,7 +200,7 @@ impl WindowState {
         let zoom = (dpr / monitor_scale).clamp(OVERLAY_CSS_ZOOM_MIN, OVERLAY_CSS_ZOOM_MAX);
 
         let previous = {
-            let mut cached = self.overlay_css_zoom.lock().unwrap();
+            let mut cached = self.overlay_css_zoom.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             // 0.01 的死区：dpr 与 scale 都是浮点，每次 present 都上报，末位抖动不该触发
             // 重设几何（重设会带来一帧的位置/尺寸跳动，见 apply_payload_layout 的注释）。
             if (zoom - *cached).abs() < 0.01 {
@@ -224,15 +224,15 @@ impl WindowState {
     /// 数百毫秒。预热只把 renderer 准备好，不显示窗口；真正 present 时仍会重新捕获
     /// 当前前台显示器、应用最终布局并置顶。
     pub fn prewarm_overlay(&self, app: &AppHandle) {
-        let _lifecycle_guard = self.overlay_lifecycle.lock().unwrap();
+        let _lifecycle_guard = self.overlay_lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.active_show_id.load(Ordering::SeqCst) != 0
             || app.get_webview_window("overlay").is_some()
         {
             return;
         }
 
-        let layout = self.overlay_layout.lock().unwrap().clone();
-        let base_width = *self.overlay_base_width.lock().unwrap();
+        let layout = self.overlay_layout.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let base_width = *self.overlay_base_width.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         write_log_line("[overlay-health] idle prewarm begin");
         self.create_overlay(app, layout, base_width, false);
     }
@@ -241,7 +241,7 @@ impl WindowState {
     pub fn present_overlay(&self, app: &AppHandle, data: Value) -> u64 {
         self.apply_payload_layout(&data);
         self.capture_overlay_monitor();
-        *self.latest_overlay_payload.lock().unwrap() = Some(data);
+        *self.latest_overlay_payload.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(data);
 
         let show_id = SHOW_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
         self.active_show_id.store(show_id, Ordering::SeqCst);
@@ -270,7 +270,7 @@ impl WindowState {
 
     /// 兼容旧调用点；新代码应使用 present_overlay，将显示和状态更新合成一次操作。
     pub fn show_overlay(&self, app: &AppHandle) -> u64 {
-        let data = self.latest_overlay_payload.lock().unwrap().clone()
+        let data = self.latest_overlay_payload.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
             // 最近一次状态可能是 hide 时写进去的 blank（它专门用来清掉残留帧，
             // 见 hide_overlay）。照它重放会显示一个空窗口，所以当没有状态处理。
             .filter(|payload| payload.get("state").and_then(Value::as_str) != Some("blank"))
@@ -280,12 +280,12 @@ impl WindowState {
 
     pub fn hide_overlay(&self, app: &AppHandle) {
         self.active_show_id.store(0, Ordering::SeqCst);
-        *self.overlay_monitor.lock().unwrap() = None;
+        *self.overlay_monitor.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         // 下次显示需要重新应用几何。
-        *self.last_applied_layout.lock().unwrap() = None;
+        *self.last_applied_layout.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
         let prev_layout = {
-            let mut layout = self.overlay_layout.lock().unwrap();
+            let mut layout = self.overlay_layout.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let previous = layout.clone();
             *layout = OverlayLayout::Base;
             previous
@@ -309,7 +309,7 @@ impl WindowState {
             // 刻意不用 render-ack 把 hide 卡住（虽然那样更精确）：ack 走双层 rAF，
             // 一旦某次没回来，窗口就永远留在屏幕上 —— 那比闪一下旧内容糟得多。
             // 固定延迟的失败模式只是"这次没来得及画完，退回原来的表现"，不会更坏。
-            *self.latest_overlay_payload.lock().unwrap() = Some(json!({ "state": "blank" }));
+            *self.latest_overlay_payload.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(json!({ "state": "blank" }));
             self.emit_latest(app, false);
             write_log_line(&format!(
                 "[overlay-health] blank before hide prev_layout={:?} delay_ms={}",
@@ -321,12 +321,12 @@ impl WindowState {
 
     pub fn update_overlay_state(&self, app: &AppHandle, data: &Value) {
         self.apply_payload_layout(data);
-        *self.latest_overlay_payload.lock().unwrap() = Some(data.clone());
+        *self.latest_overlay_payload.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(data.clone());
 
         if let Some(overlay) = app.get_webview_window("overlay") {
-            let layout = self.overlay_layout.lock().unwrap().clone();
+            let layout = self.overlay_layout.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
             // 仅在布局真正变化时才重设原生窗口几何，避免每帧 set_position/set_size 抖动。
-            let previous = self.last_applied_layout.lock().unwrap().clone();
+            let previous = self.last_applied_layout.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
             let changed = previous.as_ref() != Some(&layout);
             if changed {
                 // 录音期间唯一会改窗口几何的地方，必须留痕：这条路径以前一行日志都不写，
@@ -400,7 +400,7 @@ impl WindowState {
         // 先学缩放：这一轮的窗口已经按旧 css_zoom 建好了，学到新值就地重设几何，让**当前**
         // 这次显示也能被纠正，而不是只让下一次受益（用户按一次热键只看到这一次）。
         if self.note_css_zoom(app, data.get("devicePixelRatio").and_then(Value::as_f64)) {
-            let layout = self.overlay_layout.lock().unwrap().clone();
+            let layout = self.overlay_layout.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
             if let Some(overlay) = app.get_webview_window("overlay") {
                 self.apply_native_layout(app, &overlay, &layout);
             }
@@ -582,13 +582,13 @@ impl WindowState {
                 value.source, value.left, value.top, value.right, value.bottom,
             ));
         }
-        *self.overlay_monitor.lock().unwrap() = monitor;
+        *self.overlay_monitor.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = monitor;
     }
 
     fn apply_payload_layout(&self, data: &Value) {
         if let Some(width) = data.get("baseWidth").and_then(Value::as_f64) {
             if (160.0..=600.0).contains(&width) {
-                *self.overlay_base_width.lock().unwrap() = width;
+                *self.overlay_base_width.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = width;
             }
         }
 
@@ -621,7 +621,7 @@ impl WindowState {
             OverlayLayout::Base
         };
 
-        let mut current_layout = self.overlay_layout.lock().unwrap();
+        let mut current_layout = self.overlay_layout.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let stable_visible_phase = matches!(
             state,
             Some("listening") | Some("thinking") | Some("toast") | Some("error")
@@ -652,7 +652,7 @@ impl WindowState {
     }
 
     fn latest_state_name(&self) -> String {
-        self.latest_overlay_payload.lock().unwrap().as_ref()
+        self.latest_overlay_payload.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref()
             .and_then(|payload| payload.get("state"))
             .and_then(Value::as_str)
             .unwrap_or("unknown")
@@ -660,7 +660,7 @@ impl WindowState {
     }
 
     fn payload_for_emit(&self, probe: bool) -> Option<Value> {
-        let mut payload = self.latest_overlay_payload.lock().unwrap().clone()?;
+        let mut payload = self.latest_overlay_payload.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()?;
         let show_id = self.active_show_id.load(Ordering::SeqCst);
         let generation = self.active_generation.load(Ordering::SeqCst);
         let object = payload.as_object_mut()?;
@@ -686,9 +686,9 @@ impl WindowState {
     fn ensure_visible(&self, app: &AppHandle, show_id: u64) -> bool {
         // WebviewWindowBuilder 的 label 注册与 Manager 句柄可见性不是原子操作。
         // 多个 present 并发时若都看到 handle=MISSING，会争抢同一 "overlay" label。
-        let _lifecycle_guard = self.overlay_lifecycle.lock().unwrap();
-        let layout = self.overlay_layout.lock().unwrap().clone();
-        let base_width = *self.overlay_base_width.lock().unwrap();
+        let _lifecycle_guard = self.overlay_lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let layout = self.overlay_layout.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let base_width = *self.overlay_base_width.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let Some(overlay) = app.get_webview_window("overlay") else {
             write_log_line(&format!(
@@ -729,10 +729,10 @@ impl WindowState {
         layout: &OverlayLayout,
     ) -> Option<String> {
         // 记录本次应用的布局，供 update_overlay_state 判重、跳过无谓的窗口重设。
-        *self.last_applied_layout.lock().unwrap() = Some(layout.clone());
-        let base_width = *self.overlay_base_width.lock().unwrap();
+        *self.last_applied_layout.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(layout.clone());
+        let base_width = *self.overlay_base_width.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let css_zoom = self.css_zoom();
-        let target_monitor = self.overlay_monitor.lock().unwrap().clone();
+        let target_monitor = self.overlay_monitor.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         if let Some(bounds) = target_monitor
             .as_ref()
             .and_then(|value| calc_monitor_overlay_bounds(app, value, layout, base_width, css_zoom))
@@ -767,7 +767,7 @@ impl WindowState {
     }
 
     fn recover_overlay(&self, app: &AppHandle, show_id: u64) {
-        let _lifecycle_guard = self.overlay_lifecycle.lock().unwrap();
+        let _lifecycle_guard = self.overlay_lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // 等锁期间可能已经 hide 或开始了下一次显示，必须重新校验。
         if !self.is_active(show_id, 0) {
             return;
@@ -809,8 +809,8 @@ impl WindowState {
             return;
         }
 
-        let layout = self.overlay_layout.lock().unwrap().clone();
-        let base_width = *self.overlay_base_width.lock().unwrap();
+        let layout = self.overlay_layout.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let base_width = *self.overlay_base_width.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         self.create_overlay(app, layout, base_width, true);
     }
 
@@ -1387,7 +1387,7 @@ mod tests {
             .iter()
             .map(|payload| {
                 state.apply_payload_layout(payload);
-                state.overlay_layout.lock().unwrap().clone()
+                state.overlay_layout.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
             })
             .collect()
     }

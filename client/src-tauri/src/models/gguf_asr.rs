@@ -448,7 +448,8 @@ fn ensure_loaded(model_id: &str, accelerator: &str, gpu_device: &str) -> Result<
     // 先释放旧引擎再建新的，避免同时驻留两份权重（GGUF 动辄几百 MB ~ 数 GB）。
     *cache = None;
 
-    let path = find_gguf(&model_dir(model_id))?;
+    // model_id 来自前端（设置里的 localAsr.modelId），先校验再拼路径。
+    let path = find_gguf(&crate::models::downloader::checked_model_dir(model_id)?)?;
     log::info!("Loading GGUF ASR model: {} ({})", model_id, path.display());
     let start = Instant::now();
 

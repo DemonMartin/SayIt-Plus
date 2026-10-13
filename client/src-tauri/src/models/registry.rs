@@ -122,7 +122,7 @@ pub async fn download_model(
 /// 删除已下载的模型
 #[tauri::command]
 pub fn delete_model(model_id: String) -> Result<(), String> {
-    let model_path = downloader::model_dir(&model_id);
+    let model_path = downloader::checked_model_dir(&model_id)?;
     let _delete_lease = downloader::acquire_model_path(&model_path)?;
     if model_path.exists() {
         std::fs::remove_dir_all(&model_path)
@@ -284,7 +284,7 @@ pub async fn set_models_dir(
 /// 打开指定模型的存储目录（不存在则创建）
 #[tauri::command]
 pub fn open_model_folder(model_id: String) -> Result<String, String> {
-    let dir = downloader::model_dir(&model_id);
+    let dir = downloader::checked_model_dir(&model_id)?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create directory: {}", e))?;
     let path = dir.to_string_lossy().to_string();
     #[cfg(target_os = "windows")]

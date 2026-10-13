@@ -1336,7 +1336,7 @@ impl KeyboardHookManager {
             "[ptt-lifecycle] start() called ptt_setting={} hf_setting={} ai_toggle_setting={}",
             ptt_setting, hf_setting, ai_toggle_setting,
         ));
-        let has_hook_thread = self.hook_thread.lock().unwrap().is_some();
+        let has_hook_thread = self.hook_thread.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some();
         if self.running.load(Ordering::SeqCst) || has_hook_thread {
             self.stop();
         }
@@ -1382,7 +1382,7 @@ impl KeyboardHookManager {
             app_handle: app.clone(),
         });
 
-        *self.shared_state.lock().unwrap() = Some(state.clone());
+        *self.shared_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(state.clone());
         self.running.store(true, Ordering::SeqCst);
 
         let state_for_thread = state.clone();
@@ -1391,11 +1391,11 @@ impl KeyboardHookManager {
         let hook_thread = thread::spawn(move || {
             Self::hook_thread(state_for_thread, tx);
         });
-        *self.hook_thread.lock().unwrap() = Some(hook_thread);
+        *self.hook_thread.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook_thread);
 
         // Wait for the thread to report its ID
         if let Ok(thread_id) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            *self.hook_thread_id.lock().unwrap() = Some(thread_id);
+            *self.hook_thread_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(thread_id);
             HOOK_RUNNING.store(true, Ordering::SeqCst);
             log::info!("Keyboard hook started, thread_id={}", thread_id);
             crate::commands::system::write_log_line(&format!(
@@ -1420,7 +1420,7 @@ impl KeyboardHookManager {
         // 先清成员位，但不在调用线程清活动代次。hook 线程退出时会在最后一个 callback
         // 完成后，用同一个 sender 依次排入配对 up 和 Shutdown，避免 stop 与 down 入队竞态。
         #[cfg(windows)]
-        if let Some(state) = self.shared_state.lock().unwrap().as_ref() {
+        if let Some(state) = self.shared_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref() {
             let had_active = state.ptt_active_generation.load(Ordering::SeqCst) != 0;
             clear_ptt_members(state);
 
@@ -1448,7 +1448,7 @@ impl KeyboardHookManager {
             }
         }
 
-        if let Some(thread_id) = self.hook_thread_id.lock().unwrap().take() {
+        if let Some(thread_id) = self.hook_thread_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             #[cfg(windows)]
             unsafe {
                 let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
@@ -1457,7 +1457,7 @@ impl KeyboardHookManager {
 
         // 等 hook 线程卸载钩子，并等它内部的 dispatcher 处理 Shutdown 后真正退出。
         // 这是重配的跨实例屏障：旧实例不可能在新实例 ptt-down 之后再发旧 ptt-up。
-        if let Some(hook_thread) = self.hook_thread.lock().unwrap().take() {
+        if let Some(hook_thread) = self.hook_thread.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             if hook_thread.join().is_err() {
                 crate::commands::system::write_log_line(
                     "[ptt-lifecycle] hook thread panicked while stopping",
@@ -1466,12 +1466,12 @@ impl KeyboardHookManager {
         }
 
         #[cfg(windows)]
-        if let Some(state) = self.shared_state.lock().unwrap().as_ref() {
+        if let Some(state) = self.shared_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref() {
             // 安装失败/panic 时 hook 线程可能没机会排 up；至少不要把 native 状态留住。
             clear_ptt_members(state);
             let _ = clear_ptt_press(&state.ptt_active_generation);
         }
-        *self.shared_state.lock().unwrap() = None;
+        *self.shared_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// Reconfigure with new PTT, hands-free, and AI-cleanup settings.
@@ -1489,7 +1489,7 @@ impl KeyboardHookManager {
     /// Set hands-free mode active (suppresses PTT up events temporarily)
     #[allow(dead_code)]
     pub fn set_hands_free(&self, active: bool) {
-        if let Some(state) = self.shared_state.lock().unwrap().as_ref() {
+        if let Some(state) = self.shared_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref() {
             state.hands_free_active.store(active, Ordering::SeqCst);
             if active {
                 clear_ptt_members(state);

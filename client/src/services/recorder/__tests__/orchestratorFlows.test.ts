@@ -91,7 +91,7 @@ vi.mock('../../audio', async (importOriginal) => ({
 }))
 
 const provider = vi.hoisted(() => ({
-  mode: 'server' as const,
+  mode: 'server' as string,
   callbacks: null as null | Record<string, (...args: unknown[]) => void>,
   ready: true,
   stopAccepted: true,
@@ -144,7 +144,7 @@ vi.mock('../../textInsertion', () => ({
 vi.mock('../../personalization/store', async () => ({
   getAppPromptRules: vi.fn(async () => []),
   getUserStats: vi.fn(async () => (await import('../../personalization/defaults')).createDefaultUserStats()),
-  recordSessionStats: vi.fn(async () => ({})),
+  recordSessionStats: vi.fn(async () => (await import('../../personalization/defaults')).createDefaultUserStats()),
 }))
 vi.mock('../../../stores/activePreset', () => ({ setActivePresetKnown: vi.fn() }))
 vi.mock('@/i18n', () => ({ t: (key: string) => key, getLocale: () => 'zh-CN' }))
@@ -227,6 +227,7 @@ beforeEach(() => {
     editable: true, hwnd: '100', focusHwnd: '101', process: 'notepad.exe', probeId: 1, verdict: 'editable', detail: 'test',
   }
   h.state.pasteResult = { ok: true, strategy: 'clipboard' }
+  provider.mode = 'server'
   provider.ready = true
   provider.stopAccepted = true
   provider.callbacks = null
@@ -588,5 +589,80 @@ describe('RecorderOrchestrator 麦克风电平提醒', () => {
     expect(warnings()).not.toContain('overlay.warnMicMuted')
     expect(orch.getState()).toBe('recording')
     vi.mocked(invoke).mockImplementation(async () => undefined)
+  })
+})
+
+describe('RecorderOrchestrator 插入卡住与各模式超时', () => {
+  const fake = () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] })
+    vi.stubGlobal('window', globalThis)
+  }
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('插入一直不返回：15 秒后把文字交还给用户（兜底卡片），回到空闲，能开始下一次', async () => {
+    vi.mocked(bridge.pasteText).mockImplementationOnce(() => new Promise(() => {}))
+    await startedOrchestrator()
+    fake()
+    await recordAndRelease(2)
+    provider.callbacks!.onFinal(finalResult('卡住的这句'))
+    await vi.advanceTimersByTimeAsync(100)
+    expect(bridge.pasteText).toHaveBeenCalledTimes(1)
+    expect(overlayStates()).not.toContain('fallback')
+
+    await vi.advanceTimersByTimeAsync(15_100)
+    expect(overlayStates()).toContain('fallback')
+    const fallback = [...vi.mocked(bridge.presentOverlay).mock.calls, ...vi.mocked(bridge.updateOverlay).mock.calls]
+      .map((c) => c[0] as Record<string, unknown>)
+      .find((p) => p.state === 'fallback')
+    expect(JSON.stringify(fallback)).toContain('卡住的这句')
+    expect(orch.getState()).toBe('idle')
+    expect(store.history).toHaveLength(1)
+
+    await vi.advanceTimersByTimeAsync(600)
+    emit('ptt-down')
+    for (let i = 0; i < 5; i++) {
+      await vi.advanceTimersByTimeAsync(20)
+      await flush(60)
+    }
+    if (orch.getState() !== 'recording') {
+      const events = vi.mocked(addRuntimeEvent).mock.calls.slice(-8).map((c) => `${c[1]} ${c[2]} ${JSON.stringify(c[3] ?? '').slice(0, 200)}`)
+      throw new Error(events.join(' | '))
+    }
+  })
+
+  it.each([
+    ['server', 16_000],
+    ['local', 30_000],
+    ['cloud_api', 31_000],
+  ])('%s 模式 2 秒音频的处理超时是 %i ms', async (mode, timeoutMs) => {
+    provider.mode = mode
+    await startedOrchestrator()
+    fake()
+    await recordAndRelease(2)
+    await vi.advanceTimersByTimeAsync(timeoutMs - 200)
+    expect(orch.getState()).toBe('processing')
+    await vi.advanceTimersByTimeAsync(400)
+    expect(orch.getState()).toBe('idle')
+  })
+})
+
+describe('RecorderOrchestrator 开始录音时出错', () => {
+  it('取上下文和路由那一段抛错：报「开始录音失败」，锁释放，下一次能正常开始', async () => {
+    const personalization = await import('../../personalization/store')
+    const defaults = await import('../../personalization/defaults')
+    // 统计数据格式坏掉时，提示词路由会抛错（2026-10 补测试时撞到的真实路径）
+    vi.mocked(personalization.getUserStats).mockResolvedValueOnce({} as never)
+    await startedOrchestrator()
+
+    emit('ptt-down')
+    await flush(40)
+    expect(orch.getState()).toBe('idle')
+    expect(overlayStates()).toContain('error')
+
+    vi.mocked(personalization.getUserStats).mockResolvedValue(defaults.createDefaultUserStats())
+    await orch.refreshRuntimeSettings()
+    emit('ptt-down')
+    await flush(40)
+    expect(orch.getState()).toBe('recording')
   })
 })
