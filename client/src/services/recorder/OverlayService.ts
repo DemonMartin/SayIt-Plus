@@ -128,6 +128,7 @@ export class OverlayService {
   }
 
   private readySoundCtx: AudioContext | null = null
+  private readyTonesPlaying = 0
 
   private playReadySound() {
     if (!this.readySoundEnabled) return
@@ -159,6 +160,17 @@ export class OverlayService {
       gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15)
       osc.start(ctx.currentTime)
       osc.stop(ctx.currentTime + 0.15)
+      // 播完就把 AudioContext 挂起。一个处于 running 的 AudioContext 哪怕什么都不播，
+      // 渲染进程和音频服务进程也会每 10ms 跑一次音频图：2026-10 实测空闲 20 秒多耗约 360ms CPU
+      // （约 1.8% 个核），而且从第一次录音起一直耗到退出 —— 正式版「用久了空闲 CPU 变高」就是它。
+      // 下次播放前 playReadySound 会先 resume。计数是为了上一声没播完时别把下一声掐掉。
+      this.readyTonesPlaying++
+      osc.onended = () => {
+        this.readyTonesPlaying = Math.max(0, this.readyTonesPlaying - 1)
+        if (this.readyTonesPlaying === 0 && ctx.state === 'running') {
+          ctx.suspend().catch(() => { /* ignore */ })
+        }
+      }
     } catch { /* ignore */ }
   }
 
@@ -299,7 +311,13 @@ export class OverlayService {
     // 采集链路已经成功启动时立刻发布 listening；不要再为 ticker 的首个 33ms
     // 人为保留 waiting。PCM 随后仍通过 pushListeningBars 驱动真实波形。
     this.pushListeningBars(undefined, true)
+    // 有 PCM 时波形那一路（pushListeningBars）已经按 33ms 带着计时和流式文本在发了，
+    // 这里只在 33ms 内没人发过时补位（采集卡住、还没收到第一帧）。原来两路各自 33ms，
+    // 合起来每秒约 60 次 IPC 和 60 次悬浮窗重渲染，画面却只需要 30 帧。
     this.tickerId = setInterval(() => {
+      const now = Date.now()
+      if (now - this.lastFrameAt < 33) return
+      this.lastFrameAt = now
       void bridge.updateOverlay(this.listeningPayload())
     }, 33)
   }

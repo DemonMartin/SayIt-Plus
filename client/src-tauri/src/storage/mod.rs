@@ -264,10 +264,20 @@ impl Storage {
         db.query_row(&sql, params_ref.as_slice(), |row| row.get(0)).unwrap_or(0)
     }
 
+    /// 新记录排在最前面。
+    ///
+    /// list_order 只用来排序（ORDER BY list_order ASC），不要求从 0 开始连续，所以新记录
+    /// 取「当前最小值 - 1」即可，走索引。原来是先把全表每行 +1 再插 0，记录越多每次口述
+    /// 保存越慢（几千条时每次都是几千行的写入）。插入和统计放进同一个事务，不再三次各自提交。
     pub fn history_add(&self, record: &Value) -> SqlResult<()> {
-        let db = self.db.lock().unwrap();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
 
-        db.execute("UPDATE history_records SET list_order = list_order + 1", [])?;
+        let list_order: i64 = tx.query_row(
+            "SELECT COALESCE(MIN(list_order), 0) - 1 FROM history_records",
+            [],
+            |row| row.get(0),
+        )?;
 
         let obj = record.as_object().cloned().unwrap_or_default();
         let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -281,15 +291,15 @@ impl Storage {
         let audio_file_path = obj.get("audioFilePath").and_then(|v| v.as_str());
         let raw_json = serde_json::to_string(record).unwrap_or_else(|_| "{}".to_string());
 
-        db.execute(
+        tx.execute(
             "INSERT INTO history_records (id, list_order, timestamp, favorite, char_count, duration_sec, is_empty, app_id, app_name, audio_file_path, raw_json)
-             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![id, timestamp, favorite as i32, char_count, duration_sec, is_empty as i32, app_id, app_name, audio_file_path, raw_json],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![id, list_order, timestamp, favorite as i32, char_count, duration_sec, is_empty as i32, app_id, app_name, audio_file_path, raw_json],
         )?;
 
         // Update stats
-        self.update_stats_delta(&db, char_count, duration_sec, 1);
-        Ok(())
+        self.update_stats_delta(&tx, char_count, duration_sec, 1);
+        tx.commit()
     }
 
     pub fn history_update(&self, id: &str, patch: &Value) -> SqlResult<()> {
@@ -338,7 +348,8 @@ impl Storage {
     }
 
     pub fn history_delete(&self, id: &str) -> SqlResult<()> {
-        let db = self.db.lock().unwrap();
+        let mut db = self.db.lock().unwrap();
+        let db = db.transaction()?;
 
         let row: Option<(i64, String)> = db.query_row(
             "SELECT list_order, raw_json FROM history_records WHERE id = ?1",
@@ -355,11 +366,12 @@ impl Storage {
         let char_count = obj.get("charCount").and_then(|v| v.as_i64()).unwrap_or(0);
         let duration_sec = obj.get("durationSec").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
+        // 后面的记录整体前移一位不是必须的（排序允许有空位），保留是为了和旧数据的形态一致。
         db.execute("DELETE FROM history_records WHERE id = ?1", params![id])?;
         db.execute("UPDATE history_records SET list_order = list_order - 1 WHERE list_order > ?1", params![list_order])?;
 
         self.update_stats_delta(&db, char_count, duration_sec, -1);
-        Ok(())
+        db.commit()
     }
 
     pub fn history_set_favorite(&self, id: &str, favorite: bool) -> SqlResult<()> {
@@ -819,5 +831,47 @@ impl Storage {
         }
 
         tx.commit()
+    }
+}
+
+#[cfg(test)]
+mod history_order_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ids(storage: &Storage) -> Vec<String> {
+        storage
+            .history_list(None, false, None, None)
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// 新记录排最前，删掉中间一条后顺序不乱，再加一条仍排最前；统计跟着增减。
+    /// 也覆盖「旧库里 list_order 从 0 开始连续」和「新写法取最小值 - 1」混用的情况。
+    #[test]
+    fn newest_first_survives_add_delete_and_old_rows() {
+        let dir = std::env::temp_dir().join(format!("sayit-history-order-{}", uuid::Uuid::new_v4()));
+        let storage = Storage::new(dir.join("t.db")).unwrap();
+        storage
+            .set("history", &json!([{ "id": "old1", "charCount": 1 }, { "id": "old2", "charCount": 1 }]))
+            .unwrap();
+        storage.history_add(&json!({ "id": "a", "charCount": 3, "durationSec": 1.5 })).unwrap();
+        storage.history_add(&json!({ "id": "b", "charCount": 4, "durationSec": 2.0 })).unwrap();
+        assert_eq!(ids(&storage), ["b", "a", "old1", "old2"]);
+
+        storage.history_delete("a").unwrap();
+        assert_eq!(ids(&storage), ["b", "old1", "old2"]);
+        storage.history_add(&json!({ "id": "c", "charCount": 5 })).unwrap();
+        assert_eq!(ids(&storage), ["c", "b", "old1", "old2"]);
+
+        let stats = storage.get("stats", None);
+        assert_eq!(stats["totalChars"], json!(4 + 5));
+
+        let page = storage.history_list(None, false, Some(2), Some(1));
+        assert_eq!(page.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(), ["b", "old1"]);
+
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -335,9 +335,7 @@ fn main() {
         // 而是唤起已有窗口，避免两个客户端同时收全局热键、各插一份文本。
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.unminimize();
-                let _ = w.set_focus();
+                window::show_main_window(&w);
                 if args.iter().any(|a| a == "--open-about") {
                     let _ = w.emit("open-about", ());
                 }
@@ -505,9 +503,7 @@ fn main() {
                     // show() 只清 SW_HIDE，不解除最小化（iconic）状态：窗口若以
                     // 最小化状态诞生，只 show 会停在 -32000 的停车位上，看起来"没启动"。
                     // 托盘/单实例路径都是 show + unminimize，这里保持一致。
-                    let _ = main_window.show();
-                    let _ = main_window.unminimize();
-                    let _ = main_window.set_focus();
+                    window::show_main_window(&main_window);
                     log::info!(
                         "Main window shown (minimized={:?} visible={:?})",
                         main_window.is_minimized().ok(),
@@ -515,6 +511,7 @@ fn main() {
                     );
                 } else {
                     log::info!("Launched with --minimized, staying hidden in tray");
+                    window::set_main_window_memory_low(&main_window, true);
                 }
                 if launched_open_about {
                     let _ = main_window.emit("open-about", ());
@@ -559,9 +556,7 @@ fn main() {
                                 MouseButton::Left => {
                                     commands::tray::hide_tray_menu(tray.app_handle().clone());
                                     if let Some(w) = tray.app_handle().get_webview_window("main") {
-                                        let _ = w.show();
-                                        let _ = w.unminimize();
-                                        let _ = w.set_focus();
+                                        window::show_main_window(&w);
                                     }
                                 }
                                 MouseButton::Right => {
@@ -789,7 +784,7 @@ fn main() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     api.prevent_close();
-                    let _ = window.hide();
+                    window::hide_main_window(window);
                 }
             }
         })

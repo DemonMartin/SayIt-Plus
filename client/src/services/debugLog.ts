@@ -123,6 +123,8 @@ function shouldKeepMessage(type: string): boolean {
 
 let sessions: DebugSession[] = []
 let current: DebugSession | null = null
+/** current.audioChunks 的总字节数，跟着 current 一起重置。 */
+let currentAudioBytes = 0
 let runtimeEvents: RuntimeEvent[] = []
 
 import { appendDebugLog } from './bridge'
@@ -218,6 +220,7 @@ export function startSession(opts?: { systemPrompt?: string }) {
     messages: [],
     audioChunks: [],
   }
+  currentAudioBytes = 0
 
   sessions.unshift(current)
   trimSessions()
@@ -272,10 +275,12 @@ export function addMsg(direction: 'sent' | 'received', type: string, data: unkno
 export function addAudioChunk(buffer: ArrayBuffer) {
   if (!current) return
   if (totalAudioBytes >= MAX_AUDIO_BYTES_TOTAL) return
-  const nextBytes = current.audioChunks.reduce((sum, chunk) => sum + chunk.byteLength, 0) + buffer.byteLength
+  // 计数而不是每帧把已存的块重新加一遍：录音期间这里每发一个音频包就调一次。
+  const nextBytes = currentAudioBytes + buffer.byteLength
   if (nextBytes > MAX_AUDIO_BYTES_PER_SESSION) return
   const copy = buffer.slice(0)
   current.audioChunks.push(copy)
+  currentAudioBytes = nextBytes
   totalAudioBytes += copy.byteLength
 }
 

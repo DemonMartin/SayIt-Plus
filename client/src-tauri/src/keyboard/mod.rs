@@ -50,7 +50,34 @@ pub fn set_shortcut_capture(on: bool) {
     // 若在结束时就清掉，这个“抬起”就会漏给 webview（后退键会导致页面返回）。
     if on {
         CONSUME_XUP_VK.store(0, Ordering::SeqCst);
+        // 录制时可能按侧键，鼠标钩子必须在场才能把它吞掉（见 needs_mouse_hook）。
+        // 钩子只能装在钩子线程上，所以发消息让那边装。
+        #[cfg(windows)]
+        {
+            let tid = HOOK_THREAD_ID.load(Ordering::SeqCst);
+            if tid != 0 {
+                unsafe {
+                    let _ = PostThreadMessageW(tid, WM_SAYIT_NEED_MOUSE_HOOK, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
     }
+}
+
+/// 键盘钩子线程的 id，用来从别的线程让它装上鼠标钩子。0 = 钩子线程没在跑。
+static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+/// 发给钩子线程的私有消息（WM_APP + 0x51）：「现在需要鼠标钩子」。
+#[cfg(windows)]
+const WM_SAYIT_NEED_MOUSE_HOOK: u32 = 0x8000 + 0x51;
+
+/// 鼠标钩子只在用得上时才装：某个热键绑在鼠标键上（侧键 / 中键），或者正在录制快捷键。
+///
+/// 原来它随键盘钩子一直挂着。回调虽然对鼠标移动最先放行，但每次移动仍要经过一次
+/// 跨进程回调，高回报率的游戏鼠标每秒上千次。绝大多数用户根本没绑鼠标键。
+/// 录制时装上的钩子留到下次重配（保存绑定后就会重配）才按绑定重新决定，
+/// 这样捕获到侧键后配对的那个抬起照样能被吞掉（pitfalls #6）。
+fn needs_mouse_hook(ptt: &[u32], hf: &[u32], ai_toggle: &[u32], capturing: bool) -> bool {
+    capturing || ptt.iter().chain(hf).chain(ai_toggle).any(|vk| is_mouse_vk(*vk))
 }
 
 // ── 全局 Esc 动作 ──
@@ -1585,11 +1612,7 @@ impl KeyboardHookManager {
                 }
             };
 
-            // 低级鼠标钩子始终随键盘钩子一起挂上：一是支持侧键做 PTT/免提，二是设置页
-            // 录制侧键时需要靠它在 OS 层把侧键吞掉（否则 webview 会先把侧键当“后退”）。
-            // 它与键盘钩子共用本线程的同一个消息循环；回调对鼠标移动等有最前置的快速放行，
-            // 开销可忽略。只有真正命中侧键（录制捕获 / 已绑为热键）时才会吞事件。
-            let mouse_hook: Option<windows::Win32::UI::WindowsAndMessaging::HHOOK> =
+            let install_mouse_hook = || -> Option<windows::Win32::UI::WindowsAndMessaging::HHOOK> {
                 match SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), None, 0) {
                     Ok(h) => {
                         log::info!("SetWindowsHookExW(WH_MOUSE_LL) succeeded: {:?}", h.0);
@@ -1605,18 +1628,44 @@ impl KeyboardHookManager {
                         ));
                         None
                     }
-                };
+                }
+            };
+            let mut mouse_hook = if needs_mouse_hook(
+                &state.ptt_vk_codes,
+                &state.hf_vk_codes,
+                &state.ai_toggle_vk_codes,
+                SHORTCUT_CAPTURE.load(Ordering::SeqCst),
+            ) {
+                install_mouse_hook()
+            } else {
+                crate::commands::system::write_log_line(
+                    "[ptt-lifecycle] mouse hook not installed (no mouse button is bound)",
+                );
+                None
+            };
 
             let thread_id = GetCurrentThreadId();
             let _ = tx.send(thread_id);
+            HOOK_THREAD_ID.store(thread_id, Ordering::SeqCst);
             log::info!("keyboard hook message loop starting on thread {}", thread_id);
+            // 消息循环开始前录制可能已经打开（那条消息发给了旧线程或还没线程），补一次。
+            if mouse_hook.is_none() && SHORTCUT_CAPTURE.load(Ordering::SeqCst) {
+                mouse_hook = install_mouse_hook();
+            }
 
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                if msg.hwnd.0.is_null() && msg.message == WM_SAYIT_NEED_MOUSE_HOOK {
+                    if mouse_hook.is_none() {
+                        mouse_hook = install_mouse_hook();
+                    }
+                    continue;
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
 
+            let _ = HOOK_THREAD_ID.compare_exchange(thread_id, 0, Ordering::SeqCst, Ordering::SeqCst);
             log::info!("keyboard hook message loop exited");
             let _ = UnhookWindowsHookEx(hook);
             if let Some(mh) = mouse_hook {
@@ -2268,7 +2317,7 @@ mod tests {
         press_ptt_member, ptt_key_config, release_ptt_member, set_card_hotkeys,
         set_escape_action_mode, should_consume_combo_main_down, single_key_requires_bare_press,
         CARD_HOTKEY_COPY, CARD_HOTKEY_DEADLINE_MS, CARD_HOTKEY_FOREGROUND, DEFAULT_PTT_SETTING,
-        DEFAULT_PTT_VK, SINGLE_KEY_TABLE,
+        DEFAULT_PTT_VK, SINGLE_KEY_TABLE, needs_mouse_hook,
     };
     #[cfg(windows)]
     use super::queue_ptt_release;
@@ -2512,6 +2561,16 @@ mod tests {
         assert_eq!(active_generation.load(Ordering::SeqCst), active_gen);
         assert_eq!(claim_ptt_release(&active_generation, Some(active_gen)), Some(active_gen));
         assert!(complete_ptt_release(&active_generation, active_gen));
+    }
+
+    #[test]
+    fn mouse_hook_is_only_needed_for_mouse_bindings_or_capture() {
+        let keyboard = [0xA3u32];
+        assert!(!needs_mouse_hook(&keyboard, &[0xA5], &[], false));
+        assert!(needs_mouse_hook(&keyboard, &[0xA5], &[], true));
+        assert!(needs_mouse_hook(&[0x05], &[0xA5], &[], false));
+        assert!(needs_mouse_hook(&keyboard, &[0x06], &[], false));
+        assert!(needs_mouse_hook(&keyboard, &[], &[0x04], false));
     }
 
     /// 鼠标按键清单必须与 `is_mouse_vk` 保持一致。

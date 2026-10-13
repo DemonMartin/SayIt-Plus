@@ -558,8 +558,12 @@ impl WindowState {
 
     /// 悬浮窗正显示时，把它重新顶到 topmost 带最上层。供前台窗口切换钩子调用，
     /// 让用户切到/打开别的置顶程序时，悬浮窗立即回到最上面。
+    pub fn overlay_visible(&self) -> bool {
+        self.active_show_id.load(Ordering::SeqCst) != 0
+    }
+
     pub fn reassert_overlay_topmost_if_visible(&self, app: &AppHandle) {
-        if self.active_show_id.load(Ordering::SeqCst) == 0 {
+        if !self.overlay_visible() {
             return;
         }
         reassert_overlay_topmost(app);
@@ -916,6 +920,57 @@ fn reassert_overlay_topmost(app: &AppHandle) {
 
 #[cfg(not(windows))]
 fn reassert_overlay_topmost(_app: &AppHandle) {}
+
+/// 主窗藏到托盘时告诉 WebView2「内存可以少用」，再显示时恢复。
+///
+/// 主窗藏着的时间远多于开着的时间（常驻托盘 + 开机自启），而它的渲染进程是 SayIt 内存的大头。
+/// 只是内存目标，不停 JS：录音、WebSocket 都跑在这个进程里，必须照常工作（所以不用 TrySuspend）。
+/// 运行时太旧（没有 ICoreWebView2_19）就什么也不做。
+pub fn set_main_window_memory_low(window: &tauri::WebviewWindow, low: bool) {
+    #[cfg(windows)]
+    {
+        let _ = window.with_webview(move |webview| {
+            use webview2_com::Microsoft::Web::WebView2::Win32::{
+                ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+                COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+            };
+            use windows_core::Interface;
+            unsafe {
+                let Ok(core) = webview.controller().CoreWebView2() else { return };
+                let Ok(core19) = core.cast::<ICoreWebView2_19>() else { return };
+                let level = if low {
+                    COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+                } else {
+                    COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+                };
+                if let Err(e) = core19.SetMemoryUsageTargetLevel(level) {
+                    log::warn!("[memory] SetMemoryUsageTargetLevel failed: {e:?}");
+                } else {
+                    log::info!("[memory] main window memory target {}", if low { "low" } else { "normal" });
+                }
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = (window, low);
+}
+
+/// 显示主窗的统一入口：恢复内存目标、show、解除最小化、抢焦点。
+/// 只 show 不 unminimize 会让以最小化状态诞生的窗口停在屏幕外（pitfalls #11）。
+pub fn show_main_window(window: &tauri::WebviewWindow) {
+    set_main_window_memory_low(window, false);
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+}
+
+/// 主窗藏到托盘的统一入口。
+pub fn hide_main_window(window: &tauri::Window) {
+    let _ = window.hide();
+    if let Some(webview_window) = window.app_handle().get_webview_window(window.label()) {
+        set_main_window_memory_low(&webview_window, true);
+    }
+}
 
 /// 悬浮窗显示期间，周期性地把它重新顶到最上层，兜住「显示后才出现/重申置顶的窗口」。
 /// 只在本次 show_id 仍是当前显示时运行；一旦切到下一次显示或隐藏（active_show_id 变化）即退出。

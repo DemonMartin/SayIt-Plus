@@ -4,9 +4,8 @@
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;
@@ -92,42 +91,35 @@ pub struct MonitorBounds {
 }
 
 pub struct ContextDetector {
-    cached_context: Mutex<Option<AppContext>>,
     winevent_running: AtomicBool,
 }
 
 impl ContextDetector {
     pub fn new() -> Self {
         Self {
-            cached_context: Mutex::new(None),
             winevent_running: AtomicBool::new(false),
         }
     }
 
     /// Capture the current foreground window context
     pub fn capture(&self, reason: &str) -> AppContext {
-        let ctx = capture_context_with_text(reason, false);
-        *self.cached_context.lock().unwrap() = Some(ctx.clone());
-        ctx
+        capture_context_with_text(reason, false)
     }
 
     /// Capture the recording target, optionally including a bounded slice of editor text.
     /// This separate entry point is intentional: WinEvent hooks must never start reading text
     /// merely because the feature exists.
     pub fn capture_recording(&self, reason: &str, include_text_context: bool) -> AppContext {
-        let ctx = capture_context_with_text(reason, include_text_context);
-        *self.cached_context.lock().unwrap() = Some(ctx.clone());
-        ctx
+        capture_context_with_text(reason, include_text_context)
     }
 
-    /// Get the last cached context without re-capturing
-    #[allow(dead_code)]
-    pub fn get_cached(&self) -> Option<AppContext> {
-        self.cached_context.lock().unwrap().clone()
-    }
-
-    /// Start the WinEvent hook that monitors foreground window changes
-    /// and pushes active-app-context events to the frontend
+    /// 监听前台窗口切换：切换后若悬浮窗正显示，把它重新顶回最上层
+    /// （用户切到 PotPlayer 这类置顶程序时，悬浮窗会被压下去）。
+    ///
+    /// 只做这一件事。原来这里还挂了 EVENT_OBJECT_FOCUS，并且每次切换都完整采集一遍
+    /// 前台上下文（进程路径 + UI Automation）再广播给全部 webview —— 可前端没有任何
+    /// 地方订阅那个事件，录音和插字时都会重新采集。代价却不小：方向键在列表里移动都会触发，
+    /// 而 UIA 查询会让 Chrome / VS Code / 微信这类程序打开自己的无障碍树，跟着多耗 CPU 和内存。
     #[cfg(windows)]
     pub fn start_winevent_hook(&self, app: &AppHandle) {
         if self.winevent_running.swap(true, Ordering::SeqCst) {
@@ -135,8 +127,6 @@ impl ContextDetector {
         }
 
         let app_handle = app.clone();
-        let cached = Arc::new(Mutex::new(None::<AppContext>));
-        let cached_for_cb = cached.clone();
 
         thread::spawn(move || {
             use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
@@ -144,19 +134,13 @@ impl ContextDetector {
                 DispatchMessageW, GetMessageW, TranslateMessage, MSG,
             };
 
-            // WinEvent constants
             const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
-            const EVENT_OBJECT_FOCUS: u32 = 0x8005;
             const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
 
-            // Store app handle in thread-local for the callback
             thread_local! {
                 static APP: std::cell::RefCell<Option<AppHandle>> = std::cell::RefCell::new(None);
-                static CACHED: std::cell::RefCell<Option<Arc<Mutex<Option<AppContext>>>>> = std::cell::RefCell::new(None);
             }
-
             APP.with(|a| *a.borrow_mut() = Some(app_handle));
-            CACHED.with(|c| *c.borrow_mut() = Some(cached_for_cb));
 
             unsafe extern "system" fn winevent_proc(
                 _hook: HWINEVENTHOOK,
@@ -167,25 +151,16 @@ impl ContextDetector {
                 _event_thread: u32,
                 _event_time: u32,
             ) {
-                // Debounce: small delay to let focus settle
-                std::thread::sleep(std::time::Duration::from_millis(50));
-
-                let ctx = capture_context("winevent");
-
                 APP.with(|a| {
-                    if let Some(app) = a.borrow().as_ref() {
-                        let _ = app.emit("active-app-context", &ctx);
-                        // 前台窗口切换后，若悬浮窗正显示，立即把它重新顶回最上层——
-                        // 覆盖「用户切到/打开 PotPlayer 等置顶程序把悬浮窗压下去」的场景。
-                        app.state::<crate::window::WindowState>()
-                            .reassert_overlay_topmost_if_visible(app);
+                    let Some(app) = a.borrow().as_ref().cloned() else { return };
+                    let state = app.state::<crate::window::WindowState>();
+                    if !state.overlay_visible() {
+                        return;
                     }
-                });
-
-                CACHED.with(|c| {
-                    if let Some(cache) = c.borrow().as_ref() {
-                        *cache.lock().unwrap() = Some(ctx);
-                    }
+                    // 等新前台窗口自己完成置顶再顶回来，否则会被它随后的 SetWindowPos 压回去。
+                    // 这 50ms 是原来就有的节奏，只在悬浮窗显示时才等。
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    state.reassert_overlay_topmost_if_visible(&app);
                 });
             }
 
@@ -193,16 +168,6 @@ impl ContextDetector {
                 let _fg_hook = SetWinEventHook(
                     EVENT_SYSTEM_FOREGROUND,
                     EVENT_SYSTEM_FOREGROUND,
-                    None,
-                    Some(winevent_proc),
-                    0,
-                    0,
-                    WINEVENT_OUTOFCONTEXT,
-                );
-
-                let _focus_hook = SetWinEventHook(
-                    EVENT_OBJECT_FOCUS,
-                    EVENT_OBJECT_FOCUS,
                     None,
                     Some(winevent_proc),
                     0,
