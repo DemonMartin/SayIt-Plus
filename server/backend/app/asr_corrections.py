@@ -28,6 +28,7 @@ from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from .db import Database
+from .netutil import request_ip_override
 
 logger = logging.getLogger("sayit.asr_corrections")
 
@@ -81,6 +82,10 @@ def _err(status: int, code: str, message: str) -> JSONResponse:
 
 
 def _client_ip(request: Request) -> str:
+    # guard.use_real_ip 生效时用按可信代理解析的 IP；否则下面是原来的取法（XFF 最左值，可被伪造）
+    real = request_ip_override(request)
+    if real is not None:
+        return real
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         return forwarded.split(",")[0].strip()

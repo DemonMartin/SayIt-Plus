@@ -14,6 +14,8 @@ from pathlib import Path
 from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import JSONResponse
 
+from .netutil import request_ip_override
+
 router = APIRouter()
 
 DIAGNOSTICS_DIR = Path(__file__).resolve().parents[2] / "runtime" / "diagnostics_reports"
@@ -39,6 +41,10 @@ _TICKET_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
 
 def _client_ip(request: Request) -> str:
+    # guard.use_real_ip 生效时用按可信代理解析的 IP；否则下面是原来的取法（XFF 最左值，可被伪造）
+    real = request_ip_override(request)
+    if real is not None:
+        return real
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         return forwarded.split(",")[0].strip()

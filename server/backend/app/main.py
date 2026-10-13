@@ -21,6 +21,8 @@ from .asr import ASREngine
 from .asr_corrections import router as asr_corrections_router
 from .config import load_config
 from .db import Database
+from .guard import LLM_SKIPPED_QUOTA, Guard
+from .netutil import legacy_ip_key, request_ip_override, xff_of
 from .diagnostics import create_upload_token, router as diagnostics_router
 from .llm import LLMEngine
 from .logging_setup import attach_database_log_handler, bind_log_context, configure_logging, reset_log_context
@@ -32,6 +34,8 @@ from .telemetry import TelemetryService
 cfg = load_config()
 configure_logging(cfg.logging.level, cfg.logging.file, cfg.logging.retention_days, cfg.telemetry.node_id)
 logger = logging.getLogger("sayit")
+# 连接防护（推流 / 准入 / 额度 / 润色预算）。没有 guard 段时全部关闭，行为与没有这一层时一致。
+guard = Guard(cfg.guard)
 
 asr_engine: ASREngine | None = None
 llm_engine: LLMEngine | None = None
@@ -52,6 +56,7 @@ _WS_IDLE_TIMEOUT_SEC = 300  # 5 分钟；客户端 30s 心跳理论够用，放�
 _WS_CLOSE_SERVER_FULL = 1013     # 服务器整体到达容量上限（标准“稍后再试”）
 _WS_CLOSE_PER_IP_LIMIT = 4029    # 该客户端 IP 并发连接过多（对应 HTTP 429 语义）
 _WS_CLOSE_IDLE = 4000            # 服务端回收空闲/疑似死连接
+_WS_CLOSE_REJECTED = 4003        # 被 guard 的准入 / 推流检测拒绝（不区分具体规则）
 _MAX_PCM_BYTES = 10 * 1024 * 1024  # 10MB ≈ 5 min of 16kHz 16-bit mono
 
 
@@ -132,8 +137,14 @@ async def _lifespan(app: FastAPI):
     if cfg.llm.enabled and not llm_engine:
         logger.warning("LLM is configured but failed to initialize. Check API keys and provider settings.")
 
+    # 计数在内存里，重启后先从库里补回最近 24 小时的音频用量，再打 banner（banner 里带补了多少行）
+    guard.seed_from_db(database)
+    guard.log_banner()
+    guard.start_stats_task()
+
     yield
 
+    await guard.stop_stats_task()
     if asr_engine:
         await asr_engine.close()
     if llm_engine:
@@ -161,7 +172,10 @@ app.add_middleware(
     requests_per_minute=120,
     burst=30,
     exclude_paths=("/healthz", "/ws/"),
+    ip_resolver=guard.resolver,
 )
+# 诊断上传、ASR 纠错、反馈这几个 HTTP 路由从这里取可信代理配置
+app.state.ip_resolver = guard.resolver
 
 
 _NOISE_RE = re.compile(r"^[\s銆傦紝銆侊紵锛?,?!\u3000]*$")
@@ -308,6 +322,41 @@ def _normalize_text_context(payload: object) -> dict[str, str] | None:
     return normalized
 
 
+def _prompt_len(value: object) -> int:
+    """客户端 system_prompt 的长度（日志与 guard 的长度上限用）。
+
+    正常客户端只发字符串。别的类型按序列化后的长度算：OpenAI 接口也接受 content 数组，
+    只量字符串的话换个类型就绕过了上限。
+    """
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    try:
+        return len(json.dumps(value, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return len(str(value))
+
+
+def _llm_usage_units(
+    llm_debug: dict, result: dict, system_prompt: object, text_context: dict[str, str] | None,
+) -> int:
+    """一次润色用掉多少（token）。引擎报了用量就用它，否则按送进去的字数估。"""
+    usage = llm_debug.get("usage")
+    if isinstance(usage, dict):
+        try:
+            return max(0, int(usage.get("input_tokens") or 0)) + max(0, int(usage.get("output_tokens") or 0))
+        except (TypeError, ValueError):
+            pass
+    ctx = text_context or {}
+    return (
+        _prompt_len(system_prompt)
+        + len(result.get("asr_text") or "")
+        + sum(len(ctx.get(k) or "") for k in ("text_before", "selected_text", "text_after"))
+        + len(result.get("llm_text") or "")
+    )
+
+
 def _normalize_usage_meta(payload: object) -> dict[str, int | None]:
     data = payload if isinstance(payload, dict) else {}
     raw = _pick(data, "ptt_hold_ms", "pttHoldMs")
@@ -347,20 +396,16 @@ def _client_ip(ws: WebSocket) -> tuple[str | None, str | None]:
     return direct, forwarded_for
 
 
-def _client_ip_key(direct: str | None, forwarded: str | None) -> str:
-    """用于“按 IP 限流/计数”的真实客户端 IP。
+def _client_ip_key(direct: str | None, forwarded: str | None, xff: str | None = None) -> str:
+    """用于“按 IP 限流/计数”的客户端 IP（每 IP 连接数、网页体验并发）。
 
-    ALB 后 ws.client.host 恒为 ALB 内网地址（所有用户相同），必须取 X-Forwarded-For
-    的真实客户端 IP；且 XFF 可能是 "client, proxy1, ..." 列表，取最左第一个（与 diagnostics 一致）。
-
-    注意：最左值理论上可被客户端伪造。单层可信 ALB 场景足够；若前置更多不可信代理，
-    应按“可信代理跳数”从右侧取值，避免被伪造成他人 IP 定向占额。
+    代理后面 ws.client.host 是代理的地址（所有用户相同），客户端 IP 只能从 X-Forwarded-For 里取。
+    guard.use_real_ip 生效时按可信代理从右往左解析（netutil.real_client_ip，只看 XFF）；
+    否则是旧取法：XFF（或 X-Real-IP）的最左一个。最左值可被伪造，核对完可信代理之后应打开 use_real_ip。
     """
-    if forwarded:
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first
-    return (direct or "unknown").strip() or "unknown"
+    if guard.resolver.active:
+        return guard.resolver.real_ip(direct, xff)
+    return legacy_ip_key(direct, forwarded)
 
 
 def _is_web_demo(ws: WebSocket) -> bool:
@@ -386,6 +431,8 @@ def _try_acquire_web_demo_slot(ip: str | None) -> bool:
 
 
 def _release_web_demo_slot(ip: str | None) -> None:
+    # 必须传占名额时用的那个 key（ws_ip_key）。经过反向代理时 ws.client.host 是代理的地址，
+    # 拿它去还等于没还：访客的名额一直占着，同一 IP 用满并发数之后一直被拒，直到进程重启。
     key = (ip or "unknown").strip() or "unknown"
     current = _web_demo_active_by_ip.get(key, 0)
     if current <= 1:
@@ -545,7 +592,7 @@ async def post_feedback(request: Request):
     # --- store ---
     db = database
     if db:
-        client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "")
+        client_ip = request_ip_override(request) or request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "")
         db.execute(
             "INSERT INTO feedback (machine_id, app_version, client_ip, feedback_text, transcript_json, context_json, created_at)"
             f" VALUES ({','.join([db.dialect.placeholder] * 7)})",
@@ -639,7 +686,11 @@ async def ws_transcribe(ws: WebSocket):
     telemetry = _get_telemetry()
     is_web_demo = _is_web_demo(ws)
     client_ip_direct, client_ip_forwarded = _client_ip(ws)
-    ws_ip_key = _client_ip_key(client_ip_direct, client_ip_forwarded)
+    ws_xff = xff_of(ws.headers)
+    ws_ip_key = _client_ip_key(client_ip_direct, client_ip_forwarded, ws_xff)
+    gconn = guard.connection(
+        cid=cid, peer=client_ip_direct, forwarded=client_ip_forwarded, xff=ws_xff, is_web_demo=is_web_demo,
+    )
 
     # 先 accept，再用带专属 close code 的关闭来拒绝：
     # 若在 accept 之前 close，框架会以 HTTP 403 拒绝握手，客户端只能看到通用错误(1006)，无法区分原因。
@@ -689,8 +740,32 @@ async def ws_transcribe(ws: WebSocket):
             reset_log_context(session_tokens)
             session_tokens = {}
 
+    async def _guard_reject(rejection) -> bool:
+        """guard 拒绝本次会话：丢掉已收的音频，回 error + done。都发生在识别之前，所以不会进 ASR。
+
+        返回 True 表示连接已按 4003 关闭，调用方要退出接收循环。
+        """
+        nonlocal active, pcm_total_bytes, session_id, web_demo_slot_acquired
+        active = False
+        pcm_buffers.clear()
+        pcm_total_bytes = 0
+        gconn.end_session()
+        if telemetry:
+            telemetry.mark_terminal_status(session_id, cid, rejection.status, rejection.detail)
+        await ws.send_json(rejection.payload)
+        await ws.send_json({"type": "done"})
+        if web_demo_slot_acquired:
+            _release_web_demo_slot(ws_ip_key)
+            web_demo_slot_acquired = False
+        _clear_session_context()
+        session_id = None
+        if rejection.close:
+            await ws.close(_WS_CLOSE_REJECTED, "rejected")
+            return True
+        return False
+
     async def _process_stop():
-        nonlocal session_id, web_demo_slot_acquired, pcm_total_bytes
+        nonlocal session_id, web_demo_slot_acquired, pcm_total_bytes, disable_ai
         current_session_id = session_id
         ptt_hold_ms = last_usage_meta.get("ptt_hold_ms")
         all_pcm = b"".join(pcm_buffers)
@@ -712,11 +787,16 @@ async def ws_transcribe(ws: WebSocket):
                 telemetry.mark_terminal_status(current_session_id, cid, "empty_audio", "No PCM received")
             await ws.send_json({"type": "done"})
             if web_demo_slot_acquired:
-                _release_web_demo_slot(client_ip_direct)
+                _release_web_demo_slot(ws_ip_key)
                 web_demo_slot_acquired = False
             _clear_session_context()
             session_id = None
             return
+
+        # guard 准入：live 会话有音频就必须带 ptt_hold_ms（识别之前判）
+        rejection = gconn.check_stop(audio_ms=audio_duration_ms, ptt_hold_ms=ptt_hold_ms)
+        if rejection is not None:
+            return await _guard_reject(rejection)
 
         if is_web_demo and audio_duration_ms > cfg.web_demo.max_duration_sec * 1000:
             if telemetry:
@@ -729,7 +809,7 @@ async def ws_transcribe(ws: WebSocket):
             )
             await ws.send_json({"type": "done"})
             if web_demo_slot_acquired:
-                _release_web_demo_slot(client_ip_direct)
+                _release_web_demo_slot(ws_ip_key)
                 web_demo_slot_acquired = False
             _clear_session_context()
             session_id = None
@@ -741,7 +821,7 @@ async def ws_transcribe(ws: WebSocket):
                 telemetry.mark_terminal_status(current_session_id, cid, "short_audio", "Audio shorter than 0.3s")
             await ws.send_json({"type": "done"})
             if web_demo_slot_acquired:
-                _release_web_demo_slot(client_ip_direct)
+                _release_web_demo_slot(ws_ip_key)
                 web_demo_slot_acquired = False
             _clear_session_context()
             session_id = None
@@ -760,11 +840,27 @@ async def ws_transcribe(ws: WebSocket):
             await ws.send_json({"type": "final", "asr_text": "", "llm_text": "", "asr_ms": 0, "llm_ms": 0, "duration_sec": round(len(audio) / 16000.0, 2), "asr_debug": {"silent": True}, "llm_debug": {}})
             await ws.send_json({"type": "done"})
             if web_demo_slot_acquired:
-                _release_web_demo_slot(client_ip_direct)
+                _release_web_demo_slot(ws_ip_key)
                 web_demo_slot_acquired = False
             _clear_session_context()
             session_id = None
             return
+
+        # guard 润色预算：system_prompt 超长或用量已到上限，就只停润色（等同 disable_ai），
+        # 识别照常，final 里带 llm_skipped
+        llm_skipped = None
+        if (
+            not disable_ai
+            and _selected_llm_engine(is_web_demo) is not None
+            and (cfg.web_demo.llm.enabled if is_web_demo else cfg.llm.enabled)
+            and gconn.ai_blocked(prompt_chars=_prompt_len(sys_prompt))
+        ):
+            disable_ai = True
+            llm_skipped = LLM_SKIPPED_QUOTA
+
+        # guard 音频记账放在送进识别之前：识别一开始成本就花出去了，客户端发完 stop 立刻断开
+        # （结果发不回去、后面的代码走不到）也照样算进额度。
+        gconn.charge_audio(audio_duration_ms)
 
         try:
             result = await _run_asr_llm(
@@ -784,7 +880,7 @@ async def ws_transcribe(ws: WebSocket):
             await ws.send_json({"type": "error", "message": str(exc)})
             await ws.send_json({"type": "done"})
             if web_demo_slot_acquired:
-                _release_web_demo_slot(client_ip_direct)
+                _release_web_demo_slot(ws_ip_key)
                 web_demo_slot_acquired = False
             _clear_session_context()
             session_id = None
@@ -796,11 +892,17 @@ async def ws_transcribe(ws: WebSocket):
             await ws.send_json({"type": "error", "message": str(error)})
             await ws.send_json({"type": "done"})
             if web_demo_slot_acquired:
-                _release_web_demo_slot(client_ip_direct)
+                _release_web_demo_slot(ws_ip_key)
                 web_demo_slot_acquired = False
             _clear_session_context()
             session_id = None
             return
+        # guard 润色用量：润色真的调用过（成功或报错都算）才记。按模型接口报回的 token 数记，
+        # system_prompt、选区、上下文和输出就都在里面了；只盯识别文本的话，0.5 秒音频带一段
+        # 超长 system_prompt 就能让额度一个字都不涨。引擎没给用量时按字数估。
+        guard_llm_debug = result.get("llm_debug") if isinstance(result.get("llm_debug"), dict) else {}
+        if guard_llm_debug.get("provider") or guard_llm_debug.get("error"):
+            gconn.charge_ai(_llm_usage_units(guard_llm_debug, result, sys_prompt, text_context))
 
         llm_debug = result.get("llm_debug", {}) if isinstance(result.get("llm_debug"), dict) else {}
 
@@ -855,10 +957,12 @@ async def ws_transcribe(ws: WebSocket):
         )
         if cmp:
             msg["compare_no_hotwords"] = cmp
+        if llm_skipped:
+            msg["llm_skipped"] = llm_skipped
         await ws.send_json(msg)
         await ws.send_json({"type": "done"})
         if web_demo_slot_acquired:
-            _release_web_demo_slot(client_ip_direct)
+            _release_web_demo_slot(ws_ip_key)
             web_demo_slot_acquired = False
         _clear_session_context()
         session_id = None
@@ -901,6 +1005,10 @@ async def ws_transcribe(ws: WebSocket):
                     else:
                         pcm_buffers.append(raw)
                         pcm_total_bytes += len(raw)
+                        # guard 推流检测：live 音频不能比实时快太多（只是一次比较，没开时直接返回）
+                        rejection = gconn.check_pace(pcm_total_bytes)
+                        if rejection is not None and await _guard_reject(rejection):
+                            break
                 continue
             text = msg.get("text")
             if not text:
@@ -948,6 +1056,14 @@ async def ws_transcribe(ws: WebSocket):
                 text_context = None if is_web_demo else _normalize_text_context(payload.get("text_context"))
                 last_usage_meta = {"ptt_hold_ms": None}
                 last_audio_stats = {}
+                # guard：准入（格式）+ 音频额度都在 start 时判，而且放在建 telemetry 会话之前。被拒的
+                # start 不写库，反复发 start 也不会放大写库。同步执行，检查和登记之间没有 await。
+                session_id = None
+                rejection = gconn.check_start(source=source, client_meta=client_meta, compare=compare, sid=None)
+                if rejection is not None:
+                    if await _guard_reject(rejection):
+                        break
+                    continue
                 session_id = telemetry.create_session(
                     connection_id=cid,
                     client_ip=client_ip_direct,
@@ -956,13 +1072,15 @@ async def ws_transcribe(ws: WebSocket):
                     app_context=app_context,
                     source=source,
                 ) if telemetry else None
+                gconn.set_sid(session_id)
                 session_tokens = bind_log_context(session_id=session_id or "-")
                 logger.info(
-                    "start mode=%s source=%s compare=%s hotwords=%s disable_ai=%s user=%s process=%s",
+                    "start mode=%s source=%s compare=%s hotwords=%s prompt_len=%d disable_ai=%s user=%s process=%s",
                     "web_demo" if is_web_demo else "desktop",
                     source,
                     compare,
                     len(hw) if isinstance(hw, list) else "default",
+                    _prompt_len(sys_prompt),
                     disable_ai,
                     client_meta.get("user_id") or client_meta.get("user_name") or "-",
                     app_context.get("process_name") or "-",
@@ -977,11 +1095,23 @@ async def ws_transcribe(ws: WebSocket):
                     disable_ai = True
                 last_usage_meta = _normalize_usage_meta(payload.get("usage_meta"))
                 last_audio_stats = _normalize_audio_stats(payload.get("audio_stats"))
-                await _process_stop()
+                try:
+                    stop_closed = await _process_stop()
+                finally:
+                    # 不管 stop 走的是哪条路（处理完、被拒、报错、客户端中途断开），会话都到此结束，
+                    # 之后的 resume 不能再复用它
+                    gconn.end_session()
+                if stop_closed:
+                    break
             elif cmd == "pause":
                 active = False
             elif cmd == "resume":
-                active = True
+                # guard：resume 只在已放行、还没结束的会话里生效（没有 guard 段时恒放行）
+                rejection = gconn.check_resume()
+                if rejection is None:
+                    active = True
+                elif await _guard_reject(rejection):
+                    break
             elif cmd == "ping":
                 await ws.send_json({"type": "pong", "ts": int(time.time() * 1000)})
             elif cmd == "request_upload_token":

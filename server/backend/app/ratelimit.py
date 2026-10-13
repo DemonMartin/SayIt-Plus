@@ -8,6 +8,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from .netutil import IpResolver
+
 _PRUNE_INTERVAL = 300  # prune stale buckets every 5 minutes
 _BUCKET_TTL = 600  # remove buckets idle for 10 minutes
 
@@ -21,17 +23,31 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     requests_per_minute : max requests per minute per IP (default 120)
     burst : max burst size (default 30)
     exclude_paths : path prefixes exempt from limiting (e.g. healthz)
+    ip_resolver : 可信代理配置（guard.trusted_proxies / use_real_ip）。不传或未生效时沿用旧取法
     """
 
-    def __init__(self, app, *, requests_per_minute: int = 120, burst: int = 30, exclude_paths: tuple[str, ...] = ()):
+    def __init__(
+        self,
+        app,
+        *,
+        requests_per_minute: int = 120,
+        burst: int = 30,
+        exclude_paths: tuple[str, ...] = (),
+        ip_resolver: IpResolver | None = None,
+    ):
         super().__init__(app)
         self._rate = requests_per_minute / 60.0  # tokens per second
         self._burst = burst
         self._exclude = exclude_paths
+        self._ip_resolver = ip_resolver
         self._buckets: dict[str, list[float]] = defaultdict(lambda: [float(burst), time.monotonic()])
         self._last_prune = time.monotonic()
 
     def _client_ip(self, request: Request) -> str:
+        if self._ip_resolver is not None:
+            real = self._ip_resolver.override(request.client.host if request.client else None, request.headers)
+            if real is not None:
+                return real
         forwarded = request.headers.get("x-forwarded-for")
         if forwarded:
             return forwarded.split(",")[0].strip()

@@ -111,3 +111,43 @@ telemetry:
   collect_window_title: true
   collect_exe_path: true
   node_id: "single-node-01"
+
+# --- Abuse guard (WebSocket transcription) ---
+# Every check is off here. Roll each one out as off -> log -> enforce: "log" only writes
+# `guard violation ...` lines, "enforce" actually rejects (or skips AI polishing).
+# Quote the modes: bare off / on are YAML booleans.
+# The numbers below only illustrate the format; pick your own limits from your own traffic.
+guard:
+  # Reverse proxies in front of the backend (CIDR). X-Forwarded-For is resolved right-to-left
+  # across these hops (nginx real_ip_recursive). Add your load balancer subnet, e.g. "10.0.0.0/16".
+  trusted_proxies:
+    - "127.0.0.1/32"
+    - "::1/128"
+  # Switch the existing per-IP limits (WebSocket connections, HTTP rate limit, uploads) to the
+  # resolved client IP. Leave false until `guard netid` lines show the right IP for every entry point.
+  use_real_ip: false
+  netid_log: false                   # One `guard netid` line per client IP every 10 minutes
+  allow_ips: []                      # Matched against the resolved client IP only
+  pace:                              # Live audio arriving faster than real time
+    mode: "off"                      # off / log / enforce
+    max_ratio: 1.5                   # Reject when audio_sec > elapsed_sec * max_ratio + grace_sec
+    grace_sec: 3
+  admission:                         # Client format checks: device id, version, PTT duration
+    mode: "off"
+  quota:                             # Audio minutes per rolling 24 hours; 0 = no limit
+    mode: "off"
+    device_minutes: 100
+    ip_minutes: 400
+    nonlive_device_minutes: 20       # Non-live sessions count here and toward device / ip too
+    nonlive_ip_minutes: 50
+    demo_ip_minutes: 10              # Browser demo, per IP
+    internal_minutes: 1000           # Sessions from allow_ips (replaces the limits above)
+  ai_budget:                         # AI polishing per rolling 24 hours; 0 = no limit
+    mode: "off"                      # Over the limit: transcription still works, polishing is skipped
+    device_tokens: 300000            # Tokens reported by the LLM API (input + output); estimated from characters if absent
+    ip_tokens: 800000
+    max_system_prompt_chars: 10000   # Sessions with a longer client system prompt skip polishing
+  alert:                             # One WARNING line per hour when the last hour exceeds; 0 = off
+    audio_minutes_per_hour: 0
+    ai_tokens_per_hour: 0
+    hits_per_hour: 0
