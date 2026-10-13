@@ -32,9 +32,20 @@ pub struct ExportFile {
     pub content: String,
 }
 
+/// 导出命令会把前端给的内容写到前端给的路径上。内容和位置都由前端决定，
+/// 这里至少把扩展名钉死，免得被拿来往开机启动目录之类的地方写 .bat / .exe。
+fn check_export_extension(path: &std::path::Path, allowed: &[&str]) -> Result<(), String> {
+    if crate::path_guard::has_extension(path, allowed) {
+        Ok(())
+    } else {
+        Err(format!("Export file must end with .{}", allowed.join(" / .")))
+    }
+}
+
 #[tauri::command]
 pub fn save_text_export(payload: TextExportPayload) -> Result<Option<String>, String> {
     let path = std::path::PathBuf::from(&payload.default_path);
+    check_export_extension(&path, &["json", "csv", "txt", "md"])?;
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -48,6 +59,7 @@ pub fn save_text_export(payload: TextExportPayload) -> Result<Option<String>, St
 #[tauri::command]
 pub fn save_export_bundle(payload: ExportBundlePayload) -> Result<Option<String>, String> {
     let path = std::path::PathBuf::from(&payload.default_path);
+    check_export_extension(&path, &["zip"])?;
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -90,6 +102,7 @@ pub async fn save_full_export(
     payload: FullExportPayload,
 ) -> Result<Option<String>, String> {
     let out_path = std::path::PathBuf::from(&payload.default_path);
+    check_export_extension(&out_path, &["zip"])?;
     if let Some(parent) = out_path.parent() {
         let _ = fs::create_dir_all(parent);
     }

@@ -11,6 +11,8 @@ mod context;
 mod inject;
 mod providers;
 mod models;
+mod net_policy;
+mod path_guard;
 
 use storage::Storage;
 use window::WindowState;
@@ -28,9 +30,11 @@ use std::thread;
 // 该参数会抢先自动处理权限请求，使 PermissionRequested 事件不触发，权限停留在 "prompt"，
 // 导致新版 WebView2 隐藏 enumerateDevices 的设备名/deviceId。麦克风授权改由下面的
 // PermissionRequested 处理器负责（显式 Allow → 变为持久 granted → 恢复设备枚举）。
+// 也不要加回 --ignore-certificate-errors：它让所有主机都不校验证书，网络被截获时
+// 识别结果和更新清单都能被换掉。自建服务器的自签名证书改由主窗的
+// ServerCertificateErrorDetected 处理器按地址放行（见 net_policy::cert_error_allowed）。
 const WEBVIEW2_BROWSER_ARGS: &str =
-    "--ignore-certificate-errors \
-     --disable-backgrounding-occluded-windows --disable-renderer-backgrounding \
+    "--disable-backgrounding-occluded-windows --disable-renderer-backgrounding \
      --disable-background-timer-throttling";
 
 fn browser_args_fingerprint(value: &str) -> String {
@@ -206,9 +210,8 @@ fn main() {
         .join("logs")
         .join("sayit.log"));
 
-    // Allow self-signed certificates and auto-grant microphone for backend connection (WebView2)
     // This must be set before any WebView2 instance is created.
-    // Also disable Chromium's background tab/window throttling: SayIt keeps a long-lived
+    // Disable Chromium's background tab/window throttling: SayIt keeps a long-lived
     // WebSocket connection alive via a 30s JS heartbeat even when the window is minimized
     // or not focused. Without these flags, WebView2 throttles setInterval timers in the
     // background, delaying the heartbeat well past the server's idle timeout and causing
@@ -435,6 +438,64 @@ fn main() {
                                         "failed to attach PermissionRequested handler: {e:?}"
                                     ),
                                 }
+                            }
+                        }
+                    });
+                }
+
+                // 证书错误：只对用户自己填的、非官方的 https 服务器放行（自建 + 自签名证书）。
+                // 2026-10 实测这个事件对 wss:// 同样触发，所以 WebSocket 也走这里。
+                // 每次都从数据库读当前地址：用户改地址后不用重启就生效。
+                // 只挂在主窗上 —— 联网的只有主窗；挂不上（运行时太旧）就退回"一律严格校验"。
+                #[cfg(target_os = "windows")]
+                {
+                    let cert_app = app.handle().clone();
+                    let _ = main_window.with_webview(move |webview| {
+                        use webview2_com::Microsoft::Web::WebView2::Win32::{
+                            ICoreWebView2_14,
+                            COREWEBVIEW2_SERVER_CERTIFICATE_ERROR_ACTION_ALWAYS_ALLOW,
+                        };
+                        use webview2_com::ServerCertificateErrorDetectedEventHandler;
+                        use windows_core::{Interface, PWSTR};
+                        unsafe {
+                            let controller = webview.controller();
+                            let Ok(core) = controller.CoreWebView2() else { return };
+                            let core14: ICoreWebView2_14 = match core.cast() {
+                                Ok(value) => value,
+                                Err(e) => {
+                                    log::warn!("[cert] ServerCertificateErrorDetected unavailable, self-signed servers will be rejected: {e:?}");
+                                    return;
+                                }
+                            };
+                            let handler = ServerCertificateErrorDetectedEventHandler::create(Box::new(
+                                move |_sender, args| {
+                                    let Some(args) = args else { return Ok(()) };
+                                    let mut uri = PWSTR::null();
+                                    args.RequestUri(&mut uri)?;
+                                    let request_uri = webview2_com::take_pwstr(uri);
+                                    let storage: tauri::State<Storage> = cert_app.state();
+                                    let configured = storage
+                                        .get(net_policy::BACKEND_BASE_URL_KEY, None)
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let host = reqwest::Url::parse(&request_uri)
+                                        .ok()
+                                        .and_then(|u| u.host_str().map(|h| format!("{}:{}", h, u.port_or_known_default().unwrap_or(0))))
+                                        .unwrap_or_default();
+                                    if net_policy::cert_error_allowed(&request_uri, &configured) {
+                                        args.SetAction(COREWEBVIEW2_SERVER_CERTIFICATE_ERROR_ACTION_ALWAYS_ALLOW)?;
+                                        log::info!("[cert] certificate error allowed for the configured server host={host}");
+                                    } else {
+                                        log::warn!("[cert] certificate error rejected host={host}");
+                                    }
+                                    Ok(())
+                                },
+                            ));
+                            let mut token = Default::default();
+                            match core14.add_ServerCertificateErrorDetected(&handler, &mut token) {
+                                Ok(_) => log::info!("[cert] ServerCertificateErrorDetected handler attached"),
+                                Err(e) => log::error!("[cert] failed to attach ServerCertificateErrorDetected handler: {e:?}"),
                             }
                         }
                     });
@@ -778,6 +839,14 @@ mod config_tests {
         assert!(
             offenders.is_empty(),
             "WebView2 args must be global; per-window overrides found on: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn webview2_args_keep_certificate_validation() {
+        assert!(
+            !super::WEBVIEW2_BROWSER_ARGS.contains("ignore-certificate-errors"),
+            "certificate errors are handled per host by ServerCertificateErrorDetected; do not disable validation globally"
         );
     }
 }

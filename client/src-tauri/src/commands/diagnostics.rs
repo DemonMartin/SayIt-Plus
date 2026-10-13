@@ -315,10 +315,7 @@ struct DiagImage {
 pub fn create_diagnostics_zip(data: Value) -> Result<String, String> {
     let req: DiagnosticsZipRequest = serde_json::from_value(data).map_err(|e| e.to_string())?;
 
-    let diag_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("com.sayit.app")
-        .join("diagnostics");
+    let diag_dir = diagnostics_dir();
     std::fs::create_dir_all(&diag_dir).map_err(|e| e.to_string())?;
 
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
@@ -394,21 +391,40 @@ pub fn create_diagnostics_zip(data: Value) -> Result<String, String> {
 
 // ─── Read helpers ───
 
+fn diagnostics_dir() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("com.sayit.app")
+        .join("diagnostics")
+}
+
+/// 诊断包只会是 create_diagnostics_zip 生成在诊断目录里的 .zip。
+/// 读命令把内容整个交给前端，复制命令复制完还会删掉源文件，所以两边都不能接受任意路径。
+fn diagnostics_zip_in_dir(path: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(path);
+    if !crate::path_guard::has_extension(&path, &["zip"]) {
+        return None;
+    }
+    crate::path_guard::existing_file_in_dir(&path, &diagnostics_dir())
+}
+
 #[tauri::command]
 pub fn read_diagnostics_zip(path: String) -> Result<Option<Vec<u8>>, String> {
-    let path = std::path::PathBuf::from(&path);
-    if !path.exists() {
+    let Some(path) = diagnostics_zip_in_dir(&path) else {
         return Ok(None);
-    }
+    };
     let data = std::fs::read(&path).map_err(|e| e.to_string())?;
     Ok(Some(data))
 }
 
 #[tauri::command]
 pub fn copy_diagnostics_zip(source: String, destination: String) -> Result<(), String> {
-    let src = std::path::PathBuf::from(&source);
-    if !src.exists() {
+    let Some(src) = diagnostics_zip_in_dir(&source) else {
         return Err("The diagnostics file does not exist".to_string());
+    };
+    // 目标来自保存对话框（只给了 zip 过滤器），这里再确认一次扩展名，免得被拿来往任意位置写可执行文件。
+    if !crate::path_guard::has_extension(std::path::Path::new(&destination), &["zip"]) {
+        return Err("The diagnostics file must be saved as a .zip".to_string());
     }
     std::fs::copy(&src, &destination).map_err(|e| format!("Failed to copy diagnostics file: {}", e))?;
     // 清理临时文件

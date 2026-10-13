@@ -82,6 +82,9 @@ windows = { version = "0.58", features = [
 ] }
 # 与 tauri/wry 内部同版本，用于挂 WebView2 的 PermissionRequested 处理器（把麦克风置为持久授权）
 webview2-com = "0.38"
+# webview2-com 0.38 用的 COM 基础类型（Interface::cast、PWSTR）。上面的 windows 0.58 是另一套类型，
+# 不能混用；挂 ServerCertificateErrorDetected 时要把 ICoreWebView2 cast 成 ICoreWebView2_14。
+windows-core = "0.61"
 
 # Release 体积/性能优化。panic 保持 unwind：Tauri 与 catch_unwind 依赖它，
 # 换成 abort 会让引擎 panic 直接杀进程。
