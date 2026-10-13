@@ -234,6 +234,7 @@ export class RecorderOrchestrator {
   /** PTT up arrived while startRecording was still initializing — stop immediately after setup */
   private pendingStopWhileStarting = false
   private processingTimeoutId: ReturnType<typeof setTimeout> | null = null
+  private processingDeadline = 0
   /** 插入阶段专属超时；处理超时在 onFinal 里已被清掉，管不到这一段。 */
   private insertionTimeoutId: ReturnType<typeof setTimeout> | null = null
   private finalReceivedAt = 0
@@ -1162,6 +1163,7 @@ export class RecorderOrchestrator {
   }
 
   private clearProcessingTimeout() {
+    this.processingDeadline = 0
     if (this.processingTimeoutId) {
       clearTimeout(this.processingTimeoutId)
       this.processingTimeoutId = null
@@ -1460,6 +1462,15 @@ export class RecorderOrchestrator {
         // 仅在录音进行中把流式中间结果推给悬浮窗；下一次 listening 心跳会带上它一起渲染
         if (this.state !== 'recording') return
         this.overlayService.setStreamingText(text)
+      },
+
+      onFallbackStart: (mode) => {
+        if (this.state !== 'processing' || this.finalHandledInCurrentRun) return
+        // Allow the private server request to time out and advance the chain before the recorder expires.
+        const timeout = _computeProcessingTimeoutMs(this.getAudioDurationSec(), mode)
+        // A local backup may have to load a different model before inference.
+        const minimumMs = mode === 'local' ? 90_000 : mode === 'server' ? 65_000 : 0
+        this.processingDeadline = Date.now() + Math.max(timeout, minimumMs)
       },
 
       onASR: (result) => {
@@ -2563,6 +2574,7 @@ export class RecorderOrchestrator {
     }
 
     const processingTimeoutMs = this.computeProcessingTimeoutMs(audioDur)
+    this.processingDeadline = Date.now() + processingTimeoutMs
     addRuntimeEvent('info', 'recorder', 'Entered processing', {
       audioSec: audioDur,
       timeoutMs: processingTimeoutMs,
@@ -2575,6 +2587,11 @@ export class RecorderOrchestrator {
     let insertionExtensions = 0
     const onProcessingTimeout = () => {
       if (this.state !== 'processing' || !this.isRunCurrent(runId)) return
+      const remainingMs = this.processingDeadline - Date.now()
+      if (remainingMs > 0) {
+        this.processingTimeoutId = setTimeout(onProcessingTimeout, remainingMs)
+        return
+      }
       if (this.textInsertionInFlight) {
         if (insertionExtensions < MAX_INSERTION_TIMEOUT_EXTENSIONS) {
           insertionExtensions++
@@ -2824,6 +2841,8 @@ export class RecorderOrchestrator {
 
   /** 异步获取当前模式下的 ASR/AI 供应商信息 */
   private async buildProviderMetadata(finalResult?: FinalResult): Promise<{
+    workMode?: HistoryRecord['workMode']
+    asrFallback?: boolean
     asrProvider?: string
     aiProvider?: string
     aiModel?: string
@@ -2834,6 +2853,16 @@ export class RecorderOrchestrator {
     const executionMeta = {
       aiSource: finalResult?.aiSource,
       aiStatus: finalResult?.aiStatus,
+    }
+    if (finalResult?.asrFallback) {
+      return {
+        workMode: finalResult.workMode,
+        asrFallback: true,
+        asrProvider: finalResult.asrModel || finalResult.asrEngine,
+        aiProvider: finalResult.aiProvider,
+        aiModel: finalResult.aiModel,
+        ...executionMeta,
+      }
     }
     if (mode === 'server') {
       let asrProvider = finalResult?.asrModel || finalResult?.asrEngine || 'server'

@@ -382,6 +382,9 @@ function HistoryItem({
                       <span className="rounded border border-border px-1.5 py-0.5 text-xs">
                         {record.workMode === 'server' ? t('record.modeServer') : record.workMode === 'cloud_api' ? t('record.modeCloudApi') : t('record.modeLocal')}
                       </span>
+                      {record.asrFallback && (
+                        <span className="text-xs text-primary">{t('fallback.title')}</span>
+                      )}
                       {record.asrProvider && (
                         <span className="text-xs">ASR: {ASR_PROVIDER_DISPLAY[record.asrProvider] || record.asrProvider}</span>
                       )}

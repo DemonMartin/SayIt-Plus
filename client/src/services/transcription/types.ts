@@ -32,6 +32,8 @@ export interface ASRResult {
 }
 
 export interface FinalResult {
+  asrFallback?: boolean
+  workMode?: WorkMode
   asrText: string
   llmText: string
   asrMs: number
@@ -65,6 +67,8 @@ export interface FinalResult {
 }
 
 export interface TranscriptionCallbacks {
+  /** A backup attempt is starting; the recorder grants it a fresh, bounded timeout. */
+  onFallbackStart?: (mode: WorkMode) => void
   onStateChange?: (state: ProviderState) => void
   onReady?: (info: { connectionId?: string; asr: boolean; llm: boolean }) => void
   /** 流式识别过程中的中间结果（实时上屏用），text 为到目前为止的累计文本 */
