@@ -1,0 +1,3 @@
+# 在 Linux 容器/服务器里执行的脚本必须是 LF。本仓库在 Windows 上 core.autocrlf=true，
+# 新检出、worktree、git archive 都会把它们变成 CRLF，容器启动即报 `set: -\r: invalid option`。
+*.sh text eol=lf

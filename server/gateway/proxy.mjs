@@ -3,6 +3,7 @@ import path from "path";
 import https from "https";
 import httpProxy from "http-proxy";
 import { fileURLToPath } from "url";
+import { resolveStaticRequest } from "./static-path.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.HTTPS_PORT || 8443);
@@ -49,8 +50,14 @@ const server = https.createServer(tls, (req, res) => {
     proxy.web(req, res);
     return;
   }
-  let fp = path.join(STATIC_DIR, url === "/" ? "index.html" : url);
-  if (!fs.existsSync(fp)) fp = path.join(STATIC_DIR, "index.html");
+  // 路径判断见 static-path.mjs：越界（../）一律 404，不能回落到 index.html
+  const resolved = resolveStaticRequest(url, STATIC_DIR);
+  if (resolved.status !== 200) {
+    res.writeHead(resolved.status);
+    res.end(resolved.status === 400 ? "Bad Request" : "Not Found");
+    return;
+  }
+  const fp = resolved.file;
   const ext = path.extname(fp);
   fs.readFile(fp, (err, data) => {
     if (err) { res.writeHead(404); res.end("Not Found"); return; }

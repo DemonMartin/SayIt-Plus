@@ -33,7 +33,8 @@ class GuardConfigTests(unittest.TestCase):
 
     def assertAllOff(self, g: GuardConfig) -> None:
         self.assertEqual(
-            (g.pace.mode, g.admission.mode, g.quota.mode, g.ai_budget.mode), ("off", "off", "off", "off"),
+            (g.pace.mode, g.admission.mode, g.quota.mode, g.ai_budget.mode, g.web_demo.mode),
+            ("off", "off", "off", "off", "off"),
         )
         self.assertFalse(g.use_real_ip)
         self.assertFalse(g.netid_log)
@@ -64,6 +65,20 @@ class GuardConfigTests(unittest.TestCase):
                     continue
                 with self.subTest(cls=type(dc).__name__, field=f.name):
                     self.assertEqual(getattr(dc, f.name), 0)
+        self.assertEqual(g.web_demo.allowed_origins, [])
+
+    def test_rate_and_web_demo_keys_load(self) -> None:
+        text = (
+            "guard:\n"
+            "  quota: {mode: \"enforce\", device_sessions_per_minute: 7, demo_ip_sessions_per_hour: 3, demo_global_minutes: 2.5}\n"
+            "  web_demo: {mode: \"log\", allowed_origins: [\"https://a.example\", 5]}\n"
+        )
+        g = self._load(text)
+        self.assertEqual((g.quota.device_sessions_per_minute, g.quota.demo_ip_sessions_per_hour), (7, 3))
+        self.assertEqual(g.quota.demo_global_minutes, 2.5)
+        self.assertEqual((g.web_demo.mode, g.web_demo.allowed_origins), ("log", ["https://a.example"]))
+        self.assertEqual(len(g.warnings), 1)
+        self.assertIn("guard.web_demo.allowed_origins", g.warnings[0])
 
     def test_modes(self) -> None:
         text = (

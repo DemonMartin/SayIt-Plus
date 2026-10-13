@@ -30,6 +30,10 @@ from .ratelimit import RateLimitMiddleware
 from .notice import read_notice
 from .releases import read_public_download, read_release_manifest, resolve_release_file
 from .telemetry import TelemetryService
+from .bodylimit import BodyLimitMiddleware, build_body_limit_rules
+from .feedback_input import FeedbackInputError, parse_feedback
+from .ratelimit import KeyedWindowLimiter
+from .errors import public_error_message
 
 cfg = load_config()
 configure_logging(cfg.logging.level, cfg.logging.file, cfg.logging.retention_days, cfg.telemetry.node_id)
@@ -160,19 +164,27 @@ app.state.config = cfg
 app.include_router(diagnostics_router)
 app.include_router(asr_corrections_router)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cfg.server.cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 中间件顺序：Starlette 里**后加的在外层**。CORS 必须最后加、在最外层，这样限流的 429
+# 和请求体超限的 413 才会带上 CORS 头 —— 否则桌面端的 fetch 被浏览器拦下，用户只看到
+# "网络错误"。以前 CORS 先加、限流后加，限流在外层，它回的 429 就没有 CORS 头。
+# 从外到内：CORS → 限流 → 请求体上限 → 应用。
+app.add_middleware(BodyLimitMiddleware, **build_body_limit_rules(cfg.server.body_limits))
 app.add_middleware(
     RateLimitMiddleware,
     requests_per_minute=120,
     burst=30,
     exclude_paths=("/healthz", "/ws/"),
     ip_resolver=guard.resolver,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cfg.server.cors_origins,
+    # 不允许带凭据：桌面端与官网都不需要。允许所有来源时再开凭据，别的网站就能借浏览器里
+    # 缓存的凭据或 cookie 读这里的响应（Starlette 带 cookie 时会把 * 换成来访来源回显）。
+    # 来源保持 *：桌面端界面在 http://tauri.localhost 下，固定名单漏一个就会让更新检查等静默失败。
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 # 诊断上传、ASR 纠错、反馈这几个 HTTP 路由从这里取可信代理配置
 app.state.ip_resolver = guard.resolver
@@ -546,48 +558,29 @@ async def healthz():
 
 
 # ── Feedback ──────────────────────────────────────────────────────────────────
-_feedback_timestamps: dict[str, list[float]] = defaultdict(list)
-_FEEDBACK_WINDOW = 600  # 10 minutes
-_FEEDBACK_LIMIT = 3
+# 按 machine_id 每 10 分钟 3 次。machine_id 是客户端自报的，这个限流挡得住误操作、挡不住
+# 换 ID 的人；KeyedWindowLimiter 保证换 ID 不会让内存无限增长。按 IP 限流要等 use_real_ip。
+_feedback_limiter = KeyedWindowLimiter(window_sec=600, limit=3)
 
 
 @app.post("/api/feedback")
 async def post_feedback(request: Request):
-    request_body = await request.json()
-    # --- validate machine_id ---
-    machine_id = (request_body.get("machine_id") or "").strip()
-    if not machine_id:
-        return JSONResponse({"error": "machine_id required"}, 400)
+    try:
+        body = await request.json()
+    except ValueError:  # 不是 JSON，或不是合法 UTF-8（UnicodeDecodeError 也是 ValueError）
+        return JSONResponse({"error": "request body must be a JSON object"}, 400)
+    try:
+        parsed = parse_feedback(body)
+    except FeedbackInputError as exc:
+        return JSONResponse({"error": exc.message}, 400)
+    machine_id = parsed["machine_id"]
+    feedback_text = parsed["feedback_text"]
+    transcript = parsed["transcript"]
+    context = parsed["context"]
 
-    # --- validate feedback_text ---
-    feedback_text = (request_body.get("feedback_text") or "").strip()
-    if len(feedback_text) < 2 or len(feedback_text) > 1000:
-        return JSONResponse({"error": "feedback_text must be 2-1000 chars"}, 400)
-
-    # --- truncate long fields ---
-    transcript = request_body.get("transcript")
-    if isinstance(transcript, dict):
-        for k in ("asr_text", "ai_text"):
-            if isinstance(transcript.get(k), str) and len(transcript[k]) > 5000:
-                transcript[k] = transcript[k][:5000]
-    else:
-        transcript = None
-
-    context = request_body.get("context")
-    if isinstance(context, dict):
-        for k in ("ai_system_prompt", "ai_prompt_append"):
-            if isinstance(context.get(k), str) and len(context[k]) > 5000:
-                context[k] = context[k][:5000]
-    else:
-        context = None
-
-    # --- rate limit by machine_id: 3 per 10 min ---
-    now = time.time()
-    ts_list = _feedback_timestamps[machine_id]
-    _feedback_timestamps[machine_id] = [t for t in ts_list if now - t < _FEEDBACK_WINDOW]
-    if len(_feedback_timestamps[machine_id]) >= _FEEDBACK_LIMIT:
+    if not _feedback_limiter.allow(machine_id):
         return JSONResponse({"error": "rate limited"}, 429)
-    _feedback_timestamps[machine_id].append(now)
+    now = time.time()
 
     # --- store ---
     db = database
@@ -598,7 +591,7 @@ async def post_feedback(request: Request):
             f" VALUES ({','.join([db.dialect.placeholder] * 7)})",
             (
                 machine_id,
-                (request_body.get("app_version") or "")[:64],
+                parsed["app_version"],
                 client_ip[:64],
                 feedback_text,
                 json.dumps(transcript, ensure_ascii=False) if transcript else None,
@@ -690,6 +683,7 @@ async def ws_transcribe(ws: WebSocket):
     ws_ip_key = _client_ip_key(client_ip_direct, client_ip_forwarded, ws_xff)
     gconn = guard.connection(
         cid=cid, peer=client_ip_direct, forwarded=client_ip_forwarded, xff=ws_xff, is_web_demo=is_web_demo,
+        origin=ws.headers.get("origin"), ua=ws.headers.get("user-agent"),
     )
 
     # 先 accept，再用带专属 close code 的关闭来拒绝：
@@ -708,6 +702,14 @@ async def ws_transcribe(ws: WebSocket):
             ws_ip_key, len(_ws_by_ip.get(ws_ip_key, ())), cid,
         )
         await ws.close(_WS_CLOSE_PER_IP_LIMIT, "too many connections from this IP")
+        reset_log_context(connection_tokens)
+        return
+    # guard：网页体验必须来自白名单站点的浏览器（Origin）。和上面两条一样，拒绝时不计数、不进 try
+    connect_rejection = gconn.check_connect()
+    if connect_rejection is not None:
+        await ws.send_json(connect_rejection.payload)
+        await ws.send_json({"type": "done"})
+        await ws.close(_WS_CLOSE_REJECTED, "rejected")
         reset_log_context(connection_tokens)
         return
 
@@ -874,10 +876,11 @@ async def ws_transcribe(ws: WebSocket):
                 use_web_demo_profile=is_web_demo,
             )
         except Exception as exc:
-            logger.exception("Pipeline failed")
+            # 原文只进服务端日志和遥测表，客户端拿到固定提示 + 编号（见 errors.py）
+            public_message, ref = public_error_message(exc, where="pipeline", cid=cid, sid=current_session_id)
             if telemetry:
-                telemetry.mark_failure(current_session_id, cid, "pipeline_exception", str(exc))
-            await ws.send_json({"type": "error", "message": str(exc)})
+                telemetry.mark_failure(current_session_id, cid, "pipeline_exception", f"ref={ref} {exc}")
+            await ws.send_json({"type": "error", "message": public_message})
             await ws.send_json({"type": "done"})
             if web_demo_slot_acquired:
                 _release_web_demo_slot(ws_ip_key)
@@ -903,6 +906,8 @@ async def ws_transcribe(ws: WebSocket):
         guard_llm_debug = result.get("llm_debug") if isinstance(result.get("llm_debug"), dict) else {}
         if guard_llm_debug.get("provider") or guard_llm_debug.get("error"):
             gconn.charge_ai(_llm_usage_units(guard_llm_debug, result, sys_prompt, text_context))
+        # guard：识别真的跑过一次，结果为空或只有一个字就记一次「空结果」（只记次数，不看内容去向）
+        gconn.note_result(result.get("asr_text") or "")
 
         llm_debug = result.get("llm_debug", {}) if isinstance(result.get("llm_debug"), dict) else {}
 

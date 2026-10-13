@@ -1,4 +1,7 @@
 fastapi==0.135.2
+# 显式固定：FastAPI 0.135.2 允许装 Starlette 1.x，而 1.x 的 CORS 行为不同（开了凭据就总回显来源）。
+# 不固定的话重建虚拟环境会悄悄换版本。升级要主动改这里并重跑 test_cors.py。
+starlette==0.52.1
 # multipart 上传（诊断包、ASR 纠错样本）依赖它。缺了不是接口 404，是 FastAPI
 # 在路由注册期就抛 RuntimeError —— 整个后端起不来，所以必须显式 pin。
 python-multipart==0.0.22

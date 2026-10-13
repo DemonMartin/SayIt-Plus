@@ -154,8 +154,10 @@ class LLMEngine:
             return result, ms, debug
         except Exception as e:
             logger.exception("LLM %s failed, returning original", provider)
-            # 失败的调用也按输入估一份用量：请求可能已经计费，而且反复失败也不该能白调
-            return text, 0, {"error": str(e), "usage": self._estimate_usage(messages, "")}
+            # 失败的调用也按输入估一份用量：请求可能已经计费，而且反复失败也不该能白调。
+            # error 只放异常类型名：llm_debug 会随结果发给客户端，原文里可能有上游服务地址等内部信息。
+            # 客户端和 guard 只看"这个字段有没有值"，类型名满足这个判断；原文在上面那行日志里。
+            return text, 0, {"error": type(e).__name__, "usage": self._estimate_usage(messages, "")}
 
     # ── internals ──
 

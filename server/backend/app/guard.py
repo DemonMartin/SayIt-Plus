@@ -18,6 +18,7 @@ import contextlib
 import logging
 import re
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from .config import GuardConfig
 from .netutil import IpResolver, ip_in, legacy_ip_key, parse_ip, parse_networks
 from .quota import (
     DIM_DEMO_IP,
+    DIM_DEMO_SITE,
     DIM_DEVICE,
     DIM_INTERNAL,
     DIM_IP,
@@ -36,12 +38,24 @@ from .quota import (
     LANE_DEMO,
     LANE_LIVE,
     LANE_NONLIVE,
+    RATE_DEMO_IP_1H,
+    RATE_DEMO_IP_24H,
+    RATE_DEMO_SITE_1H,
+    RATE_DEVICE_1H,
+    RATE_DEVICE_1M,
+    RATE_DEVICE_24H,
+    RATE_EMPTY_DEVICE_1H,
+    RATE_IP_1H,
+    RATE_IP_24H,
     RollingWindow,
     SeedResult,
     UsageLedger,
     ai_keys,
     audio_keys,
+    empty_keys,
+    rate_keys,
     seed_audio_from_db,
+    seed_rates_from_db,
 )
 
 logger = logging.getLogger("sayit.guard")
@@ -56,6 +70,15 @@ STATUS_REJECTED_PACE = "rejected_pace"
 STATUS_REJECTED_ADMISSION = "rejected_admission"
 STATUS_REJECTED_QUOTA = "rejected_quota"
 LLM_SKIPPED_QUOTA = "quota"
+
+# 客户端真实会发的 source。过去 30 天带 device_id 的会话里只出现过这两个（live 65,408 个，
+# history_reprocess 129 个）；网页体验只发 live。别的值都是第三方脚本自己起的名字。
+DESKTOP_SOURCES = frozenset({"live", "history_reprocess"})
+DEMO_SOURCES = frozenset({"live"})
+
+# 「空结果」：去掉标点和空白后不超过 1 个字（「嗯。」「啊」）。唤醒词监听这类脚本一小时能刷出几百个，
+# 真人误按偶尔会有，一小时几十次不可能。
+_EMPTY_RESULT_MAX_CHARS = 1
 
 # ⚠️ 准入格式是**暂定**的：照客户端源码写的（device_id = "sayit-" + 小写 uuid4，
 # client_version = Cargo 包版本号），上 enforce 之前必须先拿 dev 库里真实的 device_id /
@@ -163,6 +186,38 @@ def _quota_rejection(detail: str, retry_after_ms: int | None) -> Rejection:
     )
 
 
+def _rate_rejection(detail: str, retry_after_ms: int | None, *, demo: bool, site: bool) -> Rejection:
+    # 文本里带 rate limit / quota：桌面端按报错文本归类，命中它才会提示「被限流、稍后再试」。
+    wait = human_wait(retry_after_ms)
+    if site:
+        message = "网页体验人数较多（quota），请稍后再试，或下载 SayIt 客户端"
+    elif demo:
+        message = f"网页体验次数已用完（quota），约 {wait}后恢复，可下载 SayIt 客户端继续使用"
+    else:
+        message = f"请求过于频繁（rate limit），约 {wait}后恢复"
+    return Rejection(
+        status=STATUS_REJECTED_QUOTA,
+        detail=detail,
+        payload={"type": "error", "code": "quota", "message": message},
+        close=False,
+    )
+
+
+def is_empty_result(text: Any) -> bool:
+    """去掉标点、符号和空白后不超过 1 个字。"""
+    meaningful = 0
+    for ch in str(text or ""):
+        if unicodedata.category(ch)[0] in ("L", "N"):
+            meaningful += 1
+            if meaningful > _EMPTY_RESULT_MAX_CHARS:
+                return False
+    return True
+
+
+def _norm_origin(value: Any) -> str:
+    return str(value or "").strip().lower().rstrip("/")
+
+
 def _admission_rule(client_meta: Mapping[str, Any]) -> str | None:
     device = str(client_meta.get("device_id") or "")
     if len(device) > _ADMISSION_MAX_LEN or not DEVICE_ID_PATTERN.fullmatch(device):
@@ -230,6 +285,12 @@ class _NullConnection:
     def end_session(self) -> None:
         return None
 
+    def check_connect(self) -> Rejection | None:
+        return None
+
+    def note_result(self, _text: Any) -> None:
+        return None
+
     def record(self, **_: Any) -> None:
         return None
 
@@ -240,9 +301,13 @@ _NULL_CONNECTION = _NullConnection()
 class GuardConnection:
     """一条 WebSocket 连接上的防护状态。一条连接上的会话是串行的，同一时间只有一个。"""
 
-    def __init__(self, guard: Guard, *, cid: str, ip: str, real_ip: str, is_web_demo: bool, whitelisted: bool) -> None:
+    def __init__(
+        self, guard: Guard, *, cid: str, ip: str, real_ip: str, is_web_demo: bool, whitelisted: bool,
+        origin: str | None = None,
+    ) -> None:
         self.guard = guard
         self.cid = cid
+        self.origin = origin
         self.ip = ip  # 额度 / 日志用的 IP（配了可信代理就是可信 IP）
         self.real_ip = real_ip  # 按可信代理解析出来的 IP（白名单只认它）
         self.is_web_demo = is_web_demo
@@ -284,6 +349,32 @@ class GuardConnection:
             return None
         return self.check_start(source="resume", client_meta={}, compare=False, sid=None, implicit=True)
 
+    def check_connect(self) -> Rejection | None:
+        """握手之后：网页体验必须来自白名单站点的浏览器。
+
+        `?client=web_demo` 是调用方自己写在 URL 上的，任何脚本都能加；浏览器发起 WebSocket 时一定带
+        Origin，而且网页脚本改不了它。非浏览器能伪造这个头，所以这条只是提高门槛，真正兜底的是限频和额度。
+        """
+        g = self.guard
+        if not self.is_web_demo or g.web_demo_mode == MODE_OFF or self.whitelisted or not g.allowed_origins:
+            return None
+        if _norm_origin(self.origin) in g.allowed_origins:
+            return None
+        detail = f"origin={_clean(self.origin, 80)}"
+        if g.web_demo_mode == MODE_ENFORCE:
+            g._event("reject", "web_demo.origin", self, mode=g.web_demo_mode, detail=detail)
+            return _generic_rejection(STATUS_REJECTED_ADMISSION, "web_demo:origin")
+        g._event("violation", "web_demo.origin", self, mode=g.web_demo_mode, detail=detail)
+        return None
+
+    def note_result(self, text: Any) -> None:
+        """识别跑完之后：空结果（见 is_empty_result）计一次。只在真的跑过识别时调（静音、过短的不算）。"""
+        s = self.session
+        if s is None or not is_empty_result(text):
+            return
+        g = self.guard
+        g.ledger.add(g.ledger.rate, empty_keys(s.lane, device=s.device, internal=self.whitelisted), 1, g.now_ms())
+
     def set_sid(self, sid: str | None) -> None:
         """start 检查要在建 telemetry 会话之前做（被拒的不建会话），放行之后再把会话号补上，日志里才对得上。"""
         if self.session is not None and sid:
@@ -319,13 +410,21 @@ class GuardConnection:
         )
         g._stats.sessions[DIM_INTERNAL if self.whitelisted else lane] += 1
 
-        # 准入只查桌面端：网页体验不带 client_meta；白名单是自己人的脚本。
-        # 不经 start 的 resume 例外：网页体验也不会这么发，一律算违规。
-        if g.admission_mode != MODE_OFF and not self.whitelisted and (implicit or lane != LANE_DEMO):
-            rule = "no_start" if implicit else _admission_rule(client_meta)
+        # 准入：桌面端查 device_id / 版本号格式；所有分道都查 source 是不是客户端真会发的值
+        # （第三方脚本会自己起名字，比如 sailchat_*）。白名单是自己人的脚本，不查。
+        # 不经 start 的 resume：网页体验也不会这么发，一律算违规。
+        if g.admission_mode != MODE_OFF and not self.whitelisted:
+            if implicit:
+                rule = "no_start"
+            elif lane == LANE_DEMO:
+                rule = None if source in DEMO_SOURCES else "source"
+            else:
+                rule = _admission_rule(client_meta) or (None if source in DESKTOP_SOURCES else "source")
             if rule is not None:
                 if rule == "no_start":
                     detail = "resume_without_start"
+                elif rule == "source":
+                    detail = f"source={_clean(source, 32)}"
                 elif rule == "device_id":
                     detail = f"len={len(str(client_meta.get('device_id') or ''))}"
                 else:
@@ -354,7 +453,36 @@ class GuardConnection:
                     g._event("violation", f"quota.{hit.dim}", self, mode=g.quota_mode, detail=detail)
             if blocking:
                 retry = max((h.retry_after_ms or 0) for h in blocking)
-                return _quota_rejection("quota:" + "+".join(h.dim for h in blocking), retry)
+                detail = "quota:" + "+".join(h.dim for h in blocking)
+                if lane == LANE_DEMO:
+                    site = any(h.dim == DIM_DEMO_SITE for h in blocking)
+                    return _rate_rejection(detail, retry, demo=True, site=site)
+                return _quota_rejection(detail, retry)
+
+            # 会话频率：同样只按「已经开始了多少次」判。只有放行的会话才计数，被拒的 start 不算——
+            # 否则撞了限的真人每重试一次就把恢复时间往后推一次。
+            internal = self.whitelisted
+            counted = rate_keys(lane, device=s.device, ip=self.ip, internal=internal)
+            checked = counted + empty_keys(lane, device=s.device, internal=internal)
+            blocking = []
+            for hit in g.ledger.over(g.ledger.rate, checked, g.rate_limits, now):
+                untrusted = hit.dim in IP_DIMS and not g.resolver.active
+                detail = (
+                    f"used={hit.used},limit={hit.limit},retry={_fmt_wait(hit.retry_after_ms)}"
+                    + (",ip_untrusted" if untrusted else "")
+                )
+                if g.quota_mode == MODE_ENFORCE and not untrusted:
+                    blocking.append(hit)
+                    g._event("reject", f"rate.{hit.dim}", self, mode=g.quota_mode, detail=detail)
+                else:
+                    g._event("violation", f"rate.{hit.dim}", self, mode=g.quota_mode, detail=detail)
+            if blocking:
+                retry = max((h.retry_after_ms or 0) for h in blocking)
+                site = any(h.dim == RATE_DEMO_SITE_1H for h in blocking)
+                return _rate_rejection(
+                    "rate:" + "+".join(h.dim for h in blocking), retry, demo=lane == LANE_DEMO, site=site,
+                )
+            g.ledger.add(g.ledger.rate, counted, 1, now)
 
         # 推流只查桌面端 live：历史记录重新识别、网页体验的「回放」本来就是一次性推完的
         s.pace = g.pace_mode != MODE_OFF and lane == LANE_LIVE and not self.whitelisted
@@ -518,20 +646,40 @@ class Guard:
             DIM_NONLIVE_DEVICE: _minutes_ms(q.nonlive_device_minutes),
             DIM_NONLIVE_IP: _minutes_ms(q.nonlive_ip_minutes),
             DIM_DEMO_IP: _minutes_ms(q.demo_ip_minutes),
+            DIM_DEMO_SITE: _minutes_ms(q.demo_global_minutes),
             DIM_INTERNAL: _minutes_ms(q.internal_minutes),
         }
+        self.rate_limits: dict[str, int] = {
+            dim: max(0, int(n)) for dim, n in (
+                (RATE_DEVICE_1M, q.device_sessions_per_minute),
+                (RATE_DEVICE_1H, q.device_sessions_per_hour),
+                (RATE_DEVICE_24H, q.device_sessions_per_day),
+                (RATE_EMPTY_DEVICE_1H, q.device_empty_per_hour),
+                (RATE_IP_1H, q.ip_sessions_per_hour),
+                (RATE_IP_24H, q.ip_sessions_per_day),
+                (RATE_DEMO_IP_1H, q.demo_ip_sessions_per_hour),
+                (RATE_DEMO_IP_24H, q.demo_ip_sessions_per_day),
+                (RATE_DEMO_SITE_1H, q.demo_global_sessions_per_hour),
+            )
+        }
+        wd = cfg.web_demo
+        self.web_demo_mode = wd.mode if on else MODE_OFF
+        self.allowed_origins = frozenset(_norm_origin(o) for o in wd.allowed_origins if _norm_origin(o))
+        if self.web_demo_mode != MODE_OFF and not self.allowed_origins:
+            self.warnings.append("web_demo.allowed_origins 为空：网页体验的 Origin 检查本次不生效")
         self.ai_limits: dict[str, int] = {
             DIM_DEVICE: max(0, int(cfg.ai_budget.device_tokens)),
             DIM_IP: max(0, int(cfg.ai_budget.ip_tokens)),
         }
         self.max_prompt_chars = max(0, int(cfg.ai_budget.max_system_prompt_chars))
-        if self.quota_mode != MODE_OFF and not any(self.audio_limits.values()):
+        if self.quota_mode != MODE_OFF and not any(self.audio_limits.values()) and not any(self.rate_limits.values()):
             self.warnings.append("quota 的上限全是 0（不限），开了也不会拦任何会话")
         if self.ai_mode != MODE_OFF and not any(self.ai_limits.values()) and not self.max_prompt_chars:
             self.warnings.append("ai_budget 的上限全是 0（不限），开了也不会停任何润色")
 
         self.ledger = UsageLedger()
         self.seed_result: SeedResult | None = None
+        self.rate_seed_result: SeedResult | None = None
         self._stats = _Stats(mono())
         # 全站最近一小时：给告警和「最忙一小时」用
         self._hour = {
@@ -567,13 +715,19 @@ class Guard:
 
     def connection(
         self, *, cid: str, peer: str | None, forwarded: str | None, xff: str | None, is_web_demo: bool,
+        origin: str | None = None, ua: str | None = None,
     ) -> GuardConnection | _NullConnection:
         if not self.present:
             return _NULL_CONNECTION
         ip, real = self.ip_for(peer, xff, forwarded)
         whitelisted = ip_in(real, self.allow)
-        self._netid(entry="ws_demo" if is_web_demo else "ws", peer=peer, xff=xff, legacy=legacy_ip_key(peer, forwarded), real=real)
-        return GuardConnection(self, cid=cid, ip=ip, real_ip=real, is_web_demo=is_web_demo, whitelisted=whitelisted)
+        self._netid(
+            entry="ws_demo" if is_web_demo else "ws", peer=peer, xff=xff, legacy=legacy_ip_key(peer, forwarded),
+            real=real, origin=origin, ua=ua,
+        )
+        return GuardConnection(
+            self, cid=cid, ip=ip, real_ip=real, is_web_demo=is_web_demo, whitelisted=whitelisted, origin=origin,
+        )
 
     # ── 日志 ──────────────────────────────────────────────────────────
 
@@ -605,7 +759,10 @@ class Guard:
             )
         self._check_alerts(now_ms)
 
-    def _netid(self, *, entry: str, peer: str | None, xff: str | None, legacy: str, real: str) -> None:
+    def _netid(
+        self, *, entry: str, peer: str | None, xff: str | None, legacy: str, real: str,
+        origin: str | None = None, ua: str | None = None,
+    ) -> None:
         """核对可信 IP 用：同一个真实 IP 10 分钟一行。
 
         去重 key 里还带了对端和最近一跳代理：同一台测试机先后从不同入口（不同负载均衡）进来时
@@ -619,7 +776,8 @@ class Guard:
         if trusted_peer and xff:
             parts = [p for p in re.split(r"[\s,]+", xff) if p]
             nearest = parts[-1][:64] if parts else ""
-        key = (real, str(peer_ip) if peer_ip is not None else str(peer), nearest)
+        # 入口和 Origin 也进去重 key：同一个 IP 既开桌面端又开网页体验时各留一行，才看得到网页访客的 Origin
+        key = (real, str(peer_ip) if peer_ip is not None else str(peer), nearest, entry, _norm_origin(origin))
         now = self._mono()
         last = self._netid_seen.get(key)
         if last is not None and now - last < _NETID_DEDUPE_SEC:
@@ -628,10 +786,11 @@ class Guard:
             self._netid_seen.clear()
         self._netid_seen[key] = now
         logger.info(
-            "guard netid ip=%s peer=%s xff=%s legacy=%s entry=%s trusted_peer=%s use_real_ip=%s",
+            "guard netid ip=%s peer=%s xff=%s legacy=%s entry=%s trusted_peer=%s use_real_ip=%s origin=%s ua=%s",
             _clean(real), _clean(peer), _clean_xff(xff), _clean(legacy), entry,
             "yes" if trusted_peer else "no",
             "active" if self.resolver.active else ("ignored" if self.cfg.use_real_ip else "off"),
+            _clean(origin, 80), _clean(ua, 100),
         )
 
     def _note_usage(self, lane: str, audio_ms: int, ai_tokens: int, now_ms: int) -> None:
@@ -693,11 +852,35 @@ class Guard:
             ip_ok = not (isinstance(forwarded, str) and len(forwarded) >= _STORED_FORWARDED_MAX)
             return keys, ip_ok
 
+        def rate_keys_for_row(row: dict[str, Any]) -> tuple[list[tuple[str, str]], list[tuple[str, str]], bool]:
+            # 没有 device_id 的行补不准：分不出是网页体验还是没带 client_meta 的桌面端，干脆不补
+            device = _device_key(row.get("device_id"))
+            if not device:
+                return [], [], True
+            forwarded = row.get("forwarded_for")
+            ip, real = self.ip_for(row.get("client_ip"), forwarded, forwarded)
+            internal = ip_in(real, self.allow)
+            source = str(row.get("source") or "live").strip()
+            lane = LANE_LIVE if source == "live" else LANE_NONLIVE
+            ip_ok = not (isinstance(forwarded, str) and len(forwarded) >= _STORED_FORWARDED_MAX)
+            return (
+                rate_keys(lane, device=device, ip=ip, internal=internal),
+                empty_keys(lane, device=device, internal=internal),
+                ip_ok,
+            )
+
+        now = self.now_ms()
         try:
-            self.seed_result = seed_audio_from_db(self.ledger, db, now_ms=self.now_ms(), keys_for_row=keys_for_row)
+            self.seed_result = seed_audio_from_db(self.ledger, db, now_ms=now, keys_for_row=keys_for_row)
         except Exception as exc:  # 起不来比少算严重得多
             logger.warning("guard seed failed (%s); counters start from zero", type(exc).__name__)
             self.seed_result = None
+        if any(self.rate_limits.values()):
+            try:
+                self.rate_seed_result = seed_rates_from_db(self.ledger, db, now_ms=now, keys_for_row=rate_keys_for_row)
+            except Exception as exc:
+                logger.warning("guard rate seed failed (%s); session counters start from zero", type(exc).__name__)
+                self.rate_seed_result = None
         return self.seed_result
 
     def banner_line(self) -> str:
@@ -713,6 +896,12 @@ class Guard:
         if quota != MODE_OFF:
             quota += "(" + ",".join(f"{dim}={_fmt_min(ms)}min" for dim, ms in self.audio_limits.items() if ms) + ")"
         parts.append(f"quota={quota}")
+        if self.quota_mode != MODE_OFF and any(self.rate_limits.values()):
+            parts.append("rate=(" + ",".join(f"{dim}={n}" for dim, n in self.rate_limits.items() if n) + ")")
+        web_demo = self.web_demo_mode
+        if web_demo != MODE_OFF:
+            web_demo += f"(origins={len(self.allowed_origins)})"
+        parts.append(f"web_demo_origin={web_demo}")
         ai = self.ai_mode
         if ai != MODE_OFF:
             items = [f"{dim}={n}tok" for dim, n in self.ai_limits.items() if n]
@@ -727,6 +916,7 @@ class Guard:
         parts.append(f"use_real_ip={real_ip}")
         parts.append(f"trusted_proxies={len(self.resolver.trusted)} allow_ips={len(self.allow)}")
         parts.append(f"netid_log={'on' if self.cfg.netid_log else 'off'}")
+        # use_real_ip 没生效时，按 IP 的额度和频率（含网页体验每 IP 的次数）即使 enforce 也只记录
         if MODE_ENFORCE in (self.quota_mode, self.ai_mode) and not self.resolver.active:
             parts.append("ip_dims=log_only")
         alerts = ",".join(f"{k}={v}" for k, v in self._alert_threshold.items() if v)
@@ -734,6 +924,8 @@ class Guard:
         parts.append("counters=memory,single_worker")
         if self.seed_result is not None:
             parts.append(f"seeded={self.seed_result.seeded}/{self.seed_result.rows}")
+        if self.rate_seed_result is not None:
+            parts.append(f"seeded_rate={self.rate_seed_result.seeded}/{self.rate_seed_result.rows}")
         return " ".join(parts)
 
     def log_banner(self) -> None:
@@ -770,6 +962,7 @@ class Guard:
             f"guard stats period={period}s sessions={sessions} audio_min={audio} ai_tokens={st.ai_tokens} "
             f"violation={events('violation')} reject={events('reject')} degrade={events('degrade')} alert={st.alerts} "
             f"max24h_audio={top(self.ledger.audio, True)} max24h_ai={top(self.ledger.ai, False)} "
+            f"max_rate={top(self.ledger.rate, False)} "
             f"peak_hour=audio:{_fmt_min(self._peak['audio'])}min,ai:{self._peak['ai']} "
             f"tracked={self.ledger.tracked()} evicted={self.ledger.evicted()}"
         )

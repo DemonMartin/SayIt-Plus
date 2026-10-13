@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,11 +17,29 @@ _DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config.yaml"
 # Sub-configs — mirror the YAML structure
 # ---------------------------------------------------------------------------
 
+_KIB = 1024
+_MIB = 1024 * 1024
+
+
+@dataclass(slots=True)
+class BodyLimitConfig:
+    """HTTP 请求体上限（字节）。
+
+    接口内原有的检查（诊断包 50 MiB、录音 10 MiB）照旧保留，这里是外面多加的一层。
+    """
+    diagnostics: int = 52 * _MIB      # 截图 ≤20 MiB + 日志压缩后约 2 MiB；接口自己还限 50 MiB
+    asr_corrections: int = 11 * _MIB  # 录音 ≤10 MiB + 文字与热词不到 50 KiB
+    feedback: int = 512 * _KIB        # 正常最大约 70~90 KiB
+    admin: int = 8 * _MIB             # admin 后台上传 5 MiB 截图，base64 后约 6.7 MiB
+    default: int = 1 * _MIB           # 其余都是 GET 或很小的 POST
+
+
 @dataclass(slots=True)
 class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    body_limits: BodyLimitConfig = field(default_factory=BodyLimitConfig)
 
 
 @dataclass(slots=True)
@@ -181,6 +200,27 @@ class GuardQuotaConfig:
     nonlive_ip_minutes: float = 0.0
     demo_ip_minutes: float = 0.0
     internal_minutes: float = 0.0
+    # 网页体验：全站 24 小时音频分钟，单 IP / 全站的会话次数
+    demo_global_minutes: float = 0.0
+    demo_ip_sessions_per_hour: int = 0
+    demo_ip_sessions_per_day: int = 0
+    demo_global_sessions_per_hour: int = 0
+    # 桌面端会话次数：按设备（1 分钟 / 1 小时 / 24 小时）、按 IP（1 小时 / 24 小时）
+    device_sessions_per_minute: int = 0
+    device_sessions_per_hour: int = 0
+    device_sessions_per_day: int = 0
+    ip_sessions_per_hour: int = 0
+    ip_sessions_per_day: int = 0
+    # 桌面端每台设备每小时「识别结果为空或只有一个字」的会话数
+    device_empty_per_hour: int = 0
+
+
+@dataclass(slots=True)
+class GuardWebDemoConfig:
+    """网页体验必须来自这些站点的浏览器（看 WebSocket 握手的 Origin 头）。"""
+
+    mode: str = "off"
+    allowed_origins: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -219,6 +259,7 @@ class GuardConfig:
     quota: GuardQuotaConfig = field(default_factory=GuardQuotaConfig)
     ai_budget: GuardAiBudgetConfig = field(default_factory=GuardAiBudgetConfig)
     alert: GuardAlertConfig = field(default_factory=GuardAlertConfig)
+    web_demo: GuardWebDemoConfig = field(default_factory=GuardWebDemoConfig)
     # 解析时发现的配置问题。不抛异常（load_config 在 main 导入期执行，抛了整个后端起不来），
     # 由启动 banner 统一打出来。
     warnings: list[str] = field(default_factory=list)
@@ -477,14 +518,22 @@ def _auto_infer_llm(profile: LLMProfile) -> LLMProfile:
 
 _GUARD_KEYS = frozenset({
     "trusted_proxies", "allow_ips", "use_real_ip", "netid_log", "pace", "admission", "quota", "ai_budget", "alert",
+    "web_demo",
 })
+_QUOTA_MINUTE_KEYS = (
+    "device_minutes", "ip_minutes", "nonlive_device_minutes", "nonlive_ip_minutes",
+    "demo_ip_minutes", "internal_minutes", "demo_global_minutes",
+)
+_QUOTA_COUNT_KEYS = (
+    "demo_ip_sessions_per_hour", "demo_ip_sessions_per_day", "demo_global_sessions_per_hour",
+    "device_sessions_per_minute", "device_sessions_per_hour", "device_sessions_per_day",
+    "ip_sessions_per_hour", "ip_sessions_per_day", "device_empty_per_hour",
+)
 _GUARD_SUB_KEYS = {
     "pace": frozenset({"mode", "max_ratio", "grace_sec"}),
     "admission": frozenset({"mode"}),
-    "quota": frozenset({
-        "mode", "device_minutes", "ip_minutes", "nonlive_device_minutes", "nonlive_ip_minutes",
-        "demo_ip_minutes", "internal_minutes",
-    }),
+    "quota": frozenset({"mode", *_QUOTA_MINUTE_KEYS, *_QUOTA_COUNT_KEYS}),
+    "web_demo": frozenset({"mode", "allowed_origins"}),
     "ai_budget": frozenset({"mode", "device_tokens", "ip_tokens", "max_system_prompt_chars"}),
     "alert": frozenset({"audio_minutes_per_hour", "ai_tokens_per_hour", "hits_per_hour"}),
 }
@@ -526,19 +575,19 @@ def _guard_bool(section: dict[str, Any], key: str, warnings: list[str]) -> bool:
     return False
 
 
-def _guard_list(section: dict[str, Any], key: str, warnings: list[str]) -> list[str]:
+def _guard_list(section: dict[str, Any], key: str, warnings: list[str], *, prefix: str = "") -> list[str]:
     value = section.get(key)
     if value is None:
         return []
     if not isinstance(value, list):
-        warnings.append(f"guard.{key} 必须是列表，已忽略")
+        warnings.append(f"guard.{prefix}{key} 必须是列表，已忽略")
         return []
     items: list[str] = []
     for item in value:
         if isinstance(item, str) and item.strip():
             items.append(item.strip())
         else:
-            warnings.append(f"guard.{key} 里的 {_guard_repr(item)} 不是字符串，已忽略")
+            warnings.append(f"guard.{prefix}{key} 里的 {_guard_repr(item)} 不是字符串，已忽略")
     return items
 
 
@@ -569,6 +618,7 @@ def _load_guard(raw: Any) -> GuardConfig:
     quota = _guard_section(raw, "quota", warnings)
     ai_budget = _guard_section(raw, "ai_budget", warnings)
     alert = _guard_section(raw, "alert", warnings)
+    web_demo = _guard_section(raw, "web_demo", warnings)
     return GuardConfig(
         present=True,
         trusted_proxies=_guard_list(raw, "trusted_proxies", warnings),
@@ -583,12 +633,12 @@ def _load_guard(raw: Any) -> GuardConfig:
         admission=GuardAdmissionConfig(mode=_guard_mode(admission.get("mode"), "admission.mode", warnings)),
         quota=GuardQuotaConfig(
             mode=_guard_mode(quota.get("mode"), "quota.mode", warnings),
-            device_minutes=_guard_number(quota, "device_minutes", "quota", warnings),
-            ip_minutes=_guard_number(quota, "ip_minutes", "quota", warnings),
-            nonlive_device_minutes=_guard_number(quota, "nonlive_device_minutes", "quota", warnings),
-            nonlive_ip_minutes=_guard_number(quota, "nonlive_ip_minutes", "quota", warnings),
-            demo_ip_minutes=_guard_number(quota, "demo_ip_minutes", "quota", warnings),
-            internal_minutes=_guard_number(quota, "internal_minutes", "quota", warnings),
+            **{k: _guard_number(quota, k, "quota", warnings) for k in _QUOTA_MINUTE_KEYS},
+            **{k: _guard_number(quota, k, "quota", warnings, integer=True) for k in _QUOTA_COUNT_KEYS},
+        ),
+        web_demo=GuardWebDemoConfig(
+            mode=_guard_mode(web_demo.get("mode"), "web_demo.mode", warnings),
+            allowed_origins=_guard_list(web_demo, "allowed_origins", warnings, prefix="web_demo."),
         ),
         ai_budget=GuardAiBudgetConfig(
             mode=_guard_mode(ai_budget.get("mode"), "ai_budget.mode", warnings),
@@ -605,6 +655,35 @@ def _load_guard(raw: Any) -> GuardConfig:
         ),
         warnings=warnings,
     )
+
+
+_BODY_LIMIT_KEYS = {
+    # yaml 键 -> (字段名, 单位)
+    "diagnostics_mib": ("diagnostics", _MIB),
+    "asr_corrections_mib": ("asr_corrections", _MIB),
+    "feedback_kib": ("feedback", _KIB),
+    "admin_mib": ("admin", _MIB),
+    "default_kib": ("default", _KIB),
+}
+
+
+def _load_body_limits(raw: dict) -> BodyLimitConfig:
+    """读 server.body_limits。写错的值记一条警告后用默认值，不抛异常 ——
+    load_config 在 main.py 导入期执行，一个手误不该让整个后端起不来。"""
+    values = {}
+    for key, value in raw.items():
+        spec = _BODY_LIMIT_KEYS.get(key)
+        if spec is None:
+            logging.getLogger("sayit.config").warning("server.body_limits: unknown key %r ignored", key)
+            continue
+        field_name, unit = spec
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            logging.getLogger("sayit.config").warning(
+                "server.body_limits.%s: invalid value %r, using default", key, value
+            )
+            continue
+        values[field_name] = int(value * unit)
+    return BodyLimitConfig(**values)
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +799,7 @@ def load_config(config_path: str | None = None, env_path: str | None = None) -> 
             host=host,
             port=port,
             cors_origins=_env_list("SAYIT_CORS_ORIGINS", list(server_raw.get("cors_origins") or defaults.server.cors_origins)),
+            body_limits=_load_body_limits(_pick(server_raw, "body_limits", default={}) or {}),
         ),
         gateway=GatewayConfig(
             host=str(gateway_raw.get("host") or defaults.gateway.host),

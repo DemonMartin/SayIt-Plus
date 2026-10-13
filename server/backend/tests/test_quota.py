@@ -102,7 +102,11 @@ class DimensionTests(unittest.TestCase):
         )
 
     def test_demo_and_internal(self) -> None:
-        self.assertEqual(audio_keys(LANE_DEMO, device="", ip="198.51.100.7"), [(DIM_DEMO_IP, "198.51.100.7")])
+        # 网页体验同时计入单 IP 和全站合计
+        self.assertEqual(
+            audio_keys(LANE_DEMO, device="", ip="198.51.100.7"),
+            [(DIM_DEMO_IP, "198.51.100.7"), ("demo_site", "site")],
+        )
         self.assertEqual(
             audio_keys(LANE_NONLIVE, device="d1", ip="198.51.100.7", internal_ip="203.0.113.5"),
             [(DIM_INTERNAL, "203.0.113.5")],

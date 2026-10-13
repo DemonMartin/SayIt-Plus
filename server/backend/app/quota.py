@@ -33,12 +33,41 @@ DIM_IP = "ip"
 DIM_NONLIVE_DEVICE = "nonlive_device"
 DIM_NONLIVE_IP = "nonlive_ip"
 DIM_DEMO_IP = "demo_ip"
+DIM_DEMO_SITE = "demo_site"  # 网页体验全站合计，key 固定为 SITE_KEY
 DIM_INTERNAL = "internal"
-AUDIO_DIMS = (DIM_DEVICE, DIM_IP, DIM_NONLIVE_DEVICE, DIM_NONLIVE_IP, DIM_DEMO_IP, DIM_INTERNAL)
+AUDIO_DIMS = (DIM_DEVICE, DIM_IP, DIM_NONLIVE_DEVICE, DIM_NONLIVE_IP, DIM_DEMO_IP, DIM_DEMO_SITE, DIM_INTERNAL)
 AI_DIMS = (DIM_DEVICE, DIM_IP)
+SITE_KEY = "site"
+
+# 会话频率维度（单位：次）。名字带窗口，日志里一眼看出是哪一道。
+RATE_DEVICE_1M = "device_1m"
+RATE_DEVICE_1H = "device_1h"
+RATE_DEVICE_24H = "device_24h"
+RATE_EMPTY_DEVICE_1H = "empty_device_1h"  # 识别结果为空 / 只有一个字的会话
+RATE_IP_1H = "ip_1h"
+RATE_IP_24H = "ip_24h"
+RATE_DEMO_IP_1H = "demo_ip_1h"
+RATE_DEMO_IP_24H = "demo_ip_24h"
+RATE_DEMO_SITE_1H = "demo_site_1h"
+_MIN_MS = 60 * 1000
+_HOUR_MS = 60 * _MIN_MS
+# (窗口, 桶)。桶越小越准，但每个 key 占的内存越多；分钟窗口用 5 秒桶，小时窗口用 1 分钟桶。
+RATE_SPECS: dict[str, tuple[int, int]] = {
+    RATE_DEVICE_1M: (_MIN_MS, 5_000),
+    RATE_DEVICE_1H: (_HOUR_MS, _MIN_MS),
+    RATE_DEVICE_24H: (WINDOW_MS, BUCKET_MS),
+    RATE_EMPTY_DEVICE_1H: (_HOUR_MS, _MIN_MS),
+    RATE_IP_1H: (_HOUR_MS, _MIN_MS),
+    RATE_IP_24H: (WINDOW_MS, BUCKET_MS),
+    RATE_DEMO_IP_1H: (_HOUR_MS, _MIN_MS),
+    RATE_DEMO_IP_24H: (WINDOW_MS, BUCKET_MS),
+    RATE_DEMO_SITE_1H: (_HOUR_MS, _MIN_MS),
+}
+
 # 以「按代理链解析出来的客户端 IP」为 key 的维度。白名单（internal）不在里面：
-# 白名单只认可信 IP，所以它的 key 本来就是可信的。
-IP_DIMS = frozenset({DIM_IP, DIM_NONLIVE_IP, DIM_DEMO_IP})
+# 白名单只认可信 IP，所以它的 key 本来就是可信的。全站维度也不在里面：它的 key 是常量，
+# 跟 IP 可不可信无关，所以 use_real_ip 没打开时也照样能拦。
+IP_DIMS = frozenset({DIM_IP, DIM_NONLIVE_IP, DIM_DEMO_IP, RATE_IP_1H, RATE_IP_24H, RATE_DEMO_IP_1H, RATE_DEMO_IP_24H})
 
 # 分道
 LANE_LIVE = "live"          # 桌面端实时录音（source == "live"）
@@ -56,7 +85,7 @@ def audio_keys(lane: str, *, device: str, ip: str, internal_ip: str | None = Non
     if internal_ip:
         return [(DIM_INTERNAL, internal_ip)]
     if lane == LANE_DEMO:
-        return [(DIM_DEMO_IP, ip)]
+        return [(DIM_DEMO_IP, ip), (DIM_DEMO_SITE, SITE_KEY)]
     keys: list[tuple[str, str]] = []
     if device:
         keys.append((DIM_DEVICE, device))
@@ -66,6 +95,30 @@ def audio_keys(lane: str, *, device: str, ip: str, internal_ip: str | None = Non
             keys.append((DIM_NONLIVE_DEVICE, device))
         keys.append((DIM_NONLIVE_IP, ip))
     return keys
+
+
+def rate_keys(lane: str, *, device: str, ip: str, internal: bool = False) -> list[tuple[str, str]]:
+    """一次会话的「次数」计到哪些频率维度上。白名单不限频（自己人的脚本）。
+
+    桌面端按设备三个窗口（1 分钟放宽、1 小时 / 24 小时收紧：真人是一阵一阵地用，脚本是整点不停），
+    再按 IP 兜底（同一台机器换着 device_id 发）。网页体验按 IP 两个窗口加全站一个。
+    """
+    if internal:
+        return []
+    if lane == LANE_DEMO:
+        return [(RATE_DEMO_IP_1H, ip), (RATE_DEMO_IP_24H, ip), (RATE_DEMO_SITE_1H, SITE_KEY)]
+    keys: list[tuple[str, str]] = []
+    if device:
+        keys += [(RATE_DEVICE_1M, device), (RATE_DEVICE_1H, device), (RATE_DEVICE_24H, device)]
+    keys += [(RATE_IP_1H, ip), (RATE_IP_24H, ip)]
+    return keys
+
+
+def empty_keys(lane: str, *, device: str, internal: bool = False) -> list[tuple[str, str]]:
+    """「空结果」计到哪里：只按桌面端设备计。网页体验已经按 IP 限了次数。"""
+    if internal or lane == LANE_DEMO or not device:
+        return []
+    return [(RATE_EMPTY_DEVICE_1H, device)]
 
 
 def ai_keys(lane: str, *, device: str, ip: str) -> list[tuple[str, str]]:
@@ -183,11 +236,14 @@ class Hit:
 
 
 class UsageLedger:
-    """音频（毫秒）和润色（token）两组滚动窗口。"""
+    """音频（毫秒）、润色（token）、会话次数三组滚动窗口。"""
 
     def __init__(self, *, max_keys: int = MAX_KEYS) -> None:
         self.audio: dict[str, RollingWindow] = {dim: RollingWindow(max_keys=max_keys) for dim in AUDIO_DIMS}
         self.ai: dict[str, RollingWindow] = {dim: RollingWindow(max_keys=max_keys) for dim in AI_DIMS}
+        self.rate: dict[str, RollingWindow] = {
+            dim: RollingWindow(window_ms=w, bucket_ms=b, max_keys=max_keys) for dim, (w, b) in RATE_SPECS.items()
+        }
 
     @staticmethod
     def over(
@@ -213,11 +269,14 @@ class UsageLedger:
         for dim, key in keys:
             windows[dim].add(key, amount, now_ms)
 
+    def _all(self) -> list[RollingWindow]:
+        return [*self.audio.values(), *self.ai.values(), *self.rate.values()]
+
     def evicted(self) -> int:
-        return sum(w.evicted for w in self.audio.values()) + sum(w.evicted for w in self.ai.values())
+        return sum(w.evicted for w in self._all())
 
     def tracked(self) -> int:
-        return sum(len(w) for w in self.audio.values()) + sum(len(w) for w in self.ai.values())
+        return sum(len(w) for w in self._all())
 
 
 # seed 只认「管线真的跑完」的会话：实时记账也只在处理完成后记。被拒、失败、空音频的都不算。
@@ -273,5 +332,51 @@ def seed_audio_from_db(
             skipped += 1
             continue
         UsageLedger.add(ledger.audio, keys, audio_ms, started)
+        seeded += 1
+    return SeedResult(rows=len(rows), seeded=seeded, skipped=skipped, ip_unknown=ip_unknown)
+
+
+# 会话次数：所有建过会话的行都算（start 被拒的根本不建会话，所以库里的每一行都是「放行过一次」）。
+SEED_RATE_SQL = (
+    "SELECT started_at, device_id, client_ip, forwarded_for, source, status "
+    "FROM usage_sessions WHERE started_at >= ? ORDER BY started_at ASC"
+)
+
+
+def seed_rates_from_db(
+    ledger: UsageLedger,
+    db: Any,
+    *,
+    now_ms: int,
+    keys_for_row: Callable[[dict[str, Any]], tuple[list[tuple[str, str]], list[tuple[str, str]], bool]],
+) -> SeedResult:
+    """从 usage_sessions 补回最近 24 小时的会话次数和最近 1 小时的空结果次数。
+
+    ``keys_for_row(row)`` 返回 ``(频率维度, 空结果维度, IP 是否可信)``。空结果只认 status=empty_result
+    （「嗯。」这种一个字的结果库里分不出来，补不回来，只少算不多算）。
+    """
+    now_ms = int(now_ms)
+    since_ms = now_ms - WINDOW_MS
+    rows = db.fetch_all(SEED_RATE_SQL, (since_ms,))
+    seeded = skipped = ip_unknown = 0
+    for row in rows:
+        try:
+            started = int(row.get("started_at") or 0)
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if started < since_ms or started > now_ms:
+            skipped += 1
+            continue
+        keys, empties, ip_ok = keys_for_row(row)
+        if not ip_ok:
+            ip_unknown += 1
+            keys = [(dim, key) for dim, key in keys if dim not in IP_DIMS]
+        if not keys:
+            skipped += 1
+            continue
+        UsageLedger.add(ledger.rate, keys, 1, started)
+        if str(row.get("status") or "") == "empty_result":
+            UsageLedger.add(ledger.rate, empties, 1, started)
         seeded += 1
     return SeedResult(rows=len(rows), seeded=seeded, skipped=skipped, ip_unknown=ip_unknown)
