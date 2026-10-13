@@ -13,6 +13,7 @@ import LocalModeSection, { LocalModeAdvancedSection } from './LocalModeSection'
 import ServerSection from './ServerSection'
 import AsrTestSection from './AsrTestSection'
 import { useT } from '@/i18n/useT'
+import { PageTitle } from '@/components/ui/info-tip'
 
 export default function VoiceEnginePage() {
   const t = useT()
@@ -42,10 +43,7 @@ export default function VoiceEnginePage() {
 
   return (
     <div className="mx-auto max-w-4xl">
-      <h1 className="mb-2 text-2xl font-bold">{t('nav.voiceEngine')}</h1>
-      <p className="mb-6 text-sm text-muted-foreground">
-        {t('voiceEngine.subtitle')}
-      </p>
+      <PageTitle title={t('nav.voiceEngine')} info={t('voiceEngine.subtitle')} />
 
       <div className="space-y-6">
         <WorkModeSection value={workMode} onChange={(m) => void handleWorkModeChange(m)} />

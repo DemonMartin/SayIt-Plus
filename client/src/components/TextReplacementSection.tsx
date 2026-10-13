@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Plus, X, List } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
+import { Card, CardContent } from '@/components/ui/card'
+import { InfoTip } from '@/components/ui/info-tip'
 import { useSortable, DragHandle, moveItem } from '@/components/ui/sortable'
 import { t } from '@/i18n'
 import { useT } from '@/i18n/useT'
@@ -115,20 +117,18 @@ export default function TextReplacementSection() {
   const enabledCount = rules.filter((r) => r.enabled).length
 
   return (
-    <div className="rounded-lg border border-border">
-      <div className="border-b border-border px-4 py-3">
-        <h2 className="text-lg font-semibold">{t('textReplace.title')}</h2>
-        <p className="mt-0.5 text-xs text-muted-foreground">
+    // 卡片样式与其他页统一；执行顺序的说明收进 ⓘ
+    <Card>
+      <CardContent className="p-6">
+        <div className="flex items-center gap-1.5">
+          <h2 className="text-lg font-semibold">{t('textReplace.title')}</h2>
+          <InfoTip content={t('textReplace.orderHint')} label={t('textReplace.title')} />
+        </div>
+        <p className="mt-1 text-xs text-muted-foreground">
           {t('textReplace.desc')}
           {rules.length > 0 && t('textReplace.counts', { enabled: enabledCount, total: rules.length })}
         </p>
-        {rules.length > 1 && (
-          <p className="mt-1 text-xs text-muted-foreground/70">
-            {t('textReplace.orderHint')}
-          </p>
-        )}
-      </div>
-      <div className="p-4">
+      <div className="mt-4">
         {/* 添加新规则 — 两列对齐 */}
         {!batchMode && (
           <div className="flex items-center gap-2">
@@ -231,10 +231,10 @@ export default function TextReplacementSection() {
             {/* 列头 */}
             <div className="flex items-center border-b border-border bg-muted/30 px-3 py-1.5">
               <span className="w-[22px] shrink-0" />
-              <span className="w-7 shrink-0" />
-              <span className="flex-1 pl-3 text-xs text-muted-foreground">{t('textReplace.from')}</span>
+              <span className="flex-1 pl-2 text-xs text-muted-foreground">{t('textReplace.from')}</span>
               <span className="mx-3 h-3 w-px shrink-0 bg-border" />
               <span className="flex-1 text-xs text-muted-foreground">{t('textReplace.toShort')}</span>
+              <span className="ml-3 w-7 shrink-0" />
               <span className="w-8 shrink-0" />
             </div>
             {rules.map((rule, index) => (
@@ -245,19 +245,20 @@ export default function TextReplacementSection() {
                   } ${sortable.rowClassName(index)}`}
               >
                 <DragHandle {...sortable.handleProps(index, t('textReplace.dragHandle', { name: rule.from }))} />
-                <Switch
-                  checked={rule.enabled}
-                  onChange={() => void toggleRule(rule.id)}
-                  size="sm"
-                  className="shrink-0"
-                />
-                <span className={`flex-1 truncate pl-3 text-sm ${!rule.enabled ? 'line-through text-muted-foreground' : ''}`}>
+                <span className={`flex-1 truncate pl-2 text-sm ${!rule.enabled ? 'line-through text-muted-foreground' : ''}`}>
                   {rule.from}
                 </span>
                 <span className="mx-3 h-4 w-px shrink-0 bg-border/50" />
                 <span className="flex-1 truncate text-sm text-muted-foreground">
                   {rule.to || <span className="italic text-muted-foreground/50">{t('textReplace.deleteMark')}</span>}
                 </span>
+                {/* 开关放在右侧，和全软件一致 */}
+                <Switch
+                  checked={rule.enabled}
+                  onChange={() => void toggleRule(rule.id)}
+                  size="sm"
+                  className="ml-3 shrink-0"
+                />
                 <button
                   onClick={() => void removeRule(rule.id)}
                   className="w-8 shrink-0 flex justify-center rounded-full p-1 text-muted-foreground/0 transition-colors group-hover:text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
@@ -276,6 +277,7 @@ export default function TextReplacementSection() {
           </div>
         )}
       </div>
-    </div>
+      </CardContent>
+    </Card>
   )
 }

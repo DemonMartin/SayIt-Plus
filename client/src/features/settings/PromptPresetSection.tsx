@@ -13,6 +13,16 @@ import { ComboShortcutInput, type ShortcutValidate } from './ShortcutInputs'
 import { displayAccelerator } from './utils'
 import { useT } from '@/i18n/useT'
 import { promptPresetDisplayName } from '@/i18n/displayNames'
+import type { TranslationKey } from '@/i18n'
+import { InfoTip } from '@/components/ui/info-tip'
+
+/** 内置润色模式的一句话说明（按 id）。用户改过内置提示词也还是这个模式，说明不变。 */
+const BUILTIN_PRESET_DESC: Record<string, TranslationKey> = {
+  intent: 'promptPreset.builtinDesc.intent',
+  faithful: 'promptPreset.builtinDesc.faithful',
+  zh2en: 'promptPreset.builtinDesc.zh2en',
+  casual: 'promptPreset.builtinDesc.casual',
+}
 
 export default function PromptPresetSection({
   presets,
@@ -98,8 +108,10 @@ export default function PromptPresetSection({
       <CardContent className="p-6">
         <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 grow basis-[18rem]">
-            <h2 className="text-lg font-semibold">{t('promptPreset.title')}</h2>
-            <p className="text-xs text-muted-foreground">{t('promptPreset.desc')}</p>
+            <div className="flex items-center gap-1.5">
+              <h2 className="text-lg font-semibold">{t('promptPreset.title')}</h2>
+              <InfoTip content={t('promptPreset.desc')} label={t('promptPreset.title')} />
+            </div>
           </div>
           <div className="flex shrink-0 flex-wrap items-center gap-2">
             <Segmented
@@ -280,7 +292,11 @@ export default function PromptPresetSection({
                           </span>
                         )}
                       </div>
-                      <p className="truncate text-xs text-muted-foreground">{preset.systemPrompt.slice(0, 60)}...</p>
+                      {/* 原来显示提示词原文的前 60 个字（「你是语音文本精炼助手。输入是 ASR……」），
+                          看不出几个模式的区别。内置模式改成一句说明；自建模式没有说明，只显示名字。 */}
+                      {BUILTIN_PRESET_DESC[preset.id] && (
+                        <p className="truncate text-xs text-muted-foreground">{t(BUILTIN_PRESET_DESC[preset.id])}</p>
+                      )}
                     </div>
                   </div>
 

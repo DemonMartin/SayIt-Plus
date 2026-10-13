@@ -6,6 +6,7 @@ import { ExternalLink, Info } from 'lucide-react'
 import { Tooltip } from '@/components/ui/tooltip'
 import { Card, CardContent } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
+import { Segmented } from '@/components/ui/segmented'
 import { themeList } from '@/themes'
 import { switchTheme, getActiveThemeId } from '@/stores/theme'
 import { getSetting, setSetting } from '@/services/store'
@@ -310,12 +311,8 @@ export default function AppearancePage() {
                         : 'border-border hover:bg-accent'
                         }`}
                     >
-                      <span className="flex items-center gap-2">
-                        <span className={`flex h-3.5 w-3.5 items-center justify-center rounded-full border ${overlayWaveTheme === option.theme ? 'border-primary' : 'border-muted-foreground/40'}`}>
-                          {overlayWaveTheme === option.theme && <span className="h-2 w-2 rounded-full bg-primary" />}
-                        </span>
-                        <span>{t(option.labelKey)}</span>
-                      </span>
+                      {/* 选中只靠边框和底色表示；原来的圆点和边框是同一个意思说了两遍 */}
+                      <span className={overlayWaveTheme === option.theme ? 'font-medium' : ''}>{t(option.labelKey)}</span>
                       <span className="flex gap-0.5">
                         {option.barColors.map((c, i) => (
                           <span key={i} className="h-3 w-1 rounded-sm" style={{ backgroundColor: c }} />
@@ -325,26 +322,17 @@ export default function AppearancePage() {
                   ))}
                 </div>
 
-                <div className="mt-4">
-                  <p className="mb-2 text-sm text-muted-foreground">{t('appearance.overlayWidth')}</p>
-                  <div className="grid gap-2 sm:grid-cols-3" style={ready ? undefined : { visibility: 'hidden' }}>
-                    {WIDTH_OPTIONS.map((option) => (
-                      <button
-                        key={option.value}
-                        type="button"
-                        onClick={() => void handleOverlayWidthChange(option.value)}
-                        className={`flex items-center gap-2 rounded-md border px-3 py-2 text-sm ${animate ? 'transition-colors' : ''} ${overlayWidth === option.value
-                          ? 'border-primary bg-primary/5'
-                          : 'border-border hover:bg-accent'
-                          }`}
-                      >
-                        <span className={`flex h-3.5 w-3.5 items-center justify-center rounded-full border ${overlayWidth === option.value ? 'border-primary' : 'border-muted-foreground/40'}`}>
-                          {overlayWidth === option.value && <span className="h-2 w-2 rounded-full bg-primary" />}
-                        </span>
-                        <span>{t(option.labelKey)}</span>
-                      </button>
-                    ))}
-                  </div>
+                {/* 只有一两个字的选项用分段按钮（和「识别语言」一致）；带图样的波形主题才用卡片 */}
+                <div className="mt-4 flex items-center justify-between gap-4">
+                  <p id="overlay-width-label" className="text-sm font-medium">{t('appearance.overlayWidth')}</p>
+                  <Segmented
+                    labelledBy="overlay-width-label"
+                    value={overlayWidth}
+                    options={WIDTH_OPTIONS.map((option) => ({ value: option.value, label: t(option.labelKey) }))}
+                    onChange={(value) => void handleOverlayWidthChange(value)}
+                    animated={animate}
+                    className="shrink-0 justify-end"
+                  />
                 </div>
 
                 <div className="mt-4 flex items-center justify-between">
@@ -361,16 +349,14 @@ export default function AppearancePage() {
                       <p className="text-sm font-medium">{t('appearance.streaming')}</p>
                       <Tooltip
                         variant="light"
-                        content={t('appearance.streamingHelp')}
+                        content={`${t('appearance.streamingHelp')}
+${t('appearance.streamingSetupNote')}`}
                       >
                         <Info className="h-3.5 w-3.5 shrink-0 cursor-help text-muted-foreground/50 transition-colors hover:text-muted-foreground" />
                       </Tooltip>
                     </div>
                     <p className="text-xs text-muted-foreground">
-                      {t('appearance.streamingDesc')}
-                      <span className="text-muted-foreground/70">
-                        {t('appearance.streamingNote')}
-                      </span>
+                      {t('appearance.streamingDesc')}{t('appearance.streamingShortNote')}
                       <button
                         type="button"
                         onClick={() => void shellOpen('https://console.volcengine.com/speech/new/setting/activate?projectName=default')}
@@ -379,7 +365,6 @@ export default function AppearancePage() {
                         {t('appearance.streamingActivate')}
                         <ExternalLink className="h-3 w-3" />
                       </button>
-                      <span className="text-muted-foreground/70">{t('appearance.streamingNoteEnd')}</span>
                     </p>
                   </div>
                   <Switch checked={streamingDisplay} onChange={handleToggleStreamingDisplay} noAnimation={!animate} hidden={!ready} />

@@ -44,6 +44,7 @@ import { MicLevelMonitor } from './MicLevelMonitor'
 import { HistoryWriter, type HistoryMetadata } from './HistoryWriter'
 import { RunState } from './RunState'
 import { InsertionController } from './InsertionController'
+import { defaultRecordingSettings, type RecordingSettings } from './RecordingSettings'
 import { createDefaultUserStats } from '../personalization/defaults'
 import { resolvePromptRouting } from '../personalization/promptRouter'
 import {
@@ -51,7 +52,7 @@ import {
   getUserStats,
   recordSessionStats,
 } from '../personalization/store'
-import type { AppPromptRule, PromptResolution, UserStats } from '../personalization/types'
+import type { PromptResolution, UserStats } from '../personalization/types'
 import type { PTTEventPayload, RecorderState } from './types'
 import { MAX_RECORDING_SEC, RECORDING_COUNTDOWN_SEC } from './types'
 import {
@@ -196,43 +197,19 @@ export class RecorderOrchestrator {
   private lastPTTUpAt = 0
   private lastPTTUpUsedModifier = false
 
-  private cachedMicId = ''
+  /** 录音要用的设置（麦克风、AI 整理、热词……），见 RecordingSettings。 */
+  private settings: RecordingSettings = defaultRecordingSettings()
   /** Last successfully opened input route in this app process. Kept in memory on purpose. */
   private lastMicSourceIdentity: string | null = null
-  /**
-   * 是否让浏览器对麦克风做降噪。默认开（底噪大的机器需要），
-   * 但降噪是按"人听得舒服"优化的，可能削掉 ASR 要的细节，所以可关。
-   */
-  private noiseSuppression = true
-  /** 是否在录音期间静音系统输出（防外放被麦克风回采）。默认关闭。 */
-  private cachedMuteSystemAudio = false
-  /** 插入文本后是否自动还原剪贴板为插入前内容。默认开启。 */
-  private cachedProtectClipboard = true
   /** 标记本次录音是否已施加系统静音，用于配对恢复。 */
   private systemMuteApplied = false
   /** 延迟静音定时器（等提示音播完再静音）。 */
   private systemMuteTimerId: ReturnType<typeof setTimeout> | null = null
-  private cachedPresets: PromptPreset[] = []
-  private cachedActivePresetId = 'intent'
-  private cachedAiEnabled = true
-  /** 0 = 所有语音都用 AI；正数 = 达到门槛才调用 AI。 */
-  private cachedAiMinDurationSec = 0
-  /** Reads bounded editor text only when explicitly enabled; default is false. */
-  private cachedContextAwareWriting = false
-  /** User-visible selection-edit prompt. Cached with other recording settings. */
-  private cachedContextSelectionEditPrompt = CONTEXT_SELECTION_EDIT_PROMPT
-  private cachedClientRuntimeInfo: ClientRuntimeInfo | null = null
+  private clientRuntimeInfo: ClientRuntimeInfo | null = null
   /** 客户端运行时信息是否已成功采集一次。它是进程内静态元数据（区域/内存/主机名等），
    *  只需启动时取一次，不该挂在每次改设置都触发的刷新热路径上。失败时保持 false 以便重试。 */
   private clientRuntimeInfoLoaded = false
-  private cachedAppPromptRules: AppPromptRule[] = []
-  private cachedUserStats: UserStats = createDefaultUserStats()
-  private cachedHotwords: string[] = []
-  /** 是否把热词注入 AI 提示词（默认关，用户可在热词页开启）。 */
-  private cachedInjectHotwords = false
-  private cachedLanguage: string = ''
-  /** 是否开启流式实时显示（识别过程中把中间结果实时显示在悬浮窗）。默认关闭。 */
-  private cachedStreamingDisplay = false
+  private userStats: UserStats = createDefaultUserStats()
 
   private readonly overlayWaveState = createWaveformBarState()
   private readonly overlayService = new OverlayService(() => this.getLiveElapsedSec())
@@ -243,7 +220,7 @@ export class RecorderOrchestrator {
     getState: () => this.state,
     isStarting: () => this.startRecordingLock,
     getActiveRunId: () => this.activeRunId,
-    getSelectedMicId: () => this.cachedMicId,
+    getSelectedMicId: () => this.settings.micId,
     cancelForMutedMic: (runId) => { void this.cancelRecording(runId, { showCanceled: false, reason: 'mic_muted_timeout' }) },
   })
   /** 拿目标窗口、判断能不能写、粘贴、给结果分类。状态怎么变仍由编排器决定。 */
@@ -378,7 +355,7 @@ export class RecorderOrchestrator {
   /** 若已开启「录音时静音系统声音」，在就绪提示音播放之后再静音系统输出。
    *  延迟略长于提示音时长（~150ms），避免把提示音也一起静掉。 */
   private scheduleSystemMuteIfEnabled() {
-    if (!this.cachedMuteSystemAudio) return
+    if (!this.settings.muteSystemAudio) return
     this.clearSystemMuteTimer()
     this.systemMuteTimerId = setTimeout(() => {
       this.systemMuteTimerId = null
@@ -430,18 +407,18 @@ export class RecorderOrchestrator {
   private async handlePresetSwitch(presetId: string) {
     try {
       // 优先用已缓存的预设列表，避免 IPC 等待导致的延时
-      let target = this.cachedPresets.find((p) => p.id === presetId)
+      let target = this.settings.presets.find((p) => p.id === presetId)
       if (!target) {
         const presets = await getPromptPresets()
         target = presets.find((p) => p.id === presetId)
-        this.cachedPresets = presets
+        this.settings.presets = presets
       }
       if (!target) {
         addRuntimeEvent('warn', 'recorder', 'Failed to switch cleanup preset: preset not found', { presetId })
         return
       }
       // 立即生效：更新录音器缓存 + 通知 UI + 悬浮窗提示（均无需等待 IPC）
-      this.cachedActivePresetId = presetId
+      this.settings.activePresetId = presetId
       setActivePresetKnown(presetId, target.name)
       if (this.state === 'idle') {
         this.overlayService.showPresetSwitched(target.name)
@@ -640,7 +617,7 @@ export class RecorderOrchestrator {
   /** 仅更新 AI 整理开关的缓存值，无 IPC/热词/语言等全量刷新。
    *  供标题栏/设置页的开关按钮使用，避免快速切换时卡顿。 */
   setAiEnabledCache(next: boolean) {
-    this.cachedAiEnabled = next
+    this.settings.aiEnabled = next
   }
 
   showAiEnabledToast(enabled: boolean) {
@@ -650,22 +627,22 @@ export class RecorderOrchestrator {
   /** 仅更新当前润色模式（preset）的缓存值，无 IPC/热词/语言等全量刷新。
    *  供设置页点击切换润色模式使用，避免快速切换时卡顿。 */
   setActivePresetCache(id: string) {
-    this.cachedActivePresetId = id
+    this.settings.activePresetId = id
   }
 
   /** 新建、编辑或删除预设后同步最新列表，避免 active id 指向尚未进入运行时缓存的新预设。 */
   setPromptPresetsCache(presets: PromptPreset[]) {
-    this.cachedPresets = presets.map((preset) => ({ ...preset }))
+    this.settings.presets = presets.map((preset) => ({ ...preset }))
   }
 
   /** 热词变更后同步下一次录音使用的快照；当前录音仍使用开始时已捕获的 StartOptions。 */
   setHotwordsCache(words: string[]) {
-    this.cachedHotwords = Array.from(new Set(words.map((word) => word.trim()).filter(Boolean)))
+    this.settings.hotwords = Array.from(new Set(words.map((word) => word.trim()).filter(Boolean)))
   }
 
   /** 仅更新「流式实时显示」开关缓存，供外观设置切换后立即生效。 */
   setStreamingDisplayCache(next: boolean) {
-    this.cachedStreamingDisplay = next
+    this.settings.streamingDisplay = next
   }
 
   /** 录音开始时实时判定是否激活流式字幕气泡（读最新的开关/供应商/WorkspaceId，避免缓存过期）。
@@ -721,20 +698,23 @@ export class RecorderOrchestrator {
       getSetting('micNoiseSuppression', true),
     ])
 
-    this.noiseSuppression = Boolean(noiseSuppression)
-    this.cachedMicId = String(micId || '')
-    this.cachedMuteSystemAudio = Boolean(muteSystemAudio)
-    this.cachedProtectClipboard = Boolean(protectClipboard)
-    this.cachedInjectHotwords = Boolean(injectHotwords)
-    this.cachedPresets = presets
-    this.cachedActivePresetId = activePresetId
-    this.cachedAiEnabled = Boolean(aiEnabled)
-    this.cachedAiMinDurationSec = Math.max(0, Math.min(MAX_RECORDING_SEC, Number(aiMinDurationSec) || 0))
-    this.cachedContextAwareWriting = Boolean(contextAwareWriting)
-    this.cachedContextSelectionEditPrompt = normalizeContextSelectionEditPrompt(contextSelectionEditPrompt)
-    this.cachedAppPromptRules = appPromptRules
-    this.cachedUserStats = userStats
-    this.cachedStreamingDisplay = Boolean(streamingDisplay)
+    this.settings = {
+      ...this.settings,
+      noiseSuppression: Boolean(noiseSuppression),
+      micId: String(micId || ''),
+      muteSystemAudio: Boolean(muteSystemAudio),
+      protectClipboard: Boolean(protectClipboard),
+      injectHotwords: Boolean(injectHotwords),
+      presets,
+      activePresetId,
+      aiEnabled: Boolean(aiEnabled),
+      aiMinDurationSec: Math.max(0, Math.min(MAX_RECORDING_SEC, Number(aiMinDurationSec) || 0)),
+      contextAwareWriting: Boolean(contextAwareWriting),
+      contextSelectionEditPrompt: normalizeContextSelectionEditPrompt(contextSelectionEditPrompt),
+      appPromptRules,
+      streamingDisplay: Boolean(streamingDisplay),
+    }
+    this.userStats = userStats
     await this.overlayService.refreshSettings()
 
     // 热词 / 服务器语言彼此独立，并行加载而非依次 await，减少本函数的总耗时
@@ -760,8 +740,11 @@ export class RecorderOrchestrator {
       }),
     ])
 
-    this.cachedHotwords = hotwordsResult.status === 'fulfilled' ? hotwordsResult.value : []
-    this.cachedLanguage = languageResult.status === 'fulfilled' ? languageResult.value : ''
+    this.settings = {
+      ...this.settings,
+      hotwords: hotwordsResult.status === 'fulfilled' ? hotwordsResult.value : [],
+      language: languageResult.status === 'fulfilled' ? languageResult.value : '',
+    }
   }
 
   /** 采集一次客户端运行时信息并缓存。静态元数据，进程内只成功采集一次；
@@ -770,10 +753,10 @@ export class RecorderOrchestrator {
   async ensureClientRuntimeInfo() {
     if (this.clientRuntimeInfoLoaded) return
     try {
-      this.cachedClientRuntimeInfo = await bridge.getClientRuntimeInfo()
+      this.clientRuntimeInfo = await bridge.getClientRuntimeInfo()
       this.clientRuntimeInfoLoaded = true
     } catch {
-      this.cachedClientRuntimeInfo = null
+      this.clientRuntimeInfo = null
     }
   }
 
@@ -1330,7 +1313,7 @@ export class RecorderOrchestrator {
       runId,
       probeResult: options.probeResult ?? null,
       finalReceivedAt: this.run.finalReceivedAt,
-      protectClipboard: this.cachedProtectClipboard,
+      protectClipboard: this.settings.protectClipboard,
       isCurrent: () => this.isRunCurrent(runId),
       waitForModifierRelease: () => this.waitForModifierPTTReleaseIfNeeded(),
       // pasteText 一旦进入 Rust SendInput 就无法撤销。先关闭本地取消屏障，再确认原生
@@ -1479,7 +1462,7 @@ export class RecorderOrchestrator {
     try {
       // AI is the only consumer of editor text. If cleanup is off, do not read the text even when
       // the preference remains enabled, so the privacy boundary matches actual behavior.
-      const includeTextContext = this.cachedContextAwareWriting && this.cachedAiEnabled
+      const includeTextContext = this.settings.contextAwareWriting && this.settings.aiEnabled
       const recordingContext = await bridge.getRecordingContext(includeTextContext)
       activeAppContext = recordingContext.appContext as unknown as ActiveAppContext
       this.run.cachedProbeResult = recordingContext.probe as unknown as ProbeResult
@@ -1504,12 +1487,12 @@ export class RecorderOrchestrator {
 
     this.run.currentPromptResolution = resolvePromptRouting({
       appContext: activeAppContext,
-      presets: this.cachedPresets,
-      activePresetId: this.cachedActivePresetId,
-      appRules: this.cachedAppPromptRules,
-      userStats: this.cachedUserStats,
-      hotwords: this.cachedHotwords,
-      injectHotwords: this.cachedInjectHotwords,
+      presets: this.settings.presets,
+      activePresetId: this.settings.activePresetId,
+      appRules: this.settings.appPromptRules,
+      userStats: this.userStats,
+      hotwords: this.settings.hotwords,
+      injectHotwords: this.settings.injectHotwords,
     })
     if (textContext) {
       this.run.currentPromptResolution = {
@@ -1517,7 +1500,7 @@ export class RecorderOrchestrator {
         systemPrompt: withContextAwareInstructions(
           this.run.currentPromptResolution.systemPrompt,
           textContext,
-          this.cachedContextSelectionEditPrompt,
+          this.settings.contextSelectionEditPrompt,
         ),
         summary: `${this.run.currentPromptResolution.summary} | Text context: ${textContext.selectedText ? 'selection' : 'caret'}`,
       }
@@ -1530,7 +1513,7 @@ export class RecorderOrchestrator {
     }
 
     addRuntimeEvent('info', 'recorder', 'Recording started', {
-      micId: this.cachedMicId || 'default',
+      micId: this.settings.micId || 'default',
       preset: this.run.currentPromptResolution.preset.id || this.run.currentPromptResolution.preset.name || 'none',
       targetCapture,
       appContext: this.summarizeAppContext(activeAppContext || null),
@@ -1588,8 +1571,8 @@ export class RecorderOrchestrator {
     // 门槛从 60 改成了 0），这一条的原因也不能跟着变。
     this.run.currentAiConfig = {
       workMode: this.provider.mode,
-      aiEnabled: this.cachedAiEnabled,
-      aiMinDurationSec: this.cachedAiMinDurationSec,
+      aiEnabled: this.settings.aiEnabled,
+      aiMinDurationSec: this.settings.aiMinDurationSec,
       serverAiSource: getRuntimeServerAiSource(),
     }
     this.run.currentOperationId = `${runId}-${Date.now().toString(36)}`
@@ -1599,28 +1582,28 @@ export class RecorderOrchestrator {
         runId,
         operationId: this.run.currentOperationId,
         aiConfig: this.run.currentAiConfig,
-        systemPrompt: this.cachedAiEnabled ? this.run.currentPromptResolution.systemPrompt : undefined,
-        disableAi: !this.cachedAiEnabled,
-        aiMinDurationSec: this.cachedAiMinDurationSec,
-        clientMeta: this.cachedClientRuntimeInfo,
+        systemPrompt: this.settings.aiEnabled ? this.run.currentPromptResolution.systemPrompt : undefined,
+        disableAi: !this.settings.aiEnabled,
+        aiMinDurationSec: this.settings.aiMinDurationSec,
+        clientMeta: this.clientRuntimeInfo,
         appContext: activeAppContext,
         textContext,
-        hotwords: this.cachedHotwords.length > 0 ? this.cachedHotwords : undefined,
-        language: this.cachedLanguage || undefined,
-        streamingDisplay: this.cachedStreamingDisplay,
+        hotwords: this.settings.hotwords.length > 0 ? this.settings.hotwords : undefined,
+        language: this.settings.language || undefined,
+        streamingDisplay: this.settings.streamingDisplay,
       }
       : {
         runId,
         operationId: this.run.currentOperationId,
         aiConfig: this.run.currentAiConfig,
-        disableAi: !this.cachedAiEnabled,
-        aiMinDurationSec: this.cachedAiMinDurationSec,
-        clientMeta: this.cachedClientRuntimeInfo,
+        disableAi: !this.settings.aiEnabled,
+        aiMinDurationSec: this.settings.aiMinDurationSec,
+        clientMeta: this.clientRuntimeInfo,
         appContext: activeAppContext,
         textContext,
-        hotwords: this.cachedHotwords.length > 0 ? this.cachedHotwords : undefined,
-        language: this.cachedLanguage || undefined,
-        streamingDisplay: this.cachedStreamingDisplay,
+        hotwords: this.settings.hotwords.length > 0 ? this.settings.hotwords : undefined,
+        language: this.settings.language || undefined,
+        streamingDisplay: this.settings.streamingDisplay,
       }
 
     // Wrap the async setup so stopRecording can wait for it
@@ -1633,7 +1616,7 @@ export class RecorderOrchestrator {
       const [, captureResult] = await Promise.all([
         this.provider.connect(this.buildProviderCallbacks()),
         startCapture(
-          this.cachedMicId || undefined,
+          this.settings.micId || undefined,
           (buffer) => {
             if (!this.isRunCurrent(runId)) return
             if (this.run.audioSentSamples === 0) {
@@ -1658,7 +1641,7 @@ export class RecorderOrchestrator {
 
             this.micLevel.onFrame(pcmFrame)
           },
-          this.noiseSuppression,
+          this.settings.noiseSuppression,
         ),
       ])
       resolveCaptureReady!()
@@ -1691,7 +1674,7 @@ export class RecorderOrchestrator {
       this.overlayService.startListeningTicker(runId)
       const micSource = describeMicSource(
         captureResult,
-        this.cachedMicId,
+        this.settings.micId,
         t('mic.title'),
         captureResult.devices,
       )
@@ -1828,8 +1811,8 @@ export class RecorderOrchestrator {
     const aiPolicy = resolveAiPolicy({
       ...(this.run.currentAiConfig ?? {
         workMode: this.provider.mode,
-        aiEnabled: this.cachedAiEnabled,
-        aiMinDurationSec: this.cachedAiMinDurationSec,
+        aiEnabled: this.settings.aiEnabled,
+        aiMinDurationSec: this.settings.aiMinDurationSec,
         serverAiSource: getRuntimeServerAiSource(),
       }),
       audioDurationSec: audioDur,
@@ -1852,7 +1835,7 @@ export class RecorderOrchestrator {
     addRuntimeEvent('info', 'recorder', 'Stop sent', {
       audioSec: audioDur,
       pttHoldMs: Math.round(pttHoldMs),
-      aiMinDurationSec: this.cachedAiMinDurationSec || undefined,
+      aiMinDurationSec: this.settings.aiMinDurationSec || undefined,
       skipAiForShortSpeech: skipAiForShortSpeech || undefined,
       stopAccepted,
     })
@@ -2333,13 +2316,13 @@ export class RecorderOrchestrator {
 
       const nextStats = await recordSessionStats(appId, wordCount)
       if (!this.isRunCurrent(runId)) return
-      this.cachedUserStats = nextStats
+      this.userStats = nextStats
       addRuntimeEvent('info', 'personalization', 'session stats recorded', {
         appId,
         appName: promptResolution?.appName,
         wordCount,
-        totalWords: this.cachedUserStats.totalWords,
-        totalSessions: this.cachedUserStats.totalSessions,
+        totalWords: this.userStats.totalWords,
+        totalSessions: this.userStats.totalSessions,
       })
     } catch (error) {
       if (!this.isRunCurrent(runId)) return

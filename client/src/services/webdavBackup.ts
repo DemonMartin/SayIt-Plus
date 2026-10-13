@@ -99,7 +99,25 @@ export function describeWebDavError(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error)
   const code = raw.trim()
   const key = ERROR_KEYS[code]
-  return key ? t(key) : raw
+  if (key) return t(key)
+  const host = unreachableHost(code)
+  return host ? t('webdav.error.unreachable', { host }) : raw
+}
+
+/**
+ * 请求根本没发出去（DNS、断网、超时、被拦）时，Rust 侧是「MKCOL failed: error sending request
+ * for url (https://…)」这种 reqwest 原文。这一类对用户只有一个意思：连不上服务器。
+ * 返回地址里的主机名；不是这一类返回 null。
+ */
+function unreachableHost(raw: string): string | null {
+  const match = /failed: error sending request for url \(https?:\/\/([^/)\s:]+)/i.exec(raw)
+  return match ? match[1] : null
+}
+
+/** 翻译过的错误，原文留给「详情」（排查时要看）；本来就按原样显示的返回 null。 */
+export function webDavErrorDetail(error: unknown): string | null {
+  const raw = (error instanceof Error ? error.message : String(error)).trim()
+  return raw && describeWebDavError(raw) !== raw ? raw : null
 }
 
 export function onWebDavBackupProgress(
