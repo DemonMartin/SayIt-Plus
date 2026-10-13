@@ -858,7 +858,7 @@
   "asr.protocol.transcriptions": "File upload (/audio/transcriptions)",
   "asr.protocol.chat": "Chat style - data URL (/chat/completions)",
   "asr.protocol.chat_standard": "Chat style - OpenAI audio object (/chat/completions)",
-  "asr.protocolHint": "OpenAI-compatible services use one of two protocols for speech. The protocol is detected automatically and remembered; select one here if the detection is incorrect.",
+  "asr.protocolHint": "OpenAI-compatible services send speech either as a file upload or in chat style, and chat style comes in two incompatible audio formats. The protocol is detected automatically and remembered; select one here if the detection is incorrect.",
   "asr.modelFreeTextHint": "Enter the model name offered by this service. If you are unsure, start with the default shown in the field.",
   "server.asrNotReady": "{prefix}. It responds, but speech recognition isn't ready on that server, so you can't dictate with it yet. Check whether the ASR model loaded on the server.",
   "server.noAi": "{prefix}. Connected. This server only does speech recognition, with AI cleanup off — you'll get the raw transcript, unpolished.",
