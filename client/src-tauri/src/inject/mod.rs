@@ -23,20 +23,61 @@ static PASTE_GENERATION: AtomicU64 = AtomicU64::new(0);
 struct ClipboardRestoreGuard {
     enabled: bool,
     previous_text: Option<String>,
+    /// 插入前剪贴板的全部格式。None = 没拍成（超预算 / 打不开），退回只还原文字。
+    previous_snapshot: Option<ClipboardSnapshot>,
     injected_text: String,
     paste_id: u64,
 }
 
 #[cfg(windows)]
 impl ClipboardRestoreGuard {
-    fn new(enabled: bool, previous_text: Option<String>, injected_text: &str, paste_id: u64) -> Self {
+    fn new(
+        enabled: bool,
+        previous_text: Option<String>,
+        previous_snapshot: Option<ClipboardSnapshot>,
+        injected_text: &str,
+        paste_id: u64,
+    ) -> Self {
         Self {
             enabled,
             previous_text,
+            previous_snapshot,
             injected_text: injected_text.to_owned(),
             paste_id,
         }
     }
+}
+
+/// 插入前剪贴板里的全部内容：每种能按字节复制的格式各一份。
+///
+/// 原来只存文字（CF_UNICODETEXT），用户刚复制的截图、文件、带格式的文本在口述一次之后
+/// 就没了，或者被降级成纯文本。
+#[cfg(windows)]
+#[derive(Default)]
+struct ClipboardSnapshot {
+    formats: Vec<(u32, Vec<u8>)>,
+}
+
+/// 拍快照的预算：超了就放弃，退回只还原文字。
+///
+/// 有些程序是延迟渲染（Excel 复制一大片区域时，读取那一刻才现场生成几十种格式），
+/// 读起来可能很慢，而这一步在插字的关键路径上，不能为了还原剪贴板把插字拖慢。
+#[cfg(windows)]
+const CLIPBOARD_SNAPSHOT_BUDGET_MS: u128 = 150;
+#[cfg(windows)]
+const CLIPBOARD_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// 这些格式的句柄不是 HGLOBAL（位图、调色板、元文件、自绘、私有/GDI 对象区间），不能按字节复制。
+/// 图片靠 CF_DIB / CF_DIBV5 保存，系统会从它们合成 CF_BITMAP。
+#[cfg(windows)]
+fn clipboard_format_is_copyable(format: u32) -> bool {
+    const CF_BITMAP: u32 = 2;
+    const CF_METAFILEPICT: u32 = 3;
+    const CF_PALETTE: u32 = 9;
+    const CF_ENHMETAFILE: u32 = 14;
+    !matches!(format, CF_BITMAP | CF_METAFILEPICT | CF_PALETTE | CF_ENHMETAFILE)
+        && !(0x0080..=0x008F).contains(&format) // CF_OWNERDISPLAY / CF_DSP*
+        && !(0x0200..=0x03FF).contains(&format) // CF_PRIVATEFIRST..CF_GDIOBJLAST
 }
 
 #[cfg(windows)]
@@ -47,6 +88,7 @@ impl Drop for ClipboardRestoreGuard {
         }
 
         let previous_text = self.previous_text.take();
+        let previous_snapshot = self.previous_snapshot.take();
         let injected_text = std::mem::take(&mut self.injected_text);
         let paste_id = self.paste_id;
         let scheduled_at = Instant::now();
@@ -77,14 +119,22 @@ impl Drop for ClipboardRestoreGuard {
                     return;
                 }
 
-                let restored = match &previous_text {
-                    Some(text) => set_clipboard_with_retry(text, 3, 20),
-                    None => native_clear_clipboard(),
+                let (restored, mode, format_count) = match &previous_snapshot {
+                    Some(snapshot) if !snapshot.formats.is_empty() => {
+                        (restore_clipboard_snapshot(snapshot, 3, 20), "all_formats", snapshot.formats.len())
+                    }
+                    Some(_) => (native_clear_clipboard(), "was_empty", 0),
+                    None => match &previous_text {
+                        Some(text) => (set_clipboard_with_retry(text, 3, 20), "text_only", 1),
+                        None => (native_clear_clipboard(), "text_only_empty", 0),
+                    },
                 };
                 crate::commands::system::write_log_line(&format!(
-                    "[RUST] [inject] clipboard restore finished pasteId={} restored={} previousUtf16Len={} elapsedMs={}",
+                    "[RUST] [inject] clipboard restore finished pasteId={} restored={} mode={} formats={} previousUtf16Len={} elapsedMs={}",
                     paste_id,
                     restored,
+                    mode,
+                    format_count,
                     previous_text.as_deref().map(|value| value.encode_utf16().count()).unwrap_or(0),
                     elapsed_ms
                 ));
@@ -425,6 +475,11 @@ unsafe fn do_inject(target: HWND, focus: HWND, text: &str, restore_clipboard: bo
     } else {
         None
     };
+    let previous_clipboard_snapshot = if restore_clipboard {
+        snapshot_clipboard(paste_id)
+    } else {
+        None
+    };
 
     // Step 1: Write text to clipboard
     let clipboard_ok = set_clipboard_with_retry(text, 5, 30);
@@ -467,6 +522,7 @@ unsafe fn do_inject(target: HWND, focus: HWND, text: &str, restore_clipboard: bo
     let _clipboard_restore_guard = ClipboardRestoreGuard::new(
         restore_clipboard,
         previous_clipboard_text,
+        previous_clipboard_snapshot,
         text,
         paste_id,
     );
@@ -1424,6 +1480,101 @@ pub unsafe fn set_clipboard_with_retry_pub(text: &str, max_retries: u32, retry_d
     set_clipboard_with_retry(text, max_retries, retry_delay_ms)
 }
 
+/// 给剪贴板拍快照。超预算、打不开时返回 None（调用方退回只还原文字）；剪贴板为空时返回空快照。
+#[cfg(windows)]
+unsafe fn snapshot_clipboard(paste_id: u64) -> Option<ClipboardSnapshot> {
+    use windows::Win32::System::DataExchange::EnumClipboardFormats;
+    use windows::Win32::System::Memory::GlobalSize;
+
+    let started = Instant::now();
+    if OpenClipboard(HWND(std::ptr::null_mut())).is_err() {
+        return None;
+    }
+    let result = (|| -> Result<ClipboardSnapshot, &'static str> {
+        let mut snapshot = ClipboardSnapshot::default();
+        let mut total = 0usize;
+        let mut format = 0u32;
+        loop {
+            format = EnumClipboardFormats(format);
+            if format == 0 {
+                break;
+            }
+            if started.elapsed().as_millis() > CLIPBOARD_SNAPSHOT_BUDGET_MS {
+                return Err("over_time_budget");
+            }
+            if !clipboard_format_is_copyable(format) {
+                continue;
+            }
+            let Ok(handle) = GetClipboardData(format) else { continue };
+            let hmem = windows::Win32::Foundation::HGLOBAL(handle.0);
+            let size = GlobalSize(hmem);
+            if size == 0 {
+                continue;
+            }
+            total += size;
+            if total > CLIPBOARD_SNAPSHOT_MAX_BYTES {
+                return Err("over_size_budget");
+            }
+            let locked = GlobalLock(hmem);
+            if locked.is_null() {
+                continue;
+            }
+            let bytes = std::slice::from_raw_parts(locked as *const u8, size).to_vec();
+            let _ = GlobalUnlock(hmem);
+            snapshot.formats.push((format, bytes));
+        }
+        Ok(snapshot)
+    })();
+    let _ = CloseClipboard();
+    match result {
+        Ok(snapshot) => Some(snapshot),
+        Err(reason) => {
+            crate::commands::system::write_log_line(&format!(
+                "[RUST] [inject] clipboard snapshot skipped pasteId={} reason={} elapsedMs={}; restoring text only",
+                paste_id,
+                reason,
+                started.elapsed().as_millis()
+            ));
+            None
+        }
+    }
+}
+
+/// 把快照整份写回剪贴板。剪贴板被别的程序占着时按 retry 重试。
+#[cfg(windows)]
+unsafe fn restore_clipboard_snapshot(snapshot: &ClipboardSnapshot, max_retries: u32, retry_delay_ms: u64) -> bool {
+    use windows::Win32::Foundation::GlobalFree;
+    for attempt in 0..=max_retries {
+        if OpenClipboard(HWND(std::ptr::null_mut())).is_ok() {
+            let _ = EmptyClipboard();
+            let mut written = 0usize;
+            for (format, bytes) in &snapshot.formats {
+                let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, bytes.len()) else { continue };
+                let locked = GlobalLock(hmem);
+                if locked.is_null() {
+                    let _ = GlobalFree(hmem);
+                    continue;
+                }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), locked as *mut u8, bytes.len());
+                let _ = GlobalUnlock(hmem);
+                if SetClipboardData(*format, HANDLE(hmem.0 as *mut _)).is_ok() {
+                    written += 1;
+                } else {
+                    let _ = GlobalFree(hmem);
+                }
+            }
+            // 还原的是用户自己复制的内容，它进剪贴板历史那一次已经记过了，别再记一条。
+            mark_clipboard_history_excluded();
+            let _ = CloseClipboard();
+            return written > 0;
+        }
+        if attempt < max_retries {
+            std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms));
+        }
+    }
+    false
+}
+
 /// 清空剪贴板（还原场景：插入前剪贴板本来就没有文本内容）。
 #[cfg(windows)]
 unsafe fn native_clear_clipboard() -> bool {
@@ -1462,6 +1613,22 @@ unsafe fn native_get_clipboard_text() -> Option<String> {
 
     let _ = CloseClipboard();
     result
+}
+
+#[cfg(all(test, windows))]
+mod clipboard_format_tests {
+    use super::clipboard_format_is_copyable;
+
+    #[test]
+    fn byte_copyable_formats_are_kept_and_gdi_handles_skipped() {
+        // 文字、DIB 图片、文件列表、注册格式（HTML / PNG 之类）都保留
+        for keep in [1u32, 7, 8, 13, 15, 16, 17, 0xC000, 0xC1A3] {
+            assert!(clipboard_format_is_copyable(keep), "{keep:#x}");
+        }
+        for skip in [2u32, 3, 9, 14, 0x80, 0x82, 0x8E, 0x200, 0x2FF, 0x300, 0x3FF] {
+            assert!(!clipboard_format_is_copyable(skip), "{skip:#x}");
+        }
+    }
 }
 
 #[cfg(test)]

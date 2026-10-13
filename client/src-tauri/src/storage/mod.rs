@@ -46,10 +46,71 @@ pub struct Storage {
     pub db: Mutex<Connection>,
 }
 
+/// 库打不开时做了什么，启动后要告诉用户（数据其实还在备份文件里）。
+#[derive(Debug, Clone)]
+pub enum StorageRecovery {
+    /// 原库打不开，已改名备份，换了一个新库启动。
+    MovedAside { backup: PathBuf, error: String },
+    /// 连新库都建不起来（磁盘满、目录没权限），本次用内存库运行，退出后什么都不留。
+    InMemory { error: String },
+}
+
 impl Storage {
+    /// 打开本地库；打不开就把它挪到一边、换新库启动，绝不让应用起不来。
+    ///
+    /// 原来是 `Storage::new(..).expect(..)`：库文件一坏（断电写到一半、杀毒软件锁住、
+    /// 磁盘坏道），每次启动都在窗口创建之前 panic —— 双击没反应、没有窗口也没有提示，
+    /// 和 0.1.4 那次运行库问题一模一样，用户只能重装，重装还不删这个库，于是永远起不来。
+    /// 现在原文件改名成 `sayit.db.corrupt-<时间>` 保留下来（连同 -wal / -shm），能救的数据还在。
+    pub fn open_or_recover(db_path: PathBuf) -> (Self, Option<StorageRecovery>) {
+        match Self::new(db_path.clone()) {
+            Ok(storage) => return (storage, None),
+            Err(first_error) => {
+                let error = first_error.to_string();
+                log::error!("[storage] failed to open {}: {}", db_path.display(), error);
+                let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                let backup = db_path.with_file_name(format!(
+                    "{}.corrupt-{}",
+                    db_path.file_name().and_then(|n| n.to_str()).unwrap_or("sayit.db"),
+                    stamp
+                ));
+                let moved = fs::rename(&db_path, &backup).is_ok() || !db_path.exists();
+                for suffix in ["-wal", "-shm"] {
+                    let side = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+                    if side.exists() {
+                        let _ = fs::rename(&side, PathBuf::from(format!("{}{}", backup.display(), suffix)));
+                    }
+                }
+                if moved {
+                    match Self::new(db_path.clone()) {
+                        Ok(storage) => {
+                            log::warn!("[storage] started with a fresh database; the old one was kept at {}", backup.display());
+                            return (storage, Some(StorageRecovery::MovedAside { backup, error }));
+                        }
+                        Err(second_error) => {
+                            log::error!("[storage] fresh database also failed: {}", second_error);
+                        }
+                    }
+                }
+                let storage = Self::new(PathBuf::from(":memory:"))
+                    .expect("an in-memory SQLite database must always open");
+                log::error!("[storage] running on an in-memory database; nothing will be saved this session");
+                (storage, Some(StorageRecovery::InMemory { error }))
+            }
+        }
+    }
+
+    /// 拿连接。锁被某次 panic「污染」时照样拿：SQLite 连接本身没坏，
+    /// 原来的 `lock().unwrap()` 会让一次意外 panic 之后的每次读写都跟着 panic。
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn new(db_path: PathBuf) -> SqlResult<Self> {
-        if let Some(parent) = db_path.parent() {
-            let _ = fs::create_dir_all(parent);
+        if db_path.as_os_str() != ":memory:" {
+            if let Some(parent) = db_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
         }
 
         let conn = Connection::open(&db_path)?;
@@ -62,7 +123,7 @@ impl Storage {
     }
 
     fn apply_migrations(&self) -> SqlResult<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.conn();
 
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -103,7 +164,7 @@ impl Storage {
     }
 
     fn seed_defaults(&self) -> SqlResult<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.conn();
         let now = chrono::Utc::now().timestamp_millis();
 
         for &(key, value_json) in DEFAULT_SETTINGS {
@@ -129,7 +190,7 @@ impl Storage {
             return self.read_collection(key).unwrap_or(Value::Array(vec![]));
         }
 
-        let db = self.db.lock().unwrap();
+        let db = self.conn();
         let result: Option<String> = db
             .query_row(
                 "SELECT value_json FROM app_settings WHERE key = ?1",
@@ -163,7 +224,7 @@ impl Storage {
             return self.replace_collection(key, &items);
         }
 
-        let db = self.db.lock().unwrap();
+        let db = self.conn();
         let json_str = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
         let now = chrono::Utc::now().timestamp_millis();
 
@@ -176,7 +237,7 @@ impl Storage {
     }
 
     pub fn delete(&self, key: &str) -> SqlResult<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.conn();
         if let Some(table) = collection_table(key) {
             db.execute(&format!("DELETE FROM {}", table), [])?;
         } else {
@@ -188,7 +249,7 @@ impl Storage {
     // ─── History ───
 
     pub fn history_list(&self, keyword: Option<&str>, favorite_only: bool, limit: Option<i64>, offset: Option<i64>) -> Vec<Value> {
-        let db = self.db.lock().unwrap();
+        let db = self.conn();
         let mut where_clauses = Vec::new();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -237,7 +298,7 @@ impl Storage {
     }
 
     pub fn history_count(&self, keyword: Option<&str>, favorite_only: bool) -> i64 {
-        let db = self.db.lock().unwrap();
+        let db = self.conn();
         let mut where_clauses = Vec::new();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -270,7 +331,7 @@ impl Storage {
     /// 取「当前最小值 - 1」即可，走索引。原来是先把全表每行 +1 再插 0，记录越多每次口述
     /// 保存越慢（几千条时每次都是几千行的写入）。插入和统计放进同一个事务，不再三次各自提交。
     pub fn history_add(&self, record: &Value) -> SqlResult<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.conn();
         let tx = db.transaction()?;
 
         let list_order: i64 = tx.query_row(
@@ -303,7 +364,7 @@ impl Storage {
     }
 
     pub fn history_update(&self, id: &str, patch: &Value) -> SqlResult<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.conn();
 
         let row: Option<(i64, String)> = db.query_row(
             "SELECT list_order, raw_json FROM history_records WHERE id = ?1",
@@ -348,7 +409,7 @@ impl Storage {
     }
 
     pub fn history_delete(&self, id: &str) -> SqlResult<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.conn();
         let db = db.transaction()?;
 
         let row: Option<(i64, String)> = db.query_row(
@@ -382,7 +443,7 @@ impl Storage {
 
     fn read_collection(&self, key: &str) -> SqlResult<Value> {
         let table = collection_table(key).ok_or(rusqlite::Error::InvalidParameterName("unknown collection".into()))?;
-        let db = self.db.lock().unwrap();
+        let db = self.conn();
         let mut stmt = db.prepare(&format!("SELECT raw_json FROM {} ORDER BY list_order ASC", table))?;
         let rows = stmt.query_map([], |row| {
             let s: String = row.get(0)?;
@@ -513,7 +574,7 @@ impl Storage {
     }
 
     fn replace_collection(&self, key: &str, items: &[Value]) -> SqlResult<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.conn();
         Self::replace_collection_on(&db, key, items)
     }
 
@@ -562,7 +623,7 @@ impl Storage {
     /// Migrate data from the Electron app's SQLite database (one-time).
     /// Looks for sayit.db in common Electron userData paths.
     pub fn migrate_from_electron(&self) -> Result<(), String> {
-        let db = self.db.lock().unwrap();
+        let db = self.conn();
 
         // Check if already migrated
         let already: bool = db.query_row(
@@ -779,7 +840,7 @@ fn parse_stats(json: &Option<String>) -> (f64, i64) {
 impl Storage {
     /// 导出 app_settings 为 { key: value } 对象；exclude 中的 key 会被跳过。
     pub fn export_app_settings(&self, exclude: &[&str]) -> Value {
-        let db = self.db.lock().unwrap();
+        let db = self.conn();
         let mut map = serde_json::Map::new();
         if let Ok(mut stmt) = db.prepare("SELECT key, value_json FROM app_settings") {
             let rows = stmt.query_map([], |row| {
@@ -807,7 +868,7 @@ impl Storage {
         prompt_presets: Option<&[Value]>,
         app_prompt_rules: Option<&[Value]>,
     ) -> SqlResult<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.conn();
         let tx = db.transaction()?;
         let now = chrono::Utc::now().timestamp_millis();
 
@@ -873,5 +934,57 @@ mod history_order_tests {
 
         drop(storage);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_database_is_moved_aside_and_a_fresh_one_opens() {
+        let dir = std::env::temp_dir().join(format!("sayit-recovery-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("sayit.db");
+        fs::write(&db, b"this is not a sqlite database at all, just garbage bytes").unwrap();
+
+        let (storage, recovery) = Storage::open_or_recover(db.clone());
+        match recovery {
+            Some(StorageRecovery::MovedAside { backup, .. }) => {
+                assert!(backup.exists());
+                assert_eq!(fs::read(&backup).unwrap(), b"this is not a sqlite database at all, just garbage bytes");
+            }
+            other => panic!("expected MovedAside, got {other:?}"),
+        }
+        storage.set("overlayWidth", &serde_json::json!("long")).unwrap();
+        assert_eq!(storage.get("overlayWidth", None), serde_json::json!("long"));
+
+        drop(storage);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn healthy_database_needs_no_recovery() {
+        let dir = std::env::temp_dir().join(format!("sayit-recovery-{}", uuid::Uuid::new_v4()));
+        let (storage, recovery) = Storage::open_or_recover(dir.join("sayit.db"));
+        assert!(recovery.is_none());
+        drop(storage);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poisoned_lock_does_not_break_later_reads() {
+        let dir = std::env::temp_dir().join(format!("sayit-recovery-{}", uuid::Uuid::new_v4()));
+        let storage = std::sync::Arc::new(Storage::new(dir.join("sayit.db")).unwrap());
+        let s2 = storage.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = s2.db.lock().unwrap();
+            panic!("simulated panic while holding the database lock");
+        })
+        .join();
+        assert!(storage.db.is_poisoned());
+        storage.set("k", &serde_json::json!(1)).unwrap();
+        assert_eq!(storage.get("k", None), serde_json::json!(1));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

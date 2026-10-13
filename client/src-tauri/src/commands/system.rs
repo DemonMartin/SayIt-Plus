@@ -406,8 +406,6 @@ pub async fn download_update(
     url: String,
     sha512: Option<String>,
 ) -> Result<String, String> {
-    use futures_util::StreamExt;
-    use std::io::Write;
 
     let fail = |msg: String| {
         write_log_line(&format!("[update] download refused: {}", msg));
@@ -436,68 +434,26 @@ pub async fn download_update(
         .build()
         .map_err(|e| format!("Failed to initialize download client: {}", e))?;
 
-    emit_update_progress(&app, 0, 0, "downloading", None);
-
-    let resp = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(300))
-        .send()
-        .await
-        .map_err(|e| {
-            let msg = format!("Download failed: {}", e);
-            emit_update_progress(&app, 0, 0, "failed", Some(&msg));
-            msg
-        })?;
-
-    if !resp.status().is_success() {
-        let msg = format!("Download failed: HTTP {}", resp.status());
-        emit_update_progress(&app, 0, 0, "failed", Some(&msg));
-        return Err(msg);
-    }
-
-    let total = resp.content_length().unwrap_or(0);
-
     let temp_dir = update_dir();
     std::fs::create_dir_all(&temp_dir).map_err(|e| format!("Failed to create temporary directory: {}", e))?;
     let file_path = temp_dir.join(&filename);
-
-    let mut file = std::fs::File::create(&file_path)
-        .map_err(|e| format!("Failed to create file: {}", e))?;
-
-    let mut downloaded: u64 = 0;
-    let mut stream = resp.bytes_stream();
-    let mut last_emit = std::time::Instant::now();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            let msg = format!("Download interrupted: {}", e);
-            emit_update_progress(&app, downloaded, total, "failed", Some(&msg));
-            msg
-        })?;
-        file.write_all(&chunk).map_err(|e| format!("Failed to write file: {}", e))?;
-        downloaded += chunk.len() as u64;
-
-        // 每 200ms 发送一次进度，避免刷屏
-        if last_emit.elapsed().as_millis() >= 200 {
-            emit_update_progress(&app, downloaded, total, "downloading", None);
-            last_emit = std::time::Instant::now();
-        }
-    }
-
-    file.flush().map_err(|e| format!("Failed to flush file: {}", e))?;
-    drop(file);
+    // 先写到 .part，校验通过才改名：半截文件永远不会被当成可安装的包。
+    let part_path = temp_dir.join(format!("{}.part", filename));
+    let (downloaded, total) = fetch_installer_part(&client, &url, &part_path, &mut |done, total, status, error| {
+        emit_update_progress(&app, done, total, status, error)
+    })
+    .await?;
 
     // 校验放在"completed"之前：前端收到 completed 就会把这个包记成待安装，
     // 先报完成再发现哈希不对，等于让一个坏包进入待安装状态。
     {
-        let actual = file_sha512_base64(&file_path).map_err(|e| {
+        let actual = file_sha512_base64(&part_path).map_err(|e| {
             emit_update_progress(&app, downloaded, total, "failed", Some(&e));
             e
         })?;
         if actual != expected_sha512 {
-            // 坏包必须删掉：它会在临时目录里等到用户点更新，留着的话
-            // 只要哪条路径漏了哈希核对，就会把它当成"已下载"拿去装。
-            let _ = std::fs::remove_file(&file_path);
+            // 坏包必须删掉（续传接错了版本也会走到这里）：下次从头下。
+            let _ = std::fs::remove_file(&part_path);
             let msg = "Update package integrity check failed (SHA-512 mismatch)".to_string();
             write_log_line("[update] downloaded package failed SHA-512 verification, discarded");
             emit_update_progress(&app, downloaded, total, "failed", Some(&msg));
@@ -508,11 +464,112 @@ pub async fn download_update(
     // 新包已经校验通过，把同目录里其它版本的安装包删掉。
     // 旧流程下载完立刻安装，包只存在几秒；现在它按设计等到用户点更新或退出时才用，
     // 于是每升一次版就在 %TEMP% 里多躺一个十几 MB 的安装包，没人清。
+    std::fs::rename(&part_path, &file_path)
+        .map_err(|e| format!("Failed to finalize the downloaded installer: {}", e))?;
     prune_stale_packages(&temp_dir, &filename);
 
     emit_update_progress(&app, downloaded, total.max(downloaded), "completed", None);
 
     Ok(file_path.to_string_lossy().to_string())
+}
+
+/// 把安装包下载（或接着下载）到 `part_path`。返回 (已下载字节, 总字节)。
+///
+/// 已有 .part 就用 Range 续传；服务器回 200 就整包重下。没有总超时，只在 60 秒收不到
+/// 任何数据时判定中断，.part 留着下次接着下。拆成独立函数是为了能用本地 HTTP 服务器测。
+async fn fetch_installer_part(
+    client: &reqwest::Client,
+    url: &str,
+    part_path: &std::path::Path,
+    progress: &mut (dyn FnMut(u64, u64, &str, Option<&str>) + Send),
+) -> Result<(u64, u64), String> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+
+    let resume_from = std::fs::metadata(part_path).map(|m| m.len()).unwrap_or(0);
+
+    progress(resume_from, 0, "downloading", None);
+
+    // 不设整次请求的总超时：原来是 300 秒，网慢的用户（14.8 MB 在 50 KB/s 下要 5 分钟）
+    // 永远下不完、每次都从头来。现在只限制连接和「多久一个字节都没收到」（见下面的 STALL）。
+    let mut request = client.get(url);
+    if resume_from > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={}-", resume_from));
+    }
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| {
+            let msg = format!("Download failed: {}", e);
+            progress(resume_from, 0, "failed", Some(&msg));
+            msg
+        })?;
+
+    if !resp.status().is_success() {
+        let msg = format!("Download failed: HTTP {}", resp.status());
+        progress(resume_from, 0, "failed", Some(&msg));
+        // 416：.part 已经比服务器上的文件还长（多半是换了版本、同名），扔掉重来。
+        if resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            let _ = std::fs::remove_file(part_path);
+        }
+        return Err(msg);
+    }
+
+    // 206 = 服务器接着给；200 = 不支持续传，整包重下。
+    let resumed = resume_from > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let mut downloaded: u64 = if resumed { resume_from } else { 0 };
+    let total = resp.content_length().map(|len| len + downloaded).unwrap_or(0);
+    if resume_from > 0 {
+        write_log_line(&format!(
+            "[update] resuming download from {} bytes: server {}",
+            resume_from,
+            if resumed { "accepted the range" } else { "ignored the range, starting over" }
+        ));
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resumed)
+        .truncate(!resumed)
+        .open(part_path)
+        .map_err(|e| format!("Failed to create file: {}", e))?;
+
+    let mut stream = resp.bytes_stream();
+    let mut last_emit = std::time::Instant::now();
+    // 60 秒一个字节都没收到才算断：慢网照样能下完，真断线也不会一直挂着。
+    const STALL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    loop {
+        let next = match tokio::time::timeout(STALL, stream.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                let msg = "Download stalled: no data for 60 seconds".to_string();
+                progress(downloaded, total, "failed", Some(&msg));
+                // .part 留着，下次接着下
+                return Err(msg);
+            }
+        };
+        let Some(chunk) = next else { break };
+        let chunk = chunk.map_err(|e| {
+            let msg = format!("Download interrupted: {}", e);
+            progress(downloaded, total, "failed", Some(&msg));
+            msg
+        })?;
+        file.write_all(&chunk).map_err(|e| format!("Failed to write file: {}", e))?;
+        downloaded += chunk.len() as u64;
+
+        // 每 200ms 发送一次进度，避免刷屏
+        if last_emit.elapsed().as_millis() >= 200 {
+            progress(downloaded, total, "downloading", None);
+            last_emit = std::time::Instant::now();
+        }
+    }
+
+    file.flush().map_err(|e| format!("Failed to flush file: {}", e))?;
+    drop(file);
+
+    Ok((downloaded, total))
 }
 
 /// 删掉更新目录里除 keep 之外的所有文件。
@@ -603,6 +660,13 @@ fn spawn_installer(installer_path: &str, relaunch: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// 系统是否正在关机或注销（GetSystemMetrics(SM_SHUTTINGDOWN)）。
+#[cfg(target_os = "windows")]
+fn system_is_shutting_down() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
+    unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+}
+
 /// 用户主动点「立即更新」：装完重新拉起应用。
 #[tauri::command]
 pub fn install_downloaded_update(
@@ -661,6 +725,14 @@ pub fn install_pending_update_on_exit(app: &AppHandle) {
     // swap 而不是 load + store：退出事件理论上只来一次，但这里是唯一没有其它
     // 互斥保护的路径，用原子交换把"检查过了"和"占位"合成一步。
     if INSTALLER_SPAWNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    // 关机 / 注销时不装：系统几秒内就会结束所有进程，安装程序可能被杀在一半，
+    // 下次开机就是一个装了一半的 SayIt。待安装包留着，下次正常退出时再装。
+    #[cfg(target_os = "windows")]
+    if system_is_shutting_down() {
+        write_log_line("[update] system is shutting down; leaving the pending update for the next exit");
         return;
     }
 
@@ -876,5 +948,95 @@ mod update_path_tests {
         assert_eq!(verify_update_package(path.clone(), Some(good)).unwrap(), true);
         assert_eq!(verify_update_package(path, Some("AAAA".into())).unwrap(), false);
         let _ = std::fs::remove_file(&pkg);
+    }
+}
+
+#[cfg(test)]
+mod resume_download_tests {
+    use super::fetch_installer_part;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// 每个连接回一个预先写好的响应，并把收到的请求头记下来。
+    fn serve(responses: Vec<Vec<u8>>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 { break; }
+                    req.extend_from_slice(&buf[..n]);
+                }
+                requests.push(String::from_utf8_lossy(&req).to_lowercase());
+                stream.write_all(&response).unwrap();
+            }
+            requests
+        });
+        (format!("http://{}/SayIt.exe", addr), handle)
+    }
+
+    fn part_file(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sayit-resume-{}-{}", tag, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("SayIt.exe.part")
+    }
+
+    #[tokio::test]
+    async fn resumes_from_an_existing_part_file() {
+        let part = part_file("resume");
+        std::fs::write(&part, b"HELLO ").unwrap();
+        let (url, server) = serve(vec![
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 6-10/11\r\nConnection: close\r\n\r\nWORLD".to_vec(),
+        ]);
+        let client = reqwest::Client::new();
+        let (done, total) = fetch_installer_part(&client, &url, &part, &mut |_, _, _, _| {}).await.unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), b"HELLO WORLD");
+        assert_eq!((done, total), (11, 11));
+        let requests = server.join().unwrap();
+        assert!(requests[0].contains("range: bytes=6-"), "{}", requests[0]);
+    }
+
+    #[tokio::test]
+    async fn starts_over_when_the_server_ignores_the_range() {
+        let part = part_file("restart");
+        std::fs::write(&part, b"STALE BYTES").unwrap();
+        let (url, server) = serve(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nNEW!".to_vec(),
+        ]);
+        let client = reqwest::Client::new();
+        fetch_installer_part(&client, &url, &part, &mut |_, _, _, _| {}).await.unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), b"NEW!");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_download_sends_no_range() {
+        let part = part_file("fresh");
+        let (url, server) = serve(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc".to_vec(),
+        ]);
+        let client = reqwest::Client::new();
+        fetch_installer_part(&client, &url, &part, &mut |_, _, _, _| {}).await.unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), b"abc");
+        let requests = server.join().unwrap();
+        assert!(!requests[0].contains("range:"));
+    }
+
+    #[tokio::test]
+    async fn range_not_satisfiable_discards_the_part_file() {
+        let part = part_file("416");
+        std::fs::write(&part, b"TOO LONG ALREADY").unwrap();
+        let (url, server) = serve(vec![
+            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ]);
+        let client = reqwest::Client::new();
+        assert!(fetch_installer_part(&client, &url, &part, &mut |_, _, _, _| {}).await.is_err());
+        assert!(!part.exists());
+        server.join().unwrap();
     }
 }

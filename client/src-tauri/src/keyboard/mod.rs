@@ -69,6 +69,36 @@ static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 /// 发给钩子线程的私有消息（WM_APP + 0x51）：「现在需要鼠标钩子」。
 #[cfg(windows)]
 const WM_SAYIT_NEED_MOUSE_HOOK: u32 = 0x8000 + 0x51;
+/// 发给钩子线程的私有消息（WM_APP + 0x52）：「钩子可能被系统摘了，重装一遍」。
+#[cfg(windows)]
+const WM_SAYIT_REFRESH_HOOKS: u32 = 0x8000 + 0x52;
+/// 已经因为怀疑被摘而重装过几次（写进 [ptt-watchdog] 日志）。
+static HOOK_REFRESH_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// 低级钩子回调超过 LowLevelHooksTimeout（系统卡顿、休眠唤醒时常见）会被 Windows **静默摘除**，
+/// 不发任何通知；之后热键全部失灵，直到重启 SayIt。
+///
+/// 判据：系统记录的「最后一次输入」比钩子最后一次被调用晚了 5 秒以上，说明有输入没经过我们。
+/// 会误报：没绑鼠标键时不装鼠标钩子，只动鼠标也算输入。误报的代价只是重装一次钩子
+/// （几微秒，在钩子线程里先装新的再卸旧的，中间不会处理任何按键，所以不会漏也不会重复），
+/// 所以宁可多装，每分钟最多一次。
+fn hook_looks_removed(callback_age_ms: i64, input_age_ms: i64) -> bool {
+    callback_age_ms >= 0 && input_age_ms >= 0 && callback_age_ms - input_age_ms > 5_000
+}
+
+/// 系统最后一次输入（键盘或鼠标）距今多少毫秒。
+#[cfg(windows)]
+fn last_input_age_ms() -> Option<i64> {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    unsafe {
+        if !GetLastInputInfo(&mut info).as_bool() {
+            return None;
+        }
+        Some(GetTickCount().wrapping_sub(info.dwTime) as i64)
+    }
+}
 
 /// 鼠标钩子只在用得上时才装：某个热键绑在鼠标键上（侧键 / 中键），或者正在录制快捷键。
 ///
@@ -1209,8 +1239,9 @@ pub fn write_health_snapshot(reason: &str) {
     let max_dur_us = MAX_CALLBACK_DURATION_US.load(Ordering::SeqCst);
     crate::commands::system::write_log_line(&format!(
         "[ptt-watchdog] reason={} hook_running={} dispatcher_alive={} last_callback_age_ms={} \
-         try_send_fail_count={} max_callback_duration_us={}",
+         try_send_fail_count={} max_callback_duration_us={} hook_refreshes={}",
         reason, hook_running, dispatcher_alive, last_cb_age_ms, fail_count, max_dur_us,
+        HOOK_REFRESH_COUNT.load(Ordering::SeqCst),
     ));
 }
 
@@ -1223,8 +1254,35 @@ pub fn spawn_health_watchdog() {
     let _ = thread::Builder::new()
         .name("ptt-watchdog".to_string())
         .spawn(|| {
+            let mut last_refresh_ms: i64 = 0;
+            let mut refresh_logged_at_ms: i64 = 0;
             loop {
-                thread::sleep(std::time::Duration::from_secs(60));
+                // 15 秒查一次：钩子被摘后最多一刻钟内（有输入的前提下）就能装回来。
+                // 采样本身只是几次原子读和一次 GetLastInputInfo。
+                thread::sleep(std::time::Duration::from_secs(15));
+
+                #[cfg(windows)]
+                if HOOK_RUNNING.load(Ordering::SeqCst) && now_ms() - last_refresh_ms >= 60_000 {
+                    let last_cb = LAST_CALLBACK_MS.load(Ordering::SeqCst);
+                    let callback_age = if last_cb == 0 { -1 } else { now_ms() - last_cb };
+                    let tid = HOOK_THREAD_ID.load(Ordering::SeqCst);
+                    if let Some(input_age) = last_input_age_ms() {
+                        if tid != 0 && hook_looks_removed(callback_age, input_age) {
+                            last_refresh_ms = now_ms();
+                            unsafe {
+                                let _ = PostThreadMessageW(tid, WM_SAYIT_REFRESH_HOOKS, WPARAM(0), LPARAM(0));
+                            }
+                            // 只动鼠标时每分钟都会走到这里，日志半小时最多一行。
+                            if now_ms() - refresh_logged_at_ms >= 30 * 60_000 {
+                                refresh_logged_at_ms = now_ms();
+                                crate::commands::system::write_log_line(&format!(
+                                    "[ptt-watchdog] input without hook callback (callback_age_ms={} input_age_ms={}); reinstalling hooks, total refreshes={}",
+                                    callback_age, input_age, HOOK_REFRESH_COUNT.load(Ordering::SeqCst),
+                                ));
+                            }
+                        }
+                    }
+                }
 
                 let hook_running = HOOK_RUNNING.load(Ordering::SeqCst);
                 let dispatcher_alive = DISPATCHER_ALIVE.load(Ordering::SeqCst);
@@ -1592,7 +1650,7 @@ impl KeyboardHookManager {
                 }
             };
 
-            let hook = match install_hook() {
+            let mut hook = match install_hook() {
                 Some(h) => h,
                 None => {
                     state.ptt_hook_alive.store(false, Ordering::SeqCst);
@@ -1659,6 +1717,21 @@ impl KeyboardHookManager {
                     if mouse_hook.is_none() {
                         mouse_hook = install_mouse_hook();
                     }
+                    continue;
+                }
+                if msg.hwnd.0.is_null() && msg.message == WM_SAYIT_REFRESH_HOOKS {
+                    // 先装新的再卸旧的：这段代码跑在消息循环线程上，期间不会处理任何钩子回调。
+                    if let Some(new_hook) = install_hook() {
+                        let _ = UnhookWindowsHookEx(hook);
+                        hook = new_hook;
+                    }
+                    if let Some(old_mouse) = mouse_hook {
+                        if let Some(new_mouse) = install_mouse_hook() {
+                            let _ = UnhookWindowsHookEx(old_mouse);
+                            mouse_hook = Some(new_mouse);
+                        }
+                    }
+                    HOOK_REFRESH_COUNT.fetch_add(1, Ordering::SeqCst);
                     continue;
                 }
                 let _ = TranslateMessage(&msg);
@@ -2317,7 +2390,7 @@ mod tests {
         press_ptt_member, ptt_key_config, release_ptt_member, set_card_hotkeys,
         set_escape_action_mode, should_consume_combo_main_down, single_key_requires_bare_press,
         CARD_HOTKEY_COPY, CARD_HOTKEY_DEADLINE_MS, CARD_HOTKEY_FOREGROUND, DEFAULT_PTT_SETTING,
-        DEFAULT_PTT_VK, SINGLE_KEY_TABLE, needs_mouse_hook,
+        DEFAULT_PTT_VK, SINGLE_KEY_TABLE, needs_mouse_hook, hook_looks_removed,
     };
     #[cfg(windows)]
     use super::queue_ptt_release;
@@ -2561,6 +2634,22 @@ mod tests {
         assert_eq!(active_generation.load(Ordering::SeqCst), active_gen);
         assert_eq!(claim_ptt_release(&active_generation, Some(active_gen)), Some(active_gen));
         assert!(complete_ptt_release(&active_generation, active_gen));
+    }
+
+    #[test]
+    fn hook_removal_is_suspected_only_when_input_outran_the_callback() {
+        // 按键刚经过钩子：回调和输入一样新
+        assert!(!hook_looks_removed(1_000, 1_000));
+        // 用户已经很久没动：两边差不多一样旧
+        assert!(!hook_looks_removed(600_000, 598_000));
+        // 很久没按键、10 秒前动了下鼠标：也会判成可疑（没装鼠标钩子时的已知误报，代价只是重装一次）
+        assert!(hook_looks_removed(600_000, 590_000));
+        // 2 分钟没回调，但 3 秒前有输入：可能被摘了
+        assert!(hook_looks_removed(120_000, 3_000));
+        // 差距在 5 秒以内不算
+        assert!(!hook_looks_removed(8_000, 4_000));
+        // 还没收到过任何回调（-1）时不判
+        assert!(!hook_looks_removed(-1, 0));
     }
 
     #[test]

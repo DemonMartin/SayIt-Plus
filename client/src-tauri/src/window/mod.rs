@@ -921,6 +921,26 @@ fn reassert_overlay_topmost(app: &AppHandle) {
 #[cfg(not(windows))]
 fn reassert_overlay_topmost(_app: &AppHandle) {}
 
+/// 主窗网页进程崩溃后的自动重载次数记录（时间戳，毫秒）。
+static MAIN_RENDERER_RELOADS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+const MAIN_RENDERER_RELOAD_WINDOW_MS: i64 = 5 * 60 * 1000;
+const MAIN_RENDERER_RELOAD_MAX: usize = 3;
+
+/// 这次崩溃还能不能自动重载：5 分钟内最多 3 次，超过就停手，避免反复崩溃时无限重载。
+pub fn main_renderer_reload_allowed(now_ms: i64) -> bool {
+    let mut history = MAIN_RENDERER_RELOADS.lock().unwrap_or_else(|p| p.into_inner());
+    reload_allowed_in_window(&mut history, now_ms, MAIN_RENDERER_RELOAD_WINDOW_MS, MAIN_RENDERER_RELOAD_MAX)
+}
+
+fn reload_allowed_in_window(history: &mut Vec<i64>, now_ms: i64, window_ms: i64, max: usize) -> bool {
+    history.retain(|t| now_ms - *t < window_ms);
+    if history.len() >= max {
+        return false;
+    }
+    history.push(now_ms);
+    true
+}
+
 /// 主窗藏到托盘时告诉 WebView2「内存可以少用」，再显示时恢复。
 ///
 /// 主窗藏着的时间远多于开着的时间（常驻托盘 + 开机自启），而它的渲染进程是 SayIt 内存的大头。
@@ -1200,6 +1220,23 @@ fn overlay_window_snapshot(app: &AppHandle) -> Value {
 
 fn set_overlay_interactivity(overlay: &tauri::WebviewWindow, interactive: bool) {
     let _ = overlay.set_ignore_cursor_events(!interactive);
+}
+
+#[cfg(test)]
+mod reload_limit_tests {
+    use super::reload_allowed_in_window;
+
+    #[test]
+    fn at_most_three_reloads_in_five_minutes() {
+        let mut h = Vec::new();
+        let w = 5 * 60 * 1000;
+        assert!(reload_allowed_in_window(&mut h, 0, w, 3));
+        assert!(reload_allowed_in_window(&mut h, 1_000, w, 3));
+        assert!(reload_allowed_in_window(&mut h, 2_000, w, 3));
+        assert!(!reload_allowed_in_window(&mut h, 3_000, w, 3));
+        // 最早那次滑出窗口之后又能重载
+        assert!(reload_allowed_in_window(&mut h, w + 1, w, 3));
+    }
 }
 
 #[cfg(test)]

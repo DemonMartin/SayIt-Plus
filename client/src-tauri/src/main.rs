@@ -150,6 +150,42 @@ fn cleanup_expired_logs(storage: &Storage) {
     }
 }
 
+/// 本地库坏了、已换新库启动时告诉用户：设置和历史看起来全没了，但旧数据在备份文件里。
+/// 用独立线程弹系统对话框，不挡启动（开机自启时也不会卡在这里）。
+fn notify_storage_recovery(recovery: storage::StorageRecovery) {
+    match &recovery {
+        storage::StorageRecovery::MovedAside { backup, error } => {
+            commands::system::write_log_line(&format!("[storage] recovered: moved the unreadable database to {} error={}", backup.display(), error));
+        }
+        storage::StorageRecovery::InMemory { error } => {
+            commands::system::write_log_line(&format!("[storage] recovered: running on an in-memory database error={}", error));
+        }
+    }
+    let zh = matches!(locale::system_ui_lang(), locale::Lang::ZhCn);
+    let text = match &recovery {
+        storage::StorageRecovery::MovedAside { backup, .. } => if zh {
+            format!("SayIt 的本地数据文件损坏，无法读取。\n\n已用全新的数据启动，设置和历史记录暂时为空。\n原文件已保留在：\n{}\n\n如需找回，请把这个文件发给开发者。", backup.display())
+        } else {
+            format!("SayIt could not read its local data file because it is damaged.\n\nIt has started with fresh data, so settings and history are empty for now.\nThe original file was kept at:\n{}\n\nSend this file to the developer if you need it recovered.", backup.display())
+        },
+        storage::StorageRecovery::InMemory { .. } => if zh {
+            "SayIt 无法创建本地数据文件（磁盘已满或没有写入权限）。\n\n本次可以正常使用，但设置和历史记录在退出后不会保存。".to_string()
+        } else {
+            "SayIt could not create its local data file (the disk may be full or not writable).\n\nYou can use it now, but settings and history will not be saved after you quit.".to_string()
+        },
+    };
+    #[cfg(target_os = "windows")]
+    thread::spawn(move || {
+        use windows::core::HSTRING;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND};
+        unsafe {
+            MessageBoxW(None, &HSTRING::from(text), &HSTRING::from("SayIt"), MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+        }
+    });
+    #[cfg(not(target_os = "windows"))]
+    let _ = text;
+}
+
 fn main() {
     // Mirror the Rust log facade to sayit.log as well as stderr. This is essential on
     // Windows release builds (`windows_subsystem = "windows"`), where stderr is invisible.
@@ -240,7 +276,10 @@ fn main() {
         .join("com.sayit.app")
         .join("sayit.db");
 
-    let storage = Storage::new(db_path).expect("failed to initialize SQLite storage");
+    let (storage, storage_recovery) = Storage::open_or_recover(db_path);
+    if let Some(recovery) = storage_recovery {
+        notify_storage_recovery(recovery);
+    }
 
     // One-time migration from Electron app's SQLite database
     if let Err(e) = storage.migrate_from_electron() {
@@ -458,6 +497,47 @@ fn main() {
                         unsafe {
                             let controller = webview.controller();
                             let Ok(core) = controller.CoreWebView2() else { return };
+                            // 主窗网页进程崩溃后自动重载。录音、连接、插字调度都跑在这个进程里，
+                            // 它一退出就是「托盘还在、热键全没反应、没有任何提示」，以前只能重启 SayIt。
+                            // 只处理「已退出」：「无响应」只记日志，导出大量历史这类长任务也会短暂无响应，
+                            // 那时重载会把用户正在做的事打断。5 分钟内超过 3 次就不再重载，免得反复崩溃时死循环。
+                            // 和证书处理器挂在同一次 with_webview 里：单独再调一次 with_webview 时
+                            // 主窗 webview 稳定建不起来（0x80070057，2026-10-12 复现 5 次），原因未查明。
+                            {
+                                use webview2_com::Microsoft::Web::WebView2::Win32::{
+                                    COREWEBVIEW2_PROCESS_FAILED_KIND, COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
+                                    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE,
+                                };
+                                use webview2_com::ProcessFailedEventHandler;
+                                let handler = ProcessFailedEventHandler::create(Box::new(move |sender, args| {
+                                    let Some(args) = args else { return Ok(()) };
+                                    let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                                    args.ProcessFailedKind(&mut kind)?;
+                                    if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED {
+                                        let now = chrono::Utc::now().timestamp_millis();
+                                        let allowed = window::main_renderer_reload_allowed(now);
+                                        commands::system::write_log_line(&format!(
+                                            "[main-webview] renderer process exited; reload={}",
+                                            allowed
+                                        ));
+                                        if allowed {
+                                            if let Some(sender) = sender {
+                                                sender.Reload()?;
+                                            }
+                                        }
+                                    } else if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE {
+                                        commands::system::write_log_line("[main-webview] renderer process is unresponsive");
+                                    } else {
+                                        commands::system::write_log_line(&format!("[main-webview] process failed kind={:?}", kind));
+                                    }
+                                    Ok(())
+                                }));
+                                let mut token = Default::default();
+                                match core.add_ProcessFailed(&handler, &mut token) {
+                                    Ok(_) => log::info!("[main-webview] ProcessFailed handler attached"),
+                                    Err(e) => log::error!("[main-webview] failed to attach ProcessFailed handler: {e:?}"),
+                                }
+                            }
                             let core14: ICoreWebView2_14 = match core.cast() {
                                 Ok(value) => value,
                                 Err(e) => {
@@ -498,6 +578,7 @@ fn main() {
                         }
                     });
                 }
+
 
                 if !launched_minimized {
                     // show() 只清 SW_HIDE，不解除最小化（iconic）状态：窗口若以
