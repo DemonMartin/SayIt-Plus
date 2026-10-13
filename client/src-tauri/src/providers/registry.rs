@@ -60,6 +60,18 @@ pub async fn test_ai_connection(config: AiProviderConfig) -> Result<TestResult, 
     }
 }
 
+/// 同 cloud_transcribe，但音频以原始 PCM 字节发过来（见 ipc_body）。
+///
+/// 各家接口本身要 base64（JSON 请求体），所以在这里转：Rust 转 10 MB 是几毫秒，
+/// 网页里那个逐字节拼字符串的转码要 0.7 秒，还跑在主窗主线程上。
+#[tauri::command]
+pub async fn cloud_transcribe_raw(request: tauri::ipc::Request<'_>) -> Result<AsrResult, String> {
+    use base64::Engine;
+    let (mut meta, pcm): (CloudTranscribeRequest, Vec<u8>) = crate::ipc_body::split_framed(&request)?;
+    meta.audio_b64 = base64::engine::general_purpose::STANDARD.encode(&pcm);
+    cloud_transcribe(meta).await
+}
+
 /// 云端 ASR 转写（Tauri command）
 #[tauri::command]
 pub async fn cloud_transcribe(request: CloudTranscribeRequest) -> Result<AsrResult, String> {
@@ -233,7 +245,8 @@ pub fn dispatch_keys_for_test() -> Vec<&'static str> {
 /// 而这行常量定义本身也在同一个文件里。写全了就等于在源码里埋下第二个匹配点，
 /// 哪天这行挪到 `cloud_transcribe` 上面去，截出来的就是这行所在的位置。
 #[cfg(test)]
-const CLOUD_TRANSCRIBE_SIGNATURE: &str = concat!("pub async fn ", "cloud_transcribe");
+// 带上左括号：同文件里还有 cloud_transcribe_raw，只按前缀找会先找到它。
+const CLOUD_TRANSCRIBE_SIGNATURE: &str = concat!("pub async fn ", "cloud_transcribe", "(");
 
 /// 截出某个顶层函数的源码片段。
 ///

@@ -3,6 +3,7 @@
 // ASR 完成后可选调用云端 AI 校对
 
 import { invoke } from '@tauri-apps/api/core'
+import * as bridge from '../bridge'
 import { getSetting } from '../store'
 import { addRuntimeEvent } from '../debugLog'
 import { BufferedProvider } from './BufferedProvider'
@@ -61,7 +62,7 @@ export class LocalProvider extends BufferedProvider {
     return true
   }
 
-  protected async processAudio(audioB64: string, durationSec: number, runId: number): Promise<void> {
+  protected async processAudio(pcm: Uint8Array, durationSec: number, runId: number): Promise<void> {
     if (!this.isRunCurrent(runId)) return
     const startOpts = this.startOpts
     const startTime = performance.now()
@@ -82,8 +83,7 @@ export class LocalProvider extends BufferedProvider {
       const gpuDevice = await getSetting('localAsr.gpuDevice', '')
       if (!this.isRunCurrent(runId)) return
 
-      const result = await invoke<{ text: string; elapsed_ms: number }>('local_transcribe', {
-        audioB64,
+      const result = await bridge.localTranscribeRaw(pcm, {
         modelId,
         language,
         accelerator,

@@ -1,7 +1,6 @@
 import * as bridge from '@/services/bridge'
 import { cn } from '@/lib/utils'
 import { buildAsrExtra, resolveAsrDisplayModel, isQwenOmniProvider } from '@/lib/asrModels'
-import { uint8ArrayToBase64 } from '@/lib/encoding'
 import { getWorkMode } from '@/services/transcription'
 import { polishWithClientAi } from '@/services/transcription/clientAiPolish'
 import {
@@ -31,7 +30,6 @@ import {
   getSetting,
   type HistoryRecord,
 } from '@/services/store'
-import { loadAudioAsDataUrl } from '@/services/audioFileService'
 import { useT } from '@/i18n/useT'
 import { applyTextTransforms, restoreHotwordSpacing } from '@/services/textPostProcess'
 import { buildHotwordInjectionPart } from '@/services/personalization/promptRouter'
@@ -254,7 +252,6 @@ async function reprocessViaCloudApi(
   systemPrompt: string | undefined,
 ): Promise<ReprocessResult> {
   const durationSec = (chunk.byteLength / 2) / 16000
-  const audioB64 = uint8ArrayToBase64(new Uint8Array(chunk))
 
   const asrProvider = await getSetting('cloudAsr.provider', 'doubao') as string
   const isQwenOmni = isQwenOmniProvider(asrProvider)
@@ -284,9 +281,10 @@ async function reprocessViaCloudApi(
   }
 
   const asrStart = performance.now()
-  const asrResult = await invoke<{ text: string; elapsed_ms: number }>('cloud_transcribe', {
-    request: { audio_b64: audioB64, sample_rate: 16000, asr_config: asrConfig, hotwords },
-  })
+  const asrResult = await bridge.cloudTranscribeRaw<{ text: string; elapsed_ms: number }>(
+    new Uint8Array(chunk),
+    { sample_rate: 16000, asr_config: asrConfig, hotwords },
+  )
   // 还原被 ASR 拆开加空格的无空格热词（如豆包把 "SayIt" 识别成 "Say It"）
   const asrText = restoreHotwordSpacing(asrResult.text, hotwords)
   const asrMs = asrResult.elapsed_ms || Math.round(performance.now() - asrStart)
@@ -334,7 +332,6 @@ async function reprocessViaLocal(
   systemPrompt: string | undefined,
 ): Promise<ReprocessResult> {
   const durationSec = (chunk.byteLength / 2) / 16000
-  const audioB64 = uint8ArrayToBase64(new Uint8Array(chunk))
 
   const modelId = await getSetting('localAsr.modelId', 'sensevoice-small-gguf') as string
   const language = await getSetting('localAsr.language', 'auto') as string
@@ -344,8 +341,8 @@ async function reprocessViaLocal(
   // hotwords 在 GGUF 引擎上不支持（transcribe.cpp 只有 whisper 族接 initial prompt），
   // 参数留着是为了不改调用方签名，后端会忽略。
   void hotwords
-  const asrResult = await invoke<{ text: string; elapsed_ms: number }>('local_transcribe', {
-    audioB64, modelId, language, accelerator, gpuDevice,
+  const asrResult = await bridge.localTranscribeRaw(new Uint8Array(chunk), {
+    modelId, language, accelerator, gpuDevice,
   })
   const asrText = asrResult.text
   const asrMs = asrResult.elapsed_ms
@@ -510,15 +507,10 @@ export default function History() {
   const handleReprocess = async (record: HistoryRecord) => {
     if (!record.audioFilePath) return
 
-    const base64 = await bridge.readAudioFile(record.audioFilePath)
-    if (!base64) return
+    const bytes = await bridge.readAudioFileBytes(record.audioFilePath)
+    if (!bytes) return
 
-    // Decode base64 WAV → PCM
-    const binaryStr = atob(base64)
-    const bytes = new Uint8Array(binaryStr.length)
-    for (let i = 0; i < binaryStr.length; i++) {
-      bytes[i] = binaryStr.charCodeAt(i)
-    }
+    // WAV → PCM（去掉 44 字节文件头）
     const pcmData = bytes.slice(44)
     const chunk = pcmData.buffer.slice(pcmData.byteOffset, pcmData.byteOffset + pcmData.byteLength)
 

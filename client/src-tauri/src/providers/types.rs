@@ -60,7 +60,8 @@ pub struct AiProviderConfig {
 /// 云端转写请求（前端传入）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudTranscribeRequest {
-    /// base64 编码的 PCM Int16 音频
+    /// base64 编码的 PCM Int16 音频。cloud_transcribe_raw 的参数里没有这一项（音频走二进制），由那边填上。
+    #[serde(default)]
     pub audio_b64: String,
     pub sample_rate: u32,
     pub asr_config: AsrProviderConfig,

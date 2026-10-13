@@ -5,7 +5,6 @@ import { Card, CardContent } from '@/components/ui/card'
 import { type HistoryRecord } from '@/services/store'
 import * as bridge from '@/services/bridge'
 import { pickVoiceDurationSec } from '@/services/timeModel'
-import { loadAudioAsDataUrl } from '@/services/audioFileService'
 import { invoke } from '@tauri-apps/api/core'
 import { getLocale, t } from '@/i18n'
 import { useT } from '@/i18n/useT'
@@ -191,8 +190,7 @@ function HistoryItem({
     setDownloadStatus('idle')
     setDownloadPath('')
     try {
-      const dataUrl = await loadAudioAsDataUrl(record.audioFilePath)
-      if (!dataUrl) {
+      if (!(await bridge.audioFileExists(record.audioFilePath))) {
         setDownloadStatus('fail')
         setDownloadPath(t('record.audioMissing'))
         setTimeout(() => setDownloadStatus('idle'), 3000)
@@ -203,12 +201,8 @@ function HistoryItem({
       const dateStr = `${ts.getFullYear()}${String(ts.getMonth() + 1).padStart(2, '0')}${String(ts.getDate()).padStart(2, '0')}_${String(ts.getHours()).padStart(2, '0')}${String(ts.getMinutes()).padStart(2, '0')}${String(ts.getSeconds()).padStart(2, '0')}`
       const filename = `sayit_${dateStr}.wav`
 
-      // Extract base64 from data URL
-      const base64Data = dataUrl.split(',')[1]
-      const savedPath = await invoke<string>('save_audio_to_downloads', {
-        base64Data,
-        filename,
-      })
+      // Rust 直接复制文件，不再把整段录音读成 base64 再发回去
+      const savedPath = await bridge.saveRecordingToDownloads(record.audioFilePath, filename)
 
       setDownloadStatus('ok')
       setDownloadPath(savedPath)

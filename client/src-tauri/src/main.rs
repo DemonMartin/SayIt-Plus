@@ -14,6 +14,7 @@ mod models;
 mod defaults;
 mod net_policy;
 mod path_guard;
+mod ipc_body;
 
 use storage::Storage;
 use window::WindowState;
@@ -765,6 +766,9 @@ fn main() {
             // Audio
             commands::audio::save_audio_file,
             commands::audio::save_pcm_as_wav,
+            commands::audio::save_pcm_as_wav_raw,
+            commands::audio::read_audio_file_bytes,
+            commands::audio::save_recording_to_downloads,
             commands::audio::read_audio_file,
             commands::audio::audio_file_exists,
             commands::audio::delete_audio_file,
@@ -802,6 +806,8 @@ fn main() {
             commands::diagnostics::collect_settings,
             commands::diagnostics::get_diagnostics_preview,
             commands::diagnostics::create_diagnostics_zip,
+            commands::diagnostics::create_diagnostics_zip_raw,
+            commands::diagnostics::read_diagnostics_zip_bytes,
             commands::diagnostics::read_diagnostics_zip,
             commands::diagnostics::copy_diagnostics_zip,
             commands::diagnostics::read_log_file,
@@ -809,6 +815,7 @@ fn main() {
             // Providers (cloud ASR / AI)
             providers::registry::cloud_polish,
             providers::registry::cloud_transcribe,
+            providers::registry::cloud_transcribe_raw,
             providers::registry::test_ai_connection,
             providers::registry::test_asr_connection,
             // 「这家 ASR 拿热词做什么」的唯一权威来源。前端不再自己维护一份清单 ——
@@ -852,6 +859,7 @@ fn main() {
             models::registry::get_models_dir,
             models::registry::set_models_dir,
             models::local_asr::local_transcribe,
+            models::local_asr::local_transcribe_raw,
             models::local_asr::preload_local_model,
             models::local_asr::unload_local_model,
             models::local_asr::set_local_model_idle_unload,

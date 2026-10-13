@@ -55,6 +55,36 @@ pub async fn local_transcribe(
     let samples = decode_pcm(&audio_b64).map_err(|e| {
         crate::providers::diag::fail("local/asr", "decode_pcm", e)
     })?;
+    transcribe_samples(samples, model_id, language, accelerator, gpu_device).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalTranscribeMeta {
+    model_id: String,
+    language: Option<String>,
+    accelerator: Option<String>,
+    gpu_device: Option<String>,
+}
+
+/// 同 local_transcribe，但 PCM 以原始字节发过来（见 ipc_body），省掉网页里的 base64 转码。
+#[tauri::command]
+pub async fn local_transcribe_raw(request: tauri::ipc::Request<'_>) -> Result<LocalAsrResult, String> {
+    let (meta, pcm): (LocalTranscribeMeta, Vec<u8>) = crate::ipc_body::split_framed(&request)?;
+    let samples = pcm
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+        .collect();
+    transcribe_samples(samples, meta.model_id, meta.language, meta.accelerator, meta.gpu_device).await
+}
+
+async fn transcribe_samples(
+    samples: Vec<f32>,
+    model_id: String,
+    language: Option<String>,
+    accelerator: Option<String>,
+    gpu_device: Option<String>,
+) -> Result<LocalAsrResult, String> {
     if samples.is_empty() {
         crate::providers::diag::empty_result("local/asr", "Input audio was empty; model inference was skipped");
         return Ok(LocalAsrResult { text: String::new(), elapsed_ms: 0 });

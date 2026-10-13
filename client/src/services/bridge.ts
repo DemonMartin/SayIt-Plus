@@ -391,6 +391,51 @@ export function savePcmAsWav(id: string, pcmBase64: string, sampleRate?: number)
   return invoke<string>('save_pcm_as_wav', { id, pcmBase64, sampleRate: sampleRate ?? null })
 }
 
+/**
+ * 二进制请求体：`[4 字节小端 JSON 长度][JSON 参数][原始字节]`，与 Rust 的 ipc_body 对应。
+ *
+ * 音频原来先转 base64 再塞进 JSON。lib/encoding 那个转码是逐字节拼字符串，2 分钟录音约
+ * 0.4 秒、5 分钟约 0.7 秒，跑在主窗主线程上（悬浮窗那段时间也跟着卡），本地 / 云 API
+ * 模式录完还要转两次。直接发原始字节就没有这一段了。
+ */
+export function framedBody(meta: unknown, payload: Uint8Array): Uint8Array {
+  const json = new TextEncoder().encode(JSON.stringify(meta))
+  const out = new Uint8Array(4 + json.length + payload.length)
+  new DataView(out.buffer).setUint32(0, json.length, true)
+  out.set(json, 4)
+  out.set(payload, 4 + json.length)
+  return out
+}
+
+/** 读录音的原始字节。文件不在（保留期过了、被删了）时返回 null。 */
+export async function readAudioFileBytes(filePath: string): Promise<Uint8Array<ArrayBuffer> | null> {
+  const buffer = await invoke<ArrayBuffer>('read_audio_file_bytes', { filePath })
+  return buffer && buffer.byteLength > 0 ? new Uint8Array(buffer) : null
+}
+
+/** 把录音直接复制到「下载」文件夹（由 Rust 复制文件，不经过网页）。 */
+export function saveRecordingToDownloads(filePath: string, filename: string) {
+  return invoke<string>('save_recording_to_downloads', { filePath, filename })
+}
+
+export function savePcmAsWavRaw(id: string, pcm: Uint8Array, sampleRate?: number) {
+  return invoke<string>('save_pcm_as_wav_raw', framedBody({ id, sampleRate: sampleRate ?? null }, pcm))
+}
+
+export function localTranscribeRaw(
+  pcm: Uint8Array,
+  opts: { modelId: string; language?: string; accelerator?: string; gpuDevice?: string },
+) {
+  return invoke<{ text: string; elapsed_ms: number }>('local_transcribe_raw', framedBody(opts, pcm))
+}
+
+export function cloudTranscribeRaw<T>(
+  pcm: Uint8Array,
+  request: { sample_rate: number; asr_config: unknown; hotwords: string[] },
+) {
+  return invoke<T>('cloud_transcribe_raw', framedBody(request, pcm))
+}
+
 export function readAudioFile(filePath: string) {
   return invoke<string | null>('read_audio_file', { filePath })
 }
@@ -424,6 +469,28 @@ export function getDiagnosticsPreview(data: {
 
 export function createDiagnosticsZip(data: unknown) {
   return invoke<string>('create_diagnostics_zip', { data })
+}
+
+/** 截图走二进制：参数里每张图只带 name / type / size，字节按顺序拼在后面（见 framedBody）。 */
+export function createDiagnosticsZipRaw(
+  meta: { description: string; issueType: string; settings: unknown; issueOccurrence: string },
+  images: Array<{ name: string; type: string; bytes: Uint8Array }>,
+) {
+  const total = images.reduce((sum, image) => sum + image.bytes.length, 0)
+  const payload = new Uint8Array(total)
+  let offset = 0
+  for (const image of images) {
+    payload.set(image.bytes, offset)
+    offset += image.bytes.length
+  }
+  const imageMeta = images.map((image) => ({ name: image.name, type: image.type, size: image.bytes.length }))
+  return invoke<string>('create_diagnostics_zip_raw', framedBody({ ...meta, images: imageMeta }, payload))
+}
+
+/** 读诊断包的原始字节；文件不在时返回 null。 */
+export async function readDiagnosticsZipBytes(path: string): Promise<Uint8Array<ArrayBuffer> | null> {
+  const buffer = await invoke<ArrayBuffer>('read_diagnostics_zip_bytes', { path })
+  return buffer && buffer.byteLength > 0 ? new Uint8Array(buffer) : null
 }
 
 export function readDiagnosticsZip(path: string) {
