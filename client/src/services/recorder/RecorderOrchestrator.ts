@@ -3,22 +3,18 @@ import { startCapture, stopCapture } from '../audio'
 import { getProvider, MID_SESSION_DISCONNECT_ERROR, type TranscriptionProvider, type TranscriptionCallbacks, type FinalResult } from '../transcription'
 import { resolveAiPolicy, serverShouldPolish, type AiConfigSnapshot } from '../transcription/aiPolicy'
 import { getRuntimeServerAiSource } from '../transcription/serverAiSource'
-import { isStreamingDisplayReady, resolveAsrDisplayModel } from '@/lib/asrModels'
+import { isStreamingDisplayReady } from '@/lib/asrModels'
 import {
-  addHistory,
-  deleteHistory,
   getActivePresetId,
   getPromptPresets,
   getSetting,
   setActivePresetId,
-  updateHistoryRecord,
   type HistoryFailReasonCode,
   type HistoryRecord,
   type PromptPreset,
 } from '../store'
 import { setActivePresetKnown } from '../../stores/activePreset'
 import { addRuntimeEvent } from '../debugLog'
-import { saveRecordingAudio } from '../audioFileService'
 import {
   BUILTIN_SET_ACTIVE_KEY,
   BUILTIN_SET_WORDS_KEY,
@@ -30,7 +26,6 @@ import {
   normalizeCustomThemeActive,
   normalizeCustomThemes,
 } from '../hotwords/model'
-import { invoke } from '@tauri-apps/api/core'
 import { createWaveformBarState, computeBarsFromPCM, resetWaveformBarState } from '../waveform'
 import { elapsedSecFromPerf } from '../timeModel'
 import {
@@ -44,6 +39,9 @@ import type { ActiveAppContext } from '../../types/appContext'
 import type { ClientRuntimeInfo } from '../../types/appApi'
 import { OverlayService, type FailureRecovery } from './OverlayService'
 import { PasteService, type ProbeResult } from './PasteService'
+import { AudioArchiveService } from './AudioArchiveService'
+import { MicLevelMonitor } from './MicLevelMonitor'
+import { HistoryWriter, type HistoryMetadata } from './HistoryWriter'
 import { createDefaultUserStats } from '../personalization/defaults'
 import { resolvePromptRouting } from '../personalization/promptRouter'
 import {
@@ -59,11 +57,7 @@ import {
   buildStatsAppId as _buildStatsAppId,
   isModifierPTTSetting as _isModifierPTTSetting,
   computeProcessingTimeoutMs as _computeProcessingTimeoutMs,
-  classifyMicLevel,
-  judgeOsMicMute,
-  hasSilenceEvidence,
   isUnconfirmedPaste,
-  type MicLevel,
 } from './helpers'
 import { t } from '@/i18n'
 import { describeProviderError } from '@/lib/errorMessages'
@@ -91,14 +85,6 @@ const VALID_TRANSITIONS: StateTransition[] = [
 ]
 
 const LATE_FINAL_GRACE_MS = 15000
-/**
- * 等音频落盘的上限。
- *
- * 存档是为了兜底，不该反过来把结果处理挂死：写盘走一次大 payload IPC（长录音的 PCM 有
- * 好几 MB），一旦它不返回，等它的那条链路就永远出不来，界面停在「处理中」什么也不说。
- * 超时后先按无音频写记录，落盘真的完成时再把路径补回去。
- */
-const AUDIO_ARCHIVE_WAIT_MS = 30_000
 /** 文本插入还没收尾时，超时定时器每次顺延多久。 */
 const INSERTION_TIMEOUT_EXTENSION_MS = 5000
 /**
@@ -109,7 +95,6 @@ const INSERTION_TIMEOUT_MS = 15000
 /** 顺延次数上限；用尽就强制把界面从「处理中」放出来。 */
 const MAX_INSERTION_TIMEOUT_EXTENSIONS = 3
 const MODIFIER_PTT_RELEASE_GUARD_MS = 200
-const MIC_MUTED_AUTO_CANCEL_MS = 3000
 
 function classifyHistoryProviderFailure(message: string): HistoryFailReasonCode {
   // 录音中掉线要单列：这段语音从未送达服务端，跟「服务端处理失败」的排查方向完全不同。
@@ -153,37 +138,7 @@ interface ResetToIdleOptions {
   preserveLateFinalContext?: boolean
 }
 
-/**
- * 一次录音的音频存档。
- *
- * 关键点：写盘在**停止录音时立刻**开始，不等 ASR/AI 结果。以前音频只在某个终态分支里
- * 才落盘，于是任何一条没走到终态的路（超时后被新录音顶掉、连接断了在假等待、进程退出）
- * 都会让整段录音消失得无声无息。现在结果只决定历史记录里写什么，不再决定音频是否存在。
- */
-/** buildHistoryMetadata 的产物：录音时的应用/窗口/Prompt 上下文。 */
-type HistoryMetadata = Pick<
-  HistoryRecord,
-  | 'appId'
-  | 'appName'
-  | 'windowTitle'
-  | 'processName'
-  | 'windowClass'
-  | 'promptPresetId'
-  | 'promptPresetName'
-  | 'promptRuleId'
-  | 'promptSummary'
-  | 'workMode'
->
 
-interface AudioArchive {
-  runId: number
-  /** 本代唯一的历史记录 id。所有终态路径必须复用它，保证一次录音只有一条记录、一份文件。 */
-  recordId: string
-  /** 落盘任务；resolve 为 WAV 路径，null = 未保存（关了音频保留 / 无数据 / 写失败）。 */
-  promise: Promise<string | null>
-  /** 用户显式取消后置位；写盘可能还没结束，所以要等 promise 出来才知道删哪个文件。 */
-  discarded: boolean
-}
 
 export class RecorderOrchestrator {
   private state: RecorderState = 'idle'
@@ -238,24 +193,10 @@ export class RecorderOrchestrator {
   private insertionTimeoutId: ReturnType<typeof setTimeout> | null = null
   private finalReceivedAt = 0
   private timedOutProcessingContext: TimedOutProcessingContext | null = null
-  private pendingHistoryArtifact: { runId: number; recordId: string; audioFilePath?: string } | null = null
-  /**
-   * 各代录音的音频存档任务，按 runId 索引。停止录音后立刻开始写盘，不等识别结果。
-   *
-   * 必须按代保存、不能只留一份：超时兜底要等 15 秒宽限，这期间用户完全可能已经录完了
-   * 下一段。只留一份的话，旧代来取存档时拿到的是新代的，只能放弃 —— 音频又成了孤儿文件、
-   * 历史里依旧什么都没有。
-   */
-  private audioArchives = new Map<number, AudioArchive>()
-  /**
-   * 被用户**显式**取消的代次（Esc / 取消录音）。
-   *
-   * 与「run 失效」不是一回事：用户在超时后立刻再按热键，新 run 会让旧 runId 失效，
-   * 但上一段录音的音频和历史必须留下。以前这两种情况共用 isRunCurrent 判据，于是
-   * 2026-09-07 实测丢掉了一整段 60 秒录音（超时兜底回调在 0.75 秒后被新录音判为失效，
-   * 直接 return，音频、记录、日志三样都没有）。
-   */
-  private canceledRuns = new Set<number>()
+  /** 各代录音的音频存档（停止录音就落盘，不等识别结果）。 */
+  private audioArchive = new AudioArchiveService((runId) => this.overlayService.updateFailureRecovery('history', runId))
+  /** 历史记录的写入、取消后的清理，以及「哪些代被用户主动取消」。 */
+  private readonly history = new HistoryWriter(this.audioArchive)
 
   private handsFreeMode = false
   private pttSuppressed = false
@@ -317,52 +258,22 @@ export class RecorderOrchestrator {
 
   private readonly overlayWaveState = createWaveformBarState()
   private readonly overlayService = new OverlayService(() => this.getLiveElapsedSec())
+  /** 音量两档提醒、系统静音判定、本次录音的音频统计。 */
+  private readonly micLevel = new MicLevelMonitor({
+    overlay: this.overlayService,
+    isRunCurrent: (runId) => this.isRunCurrent(runId),
+    getState: () => this.state,
+    isStarting: () => this.startRecordingLock,
+    getActiveRunId: () => this.activeRunId,
+    getSelectedMicId: () => this.cachedMicId,
+    cancelForMutedMic: (runId) => { void this.cancelRecording(runId, { showCanceled: false, reason: 'mic_muted_timeout' }) },
+  })
   private readonly pasteService = new PasteService()
   private get provider(): TranscriptionProvider { return getProvider() }
   private recordedChunks: ArrayBuffer[] = []
   private captureReadyPromise: Promise<void> | null = null
   /** 5-minute auto-stop timer for hands-free mode */
   private handsFreeAutoStopId: ReturnType<typeof setTimeout> | null = null
-  /** 系统确认麦克风静音后的自动取消计时器，避免悬浮窗无限停留。 */
-  private micMutedAutoCancelId: ReturnType<typeof setTimeout> | null = null
-  /** 静音探测代次：实际打开设备的复核必须覆盖较早发起的预检查结果。 */
-  private micMuteProbeSequence = 0
-  /** 连续「非正常音量」（静音或偏低）的采样数 */
-  private consecutiveSilentSamples = 0
-  /** 当前连续非正常音量的采样数，仅用于判断正常说话候选之间的间隔。 */
-  private consecutiveNonVoicedSamples = 0
-  /** 当前这段安静里是否出现过任何非零采样。
-   * 只要为真，就只能提示「请靠近麦克风」，不能提示「未检测到声音」。 */
-  private quietRunSawSignal = false
-  /** 连续正常音量的采样数——用于「持续说话一段时间才清除警告」的迟滞判断，避免瞬时小声音把警告瞬间清掉造成闪烁 */
-  private consecutiveVoicedSamples = 0
-  /** 悬浮窗当前正在显示的音量类警告 */
-  private currentVolumeWarning: 'none' | 'muted' | 'low' = 'none'
-  /** 本次录音是否已经听到过一次正常音量的说话。一旦听到过，说明麦克风正常，
-   *  后续安静只是正常停顿思考——只给温和「请靠近麦克风」，绝不再报「未检测到声音」造成惊吓。 */
-  private hasDetectedVoiceThisSession = false
-  private lastLowVolumeWarnAt = 0
-  /** 麦克风被静音已被「系统标志 + 音频信号」双重证实。为真时悬浮窗显示红色高警，
-   *  并抑制基于信号的琥珀提醒，直到检测到真实说话（用户中途取消了静音）。 */
-  private osMicMuted = false
-  /** 系统报了「端点被静音」，但还没被音频信号证实。
-   *
-   *  为什么不能直接相信系统：IAudioEndpointVolume::GetMute 反映的是端点上的静音**设置**，
-   *  不等于采集流真被切断。实测 Plantronics Blackwire 5220 USB 耳麦（软/硬静音会与 Windows
-   *  端点标志同步）会停在 GetMute=true，而 getUserMedia 照常收到正常音量的音频 —— 于是每次
-   *  按热键都先弹一次红色高警「麦克风已被静音」，说话 0.5s 后又自己消失。
-   *  所以这个标志只当线索：必须等 PCM 证实真的全 0 才升级成 osMicMuted。 */
-  private pendingOsMicMuted = false
-  /** pending 期间累计的全 0 采样数，达到 OS_MIC_MUTE_CONFIRM_SAMPLES 才确认。 */
-  private pendingOsMicMutedSamples = 0
-
-  /** Audio stats tracking */
-  private audioStatsRmsSum = 0
-  private audioStatsPeakRms = 0
-  private audioStatsPeakAmplitude = 0
-  private audioStatsSilentFrames = 0
-  private audioStatsTotalFrames = 0
-  private static readonly SILENCE_RMS_THRESHOLD = 0.01
 
   setStateListener(cb: (s: RecorderState) => void) {
     this.onStateChange = cb
@@ -376,247 +287,8 @@ export class RecorderOrchestrator {
     return runId !== 0 && this.activeRunId === runId
   }
 
-  /** 标记这一代是被用户主动取消的（只有 Esc / 取消录音走这里）。 */
-  private markRunCanceled(runId: number) {
-    if (runId === 0) return
-    this.canceledRuns.add(runId)
-    // 长期运行下别无界增长；只保留最近若干代，足够覆盖仍在飞的异步收尾。
-    if (this.canceledRuns.size > 64) {
-      for (const id of this.canceledRuns) {
-        if (this.canceledRuns.size <= 32) break
-        this.canceledRuns.delete(id)
-      }
-    }
-  }
 
-  /**
-   * 这一代的历史存档该不该丢弃。
-   *
-   * 判据是「用户是否主动取消」，**不是** isRunCurrent。用户在上一段还没收尾时又按了热键，
-   * 旧 run 会失效但他并没有要求丢掉上一段——那段音频是他刚说完的，必须留下。
-   */
-  private isRunCanceled(runId: number) {
-    return runId === 0 || this.canceledRuns.has(runId)
-  }
 
-  /**
-   * 停止录音后立刻把音频写盘，不等识别结果。
-   *
-   * 返回本代的 recordId：所有终态路径（正常 final / 空识别 / 报错 / 超时兜底）都必须用
-   * takeArchivedAudio 取回它，绝不再自己生成 id、自己保存一遍。
-   */
-  private beginAudioArchive(runId: number, chunks: ArrayBuffer[]): string {
-    const recordId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
-    const promise = (async (): Promise<string | null> => {
-      try {
-        if (chunks.length === 0) return null
-        const [historyEnabled, retentionEnabled] = await Promise.all([
-          getSetting('historyEnabled', true),
-          getSetting('audioRetentionEnabled', true),
-        ])
-        if (!historyEnabled || !retentionEnabled) return null
-        const savedPath = await saveRecordingAudio(recordId, chunks)
-        addRuntimeEvent('info', 'recorder', 'Recording audio archived', {
-          runId,
-          recordId,
-          saved: Boolean(savedPath),
-          chunks: chunks.length,
-        })
-        return savedPath
-      } catch (error) {
-        addRuntimeEvent('warn', 'recorder', 'Failed to archive recording audio', {
-          runId,
-          recordId,
-          error: String(error),
-        })
-        return null
-      }
-    })()
-    this.audioArchives.set(runId, { runId, recordId, promise, discarded: false })
-    // 正常情况下每条存档都会被某个终态取走；关掉历史等分支不会取，这里兜一下上限。
-    if (this.audioArchives.size > 8) {
-      const oldest = this.audioArchives.keys().next()
-      if (!oldest.done) this.audioArchives.delete(oldest.value)
-    }
-    return recordId
-  }
-
-  /**
-   * 确保本代音频已经在落盘。
-   *
-   * 正常路径由 stopRecording 发起；错误可能在**录音进行中**就到达（连接断开），那时还没
-   * 走到 stopRecording，必须在这里补一次，否则这段音频没人保存。
-   */
-  private ensureAudioArchive(runId: number, chunks: ArrayBuffer[]): void {
-    if (this.audioArchives.has(runId)) return
-    this.beginAudioArchive(runId, chunks)
-  }
-
-  /** 取回本代已存档的音频；返回 null 表示这一代没有存档（例如时长不足没进 processing）。 */
-  private async takeArchivedAudio(
-    runId: number,
-  ): Promise<{ recordId: string; audioFilePath?: string; pendingLate?: boolean } | null> {
-    const archive = this.audioArchives.get(runId)
-    if (!archive) return null
-    // 取走即移交：一次录音只有一条终态路径会走到这里（finalHandled / settled 互斥保证）。
-    this.audioArchives.delete(runId)
-    let timedOutWaiting = false
-    const savedPath = await Promise.race([
-      archive.promise,
-      new Promise<null>((resolve) => setTimeout(() => {
-        timedOutWaiting = true
-        resolve(null)
-      }, AUDIO_ARCHIVE_WAIT_MS)),
-    ])
-    if (archive.discarded) return null
-    if (timedOutWaiting) {
-      // 落盘 IPC 卡住时绝不能把整条结果处理一起挂死（那正是「悬浮条无限转圈、什么都不说」
-      // 的成因之一）。记录先写出去，音频路径等落盘真的完成再补上。
-      addRuntimeEvent('warn', 'recorder', 'Audio archive did not finish in time; writing history without the audio path', {
-        runId,
-        recordId: archive.recordId,
-        waitedMs: AUDIO_ARCHIVE_WAIT_MS,
-      })
-      void archive.promise.then(async (latePath) => {
-        if (!latePath || archive.discarded) return
-        try {
-          await updateHistoryRecord(archive.recordId, { audioFilePath: latePath })
-          void bridge.emit('history-updated')
-          addRuntimeEvent('info', 'recorder', 'Attached late audio archive to its history record', {
-            recordId: archive.recordId,
-          })
-          // 落盘终于成功了：若那张失败卡还开着，把"尚未确定"升级成明确的去处。
-          // updateFailureRecovery 自己校验 token 与当前状态，卡片已关时是空操作。
-          this.overlayService.updateFailureRecovery('history', archive.runId)
-        } catch (error) {
-          addRuntimeEvent('warn', 'recorder', 'Failed to attach late audio archive', {
-            recordId: archive.recordId,
-            error: String(error),
-          })
-        }
-      })
-      // pendingLate：落盘还在继续，稍后大概率会成功并补进历史。调用方据此说
-      // "尚未确定"，绝不能说成"没有留下录音" —— 那是错的，而且不可挽回地误导用户。
-      return { recordId: archive.recordId, pendingLate: true }
-    }
-    return { recordId: archive.recordId, audioFilePath: savedPath ?? undefined }
-  }
-
-  /** 用户主动取消：把这份存档标为废弃，写盘完成后删掉文件。 */
-  private discardAudioArchive(runId: number) {
-    const archive = this.audioArchives.get(runId)
-    if (!archive || archive.discarded) return
-    archive.discarded = true
-    this.audioArchives.delete(runId)
-    void archive.promise.then((savedPath) => {
-      if (!savedPath) return
-      void bridge.deleteAudioFile(savedPath).catch(() => { /* 孤儿文件删除失败不影响状态复位 */ })
-    })
-  }
-
-  /**
-   * 把「有音频但没有可用文本」的一次录音写进历史，供回放与重新识别。
-   *
-   * 空识别、供应商报错、处理超时、连接断开四条路共用它：音频已经在 beginAudioArchive 里
-   * 存好了，这里只负责补一条带明确原因的记录。
-   *
-   * 返回**能不能恢复**，而不是"有没有写历史"：只有历史记录和音频文件都在，用户才真的
-   * 能去重新识别。界面上那句"可在历史记录重新识别"只能由这个返回值决定 —— 靠
-   * historyEnabled / audioRetentionEnabled 两个开关推断是不够的，写盘还会失败、
-   * 还会超时。许一个作废的承诺比什么都不说更糟。
-   */
-  private async archiveFailedRun(params: {
-    runId: number
-    audioDurationSec: number
-    wallTimeSec: number
-    asrMs?: number
-    asrDurationSec?: number
-    failReason?: string
-    failReasonCode?: HistoryFailReasonCode
-    historyMeta: HistoryMetadata
-    aiSource?: HistoryRecord['aiSource']
-    aiStatus?: HistoryRecord['aiStatus']
-  }): Promise<FailureRecovery> {
-    const { runId } = params
-    let artifact: { recordId: string; audioFilePath?: string; pendingLate?: boolean } | null = null
-    try {
-      const historyEnabled = await getSetting('historyEnabled', true)
-      if (!historyEnabled) return 'none'
-      artifact = await this.takeArchivedAudio(runId)
-      if (!artifact) return 'none'
-      if (this.isRunCanceled(runId)) {
-        await this.discardCanceledHistory(artifact)
-        return 'none'
-      }
-      this.pendingHistoryArtifact = { runId, ...artifact }
-      await addHistory({
-        ...params.historyMeta,
-        id: artifact.recordId,
-        timestamp: Date.now(),
-        asrText: '',
-        llmText: '',
-        asrMs: params.asrMs ?? 0,
-        llmMs: 0,
-        durationSec: params.wallTimeSec,
-        audioDurationSec: params.audioDurationSec > 0 ? params.audioDurationSec : undefined,
-        asrDurationSec: params.asrDurationSec,
-        charCount: 0,
-        isEmpty: true,
-        failReason: params.failReason,
-        failReasonCode: params.failReasonCode,
-        aiSource: params.aiSource,
-        aiStatus: params.aiStatus,
-        audioFilePath: artifact.audioFilePath,
-      })
-      // 写入后再验一次：取消可能发生在 addHistory 期间。
-      if (this.isRunCanceled(runId)) {
-        await this.discardCanceledHistory(artifact)
-        return 'none'
-      }
-      void bridge.emit('history-updated')
-      addRuntimeEvent('info', 'recorder', 'Saved recording to history without text', {
-        runId,
-        recordId: artifact.recordId,
-        audioSaved: Boolean(artifact.audioFilePath),
-        audioSec: params.audioDurationSec,
-        failReasonCode: params.failReasonCode,
-      })
-      // 没有音频文件就没法重新识别（历史页的重试按钮同样以 audioFilePath 为条件）。
-      //
-      // 三分而不是两分：落盘还在继续时（pendingLate）返回 'unknown'，界面什么都不说。
-      // 说成 'none'（"这次没有留下录音"）是**错的** —— 那条路稍后大概率会成功并把
-      // 路径补进历史，而用户已经被告知录音没了。
-      if (artifact.audioFilePath) return 'history'
-      return artifact.pendingLate ? 'unknown' : 'none'
-    } catch (error) {
-      if (artifact) await this.discardCanceledHistory(artifact)
-      addRuntimeEvent('warn', 'recorder', 'Failed to save recording to history', {
-        runId,
-        error: String(error),
-        failReasonCode: params.failReasonCode,
-      })
-      return 'none'
-    }
-  }
-
-  /**
-   * 这段录音是否有「确实没有可用语音」的实测证据。
-   *
-   * 为什么要证据：「未检测到有效声音」是全软件最容易被误读的一句话，它会把用户直接
-   * 引去查麦克风。而同一句话背后的真实成因可能是额度耗尽、服务端提前断开、热词回显
-   * 被判定清空（见 pitfalls 15）。没有证据时就该说「没有取得识别结果」，别替用户
-   * 下结论。
-   *
-   * 判据本身抽到了 helpers.ts（纯函数，带单测钉住"两个条件必须同时成立"那一刀）。
-   */
-  private hasSilenceEvidence(): boolean {
-    return hasSilenceEvidence({
-      totalFrames: this.audioStatsTotalFrames,
-      silentFrames: this.audioStatsSilentFrames,
-      peakAmplitude: this.audioStatsPeakAmplitude,
-      silenceRmsThreshold: RecorderOrchestrator.SILENCE_RMS_THRESHOLD,
-    })
-  }
 
   /**
    * 一次失败的统一收尾：**立刻**显示失败卡，随后按实际存档结果把恢复提示补上。
@@ -656,7 +328,7 @@ export class RecorderOrchestrator {
       })
     }
 
-    const recovery = await this.archiveFailedRun({
+    const recovery = await this.history.writeFailedRun({
       runId,
       audioDurationSec: params.audioDurationSec,
       wallTimeSec: params.wallTimeSec,
@@ -716,9 +388,7 @@ export class RecorderOrchestrator {
   /** 幂等结束指定代次；所有清理都带 runId 条件，绝不清除随后创建的新代次。 */
   private finishRun(runId: number) {
     if (runId === 0) return
-    if (this.pendingHistoryArtifact?.runId === runId) {
-      this.pendingHistoryArtifact = null
-    }
+    this.history.clearPendingFor(runId)
     if (this.timedOutProcessingContext?.runId === runId) {
       this.timedOutProcessingContext = null
     }
@@ -982,8 +652,8 @@ export class RecorderOrchestrator {
 
   cleanup() {
     this.clearProcessingTimeout()
-    this.clearMicMutedAutoCancelTimer()
-    this.micMuteProbeSequence++
+    this.micLevel.clearAutoCancelTimer()
+    this.micLevel.invalidateProbes()
     this.overlayService.dispose()
     stopInsertionTargetTracking()
     void stopCapture().catch(() => { })
@@ -1223,59 +893,8 @@ export class RecorderOrchestrator {
     this.resetToIdle()
   }
 
-  private clearMicMutedAutoCancelTimer() {
-    if (this.micMutedAutoCancelId) {
-      clearTimeout(this.micMutedAutoCancelId)
-      this.micMutedAutoCancelId = null
-    }
-  }
 
-  private scheduleMicMutedAutoCancel(runId: number) {
-    this.clearMicMutedAutoCancelTimer()
-    const closeWhenReady = () => {
-      this.micMutedAutoCancelId = null
-      if (!this.isRunCurrent(runId) || !this.osMicMuted) return
-      if (this.state === 'idle' && this.startRecordingLock) {
-        // 防御：这个计时器现在只在收到音频帧后才排，理论上必定已在 recording。
-        // 万一将来又从「采集就绪前」的路径调用，也不要在这里直接放弃。
-        this.micMutedAutoCancelId = setTimeout(closeWhenReady, 100)
-        return
-      }
-      if (this.state !== 'recording') return
-      addRuntimeEvent('info', 'recorder', 'Muted microphone warning timed out; recording will close automatically', {
-        runId,
-        timeoutMs: MIC_MUTED_AUTO_CANCEL_MS,
-      })
-      void this.cancelRecording(runId, { showCanceled: false, reason: 'mic_muted_timeout' })
-    }
-    this.micMutedAutoCancelId = setTimeout(closeWhenReady, MIC_MUTED_AUTO_CANCEL_MS)
-  }
 
-  /** 在采集链路初始化前查询系统静音状态；默认设备不经过可能很慢的设备枚举。 */
-  private async checkConfiguredMicMuted(runId: number) {
-    // 在任何异步操作之前占用代次；之后发起的实际设备复核可以可靠淘汰本次预检查。
-    const probeSequence = ++this.micMuteProbeSequence
-    // 空值与 Web Media 的 "default" 都表示跟随 Windows 当前默认录音端点。
-    // 直接把 null 交给原生层查询该端点的 GetMute；deviceId 只用于定位，不参与静音判定。
-    if (!this.cachedMicId || this.cachedMicId === 'default') {
-      await this.checkMicMuted(null, runId, probeSequence)
-      return
-    }
-
-    try {
-      const devices = await navigator.mediaDevices.enumerateDevices()
-      if (probeSequence !== this.micMuteProbeSequence || !this.isRunCurrent(runId)) return
-      const inputs = devices.filter((device) => device.kind === 'audioinput')
-      const selected = inputs.find((device) => device.deviceId === this.cachedMicId)
-
-      const label = selected?.label?.trim() || ''
-      // 指定设备却无法取得名称时不能回退查系统默认端点，否则可能把另一支麦克风的状态报过来。
-      if (!label) return
-      await this.checkMicMuted(label, runId, probeSequence)
-    } catch {
-      // 预检查失败不影响录音；采集真正打开后还会用 MediaStreamTrack.label 再复核一次。
-    }
-  }
 
   private getLiveElapsedSec() {
     if (this.state === 'recording' && this.recordStartPerf > 0) {
@@ -1297,8 +916,8 @@ export class RecorderOrchestrator {
     })
     this.clearProcessingTimeout()
     this.clearInsertionTimeout()
-    this.clearMicMutedAutoCancelTimer()
-    this.micMuteProbeSequence++
+    this.micLevel.clearAutoCancelTimer()
+    this.micLevel.invalidateProbes()
     if (this.handsFreeAutoStopId) {
       clearTimeout(this.handsFreeAutoStopId)
       this.handsFreeAutoStopId = null
@@ -1316,20 +935,11 @@ export class RecorderOrchestrator {
     this.processingCancelable = false
     this.captureReadyPromise = null
     this.finalReceivedAt = 0
-    this.pendingHistoryArtifact = null
+    this.history.clearPending()
     this.currentActiveAppContext = null
     this.currentPromptResolution = null
     this.cachedProbeResult = null
-    this.consecutiveSilentSamples = 0
-    this.consecutiveNonVoicedSamples = 0
-    this.quietRunSawSignal = false
-    this.consecutiveVoicedSamples = 0
-    this.currentVolumeWarning = 'none'
-    this.hasDetectedVoiceThisSession = false
-    this.lastLowVolumeWarnAt = 0
-    this.osMicMuted = false
-    this.pendingOsMicMuted = false
-    this.pendingOsMicMutedSamples = 0
+    this.micLevel.resetOnIdle()
     clearCapturedInsertionTarget()
     this.recordStartPerf = 0
     if (!options?.preserveLateFinalContext) {
@@ -1342,15 +952,6 @@ export class RecorderOrchestrator {
     }
   }
 
-  private async discardCanceledHistory(artifact: { recordId: string; audioFilePath?: string }) {
-    try {
-      if (artifact.audioFilePath) await bridge.deleteAudioFile(artifact.audioFilePath)
-    } catch { /* 取消清理失败不阻塞状态复位 */ }
-    try {
-      await deleteHistory(artifact.recordId)
-      void bridge.emit('history-updated')
-    } catch { /* 记录可能尚未写入；processFinalResult 完成写入后会再次清理 */ }
-  }
 
   private async cancelRecording(
     token: number,
@@ -1376,7 +977,7 @@ export class RecorderOrchestrator {
     // 在任何 await 之前离开 recording 并让 run 失效。这样同时到达的 PTT up 不会
     // 再进入正常 stopRecording，Provider 的迟到 partial/error 也会被 run guard 丢弃。
     if (!this.transition('processing')) return
-    this.markRunCanceled(canceledRunId)
+    this.history.markRunCanceled(canceledRunId)
     this.finalHandledInCurrentRun = true
     this.processingCancelable = false
     this.overlayService.stopListeningTicker()
@@ -1423,11 +1024,11 @@ export class RecorderOrchestrator {
     }
 
     const canceledRunId = this.activeRunId
-    const historyArtifact = this.pendingHistoryArtifact
+    const historyArtifact = this.history.getPending()
     this.clearProcessingTimeout()
     // 用户明确按了 Esc：这一代的音频存档和历史都该消失。这是唯一允许丢弃录音的入口。
-    this.markRunCanceled(canceledRunId)
-    this.discardAudioArchive(canceledRunId)
+    this.history.markRunCanceled(canceledRunId)
+    this.audioArchive.discard(canceledRunId)
     if (this.timedOutProcessingContext?.runId === canceledRunId) {
       this.timedOutProcessingContext.settled = true
     }
@@ -1437,7 +1038,7 @@ export class RecorderOrchestrator {
     this.recordedChunks = []
     this.finishRun(canceledRunId)
     if (historyArtifact?.runId === canceledRunId) {
-      void this.discardCanceledHistory(historyArtifact)
+      void this.history.discard(historyArtifact)
     }
 
     // token 与当前 run 在同一同步检查内通过后才允许提示“已取消”；旧队列动作不会影响新代次。
@@ -1484,7 +1085,7 @@ export class RecorderOrchestrator {
         // 清空、服务端提前收尾都会走到这里（pitfalls 15）。所以分两条说：
         // 采集侧有近静音实证的，才敢说「未检测到有效声音」；没有实证的只说
         // 「没有取得识别结果」，并给出可恢复的去处，别把人引去查麦克风。
-        const silenceProven = this.hasSilenceEvidence()
+        const silenceProven = this.micLevel.hasSilenceEvidence()
         const silenceDiagnostic = {
           reason: 'asr_empty',
           mode: this.provider.mode,
@@ -1492,7 +1093,7 @@ export class RecorderOrchestrator {
           asrMs: result.asrMs || 0,
           audioChunks: audioChunkCount,
           silenceProven,
-          peakAmplitude: Math.round(this.audioStatsPeakAmplitude * 10000) / 10000,
+          peakAmplitude: this.micLevel.roundedPeakAmplitude(),
           runId,
         }
         // 识别没出文字一律只给 toast，不弹卡片。
@@ -1507,7 +1108,7 @@ export class RecorderOrchestrator {
         void (async () => {
           // 两条路的存档参数本来就完全一样（同一个 failReasonCode），合并掉那份
           // 重复的 if/else —— 它正是上面那个漏改能发生的土壤。
-          await this.archiveFailedRun({
+          await this.history.writeFailedRun({
             runId,
             audioDurationSec: audioDur,
             wallTimeSec: wallSec,
@@ -1610,7 +1211,7 @@ export class RecorderOrchestrator {
         // Provider 说本轮结束了，却一个结果都没给（协议异常：done 先于 final 到达、
         // 或服务端只发了 done）。音频已经存档，别让它变成没人认领的孤儿文件 ——
         // 补一条带原因的记录，用户至少还能回放和重新识别。
-        if (this.audioArchives.has(runId)) {
+        if (this.audioArchive.has(runId)) {
           const audioDur = this.getAudioDurationSec()
           const wallSec = this.wallTimeAtStopSec > 0 ? this.wallTimeAtStopSec : audioDur
           const historyMeta = this.buildHistoryMetadata(
@@ -1680,7 +1281,7 @@ export class RecorderOrchestrator {
         // 错误在录音进行中到达时还没走过 stopRecording，音频尚未开始落盘 —— 在这里补上，
         // 否则「说到一半连接断了」这段语音谁都没保存。
         if (audioDur >= 0.5 && this.recordedChunks.length > 0) {
-          this.ensureAudioArchive(runId, this.recordedChunks.slice())
+          this.audioArchive.ensure(runId, this.recordedChunks.slice())
         }
         void (async () => {
           if (audioDur >= 0.5) {
@@ -1952,17 +1553,14 @@ export class RecorderOrchestrator {
     this.startRecordingLock = true
     this.pendingStopWhileStarting = false
     this.timedOutProcessingContext = null
-    this.clearMicMutedAutoCancelTimer()
-    this.osMicMuted = false
-    this.pendingOsMicMuted = false
-    this.pendingOsMicMutedSamples = 0
+    this.micLevel.resetMuteState()
 
     // 先给用户即时视觉反馈；overlay 不聚焦，因此后续原生上下文捕获仍指向原目标窗口。
     // 首次 WebView 已在启动空闲期预热，正常情况下这里只剩一次轻量 show + emit。
     this.overlayService.showWaiting()
     // 不等待上下文捕获、Provider 建连或 AudioWorklet 初始化：提前拿到系统静音标志，
     // 好让第一帧 PCM 一到就能立刻裁决（标志本身不足以判定，见 pendingOsMicMuted）。
-    void this.checkConfiguredMicMuted(runId)
+    void this.micLevel.checkConfiguredMicMuted(runId)
 
     const targetCapture = captureActiveInsertionTarget(undefined, {
       preserveExistingOnFailure: true,
@@ -2053,19 +1651,7 @@ export class RecorderOrchestrator {
     this.audioSentSamples = 0
     this.wallTimeAtStopSec = 0
     this.recordedChunks = []
-    // Reset audio stats
-    this.audioStatsRmsSum = 0
-    this.audioStatsPeakRms = 0
-    this.audioStatsPeakAmplitude = 0
-    this.audioStatsSilentFrames = 0
-    this.audioStatsTotalFrames = 0
-    this.consecutiveSilentSamples = 0
-    this.consecutiveNonVoicedSamples = 0
-    this.quietRunSawSignal = false
-    this.consecutiveVoicedSamples = 0
-    this.currentVolumeWarning = 'none'
-    this.hasDetectedVoiceThisSession = false
-    this.lastLowVolumeWarnAt = 0
+    this.micLevel.resetLevels()
     resetWaveformBarState(this.overlayWaveState, this.overlayService.getBarCount(), 3)
 
     // Hands-free mode: arm a 5-minute auto-stop timer
@@ -2160,28 +1746,7 @@ export class RecorderOrchestrator {
             })
             this.overlayService.pushListeningBars(bars)
 
-            // 计算本帧 RMS 与峰值幅度（均归一化到 0..1）。峰值严格为 0 才表示整帧没有输入；
-            // 只要存在任何非零采样，就必须和「未检测到声音」区分开。
-            let sum = 0
-            let framePeakRaw = 0
-            for (let i = 0; i < pcmFrame.length; i++) {
-              const s = pcmFrame[i]
-              sum += s * s
-              const amp = s < 0 ? -s : s
-              if (amp > framePeakRaw) framePeakRaw = amp
-            }
-            const rms = Math.sqrt(sum / pcmFrame.length) / 32768
-            const framePeak = framePeakRaw / 32768
-
-            // Audio stats tracking
-            this.audioStatsTotalFrames++
-            this.audioStatsRmsSum += rms
-            if (rms > this.audioStatsPeakRms) this.audioStatsPeakRms = rms
-            if (framePeak > this.audioStatsPeakAmplitude) this.audioStatsPeakAmplitude = framePeak
-            if (rms < RecorderOrchestrator.SILENCE_RMS_THRESHOLD) this.audioStatsSilentFrames++
-
-            // 两档提醒：静音（未检测到声音）/ 偏低（请靠近麦克风）
-            this.updateVolumeWarning(classifyMicLevel(rms, framePeak), pcmFrame.length)
+            this.micLevel.onFrame(pcmFrame)
           },
           this.noiseSuppression,
         ),
@@ -2235,10 +1800,10 @@ export class RecorderOrchestrator {
       }
       // 录音一开始就查一次麦克风是否被系统静音，被静音则悬浮窗即时红色高警（不阻塞录音）
       // 用 getUserMedia 实际打开的设备再复核；若系统在初始化期间切换了默认麦克风，以这里为准。
-      void this.checkMicMuted(
+      void this.micLevel.checkMicMuted(
         captureResult.label || null,
         runId,
-        ++this.micMuteProbeSequence,
+        this.micLevel.nextProbeSequence(),
       )
       // 就绪提示音已触发，稍后再静音系统输出（避免把提示音一起静掉）
       this.scheduleSystemMuteIfEnabled()
@@ -2273,156 +1838,7 @@ export class RecorderOrchestrator {
     }
   }
 
-  /**
-   * 录音时的音量提醒状态机（两档）：
-   *  - muted（PCM 全 0）：麦克风没有任何输入 → 「未检测到声音」
-   *  - low （有声音但 RMS 偏低）：距离远 / 说太小声 → 「请靠近麦克风」
-   *  - voiced（正常）：连续约 0.5s 即认定恢复，清除提醒
-   *
-   * 关键准确性约束：「未检测到声音」只在「从录音开始就没听到过正常说话，且这整段安静里
-   * 每个采样都为 0」时才报；任何非零输入都只能算声音小。这样也避免把说话后的正常停顿
-   * 思考误判成设备故障（那种情况只温和提示「请靠近麦克风」）。
-   * 计时/迟滞沿用原逻辑：没听到过说话时更早提醒（2s），
-   * 听到过后放宽（5s）；同档每 5s 重弹；连续正常音量 0.5s 才清警告，避免瞬时小声闪烁。
-   */
-  private updateVolumeWarning(level: MicLevel, sampleCount: number) {
-    const REWARN_MS = 5000
-    const CLEAR_VOICED = 8000 // ~0.5s @16kHz 累计正常音量才清除
-    const VOICED_GAP_TOLERANCE = 4800 // ~300ms：容忍说话中字与字之间的短暂停顿，不清零已累计的清除进度
-    const firstWarn = this.hasDetectedVoiceThisSession ? 80000 : 32000 // 5s / 2s @16kHz
 
-    // 系统报了端点静音，但那只是设置标志，不代表采集流真被切断（见 pendingOsMicMuted）。
-    // 用真实 PCM 裁决：全 0 累计到阈值才升级成红色高警；一旦出现任何非零采样，
-    // 就说明这块设备的 mute 标志不作数，本次录音永久丢弃这条线索。
-    if (this.pendingOsMicMuted) {
-      const decision = judgeOsMicMute(this.pendingOsMicMutedSamples, level, sampleCount)
-      if (decision.verdict === 'confirmed') {
-        this.pendingOsMicMuted = false
-        this.pendingOsMicMutedSamples = 0
-        this.osMicMuted = true
-        addRuntimeEvent('warn', 'recorder', 'Microphone is muted by the operating system (confirmed: audio is all-zero)')
-        this.overlayService.showMicMutedAlert()
-        this.scheduleMicMutedAutoCancel(this.activeRunId)
-      } else if (decision.verdict === 'dismissed') {
-        this.pendingOsMicMuted = false
-        this.pendingOsMicMutedSamples = 0
-        addRuntimeEvent('info', 'recorder', 'System reported the microphone as muted but audio is flowing; ignoring the flag')
-      } else {
-        this.pendingOsMicMutedSamples = decision.silentSamples
-      }
-    }
-
-    // 系统已确认被静音：保持红色高警，不让琥珀提醒覆盖它；
-    // 一旦收到真实说话（用户中途取消了静音）立即恢复正常。
-    if (this.osMicMuted) {
-      if (level === 'voiced') {
-        this.consecutiveVoicedSamples += sampleCount
-        this.consecutiveNonVoicedSamples = 0
-        if (this.consecutiveVoicedSamples < CLEAR_VOICED) return
-      } else {
-        this.consecutiveNonVoicedSamples += sampleCount
-        if (this.consecutiveNonVoicedSamples >= VOICED_GAP_TOLERANCE) this.consecutiveVoicedSamples = 0
-        return
-      }
-      this.osMicMuted = false
-      this.clearMicMutedAutoCancelTimer()
-      this.overlayService.clearWarning()
-      this.currentVolumeWarning = 'none'
-      this.consecutiveVoicedSamples = 0
-      this.consecutiveSilentSamples = 0
-      this.consecutiveNonVoicedSamples = 0
-      this.quietRunSawSignal = false
-      this.hasDetectedVoiceThisSession = true
-      return
-    }
-
-    if (level === 'voiced') {
-      // 即使还不足 0.5s、尚未确认恢复正常，也已经证明输入不为零。
-      this.quietRunSawSignal = true
-      this.consecutiveVoicedSamples += sampleCount
-      this.consecutiveNonVoicedSamples = 0
-      if (this.consecutiveVoicedSamples >= CLEAR_VOICED) {
-        this.hasDetectedVoiceThisSession = true
-        this.consecutiveSilentSamples = 0
-        this.quietRunSawSignal = false
-        if (this.currentVolumeWarning !== 'none') {
-          this.overlayService.clearWarning()
-          this.currentVolumeWarning = 'none'
-        }
-      }
-      return
-    }
-
-    // 非正常音量（muted / low）：累计安静时长；任何非零输入都永久标记本段并非「无声音」。
-    this.consecutiveSilentSamples += sampleCount
-    this.consecutiveNonVoicedSamples += sampleCount
-    if (level === 'low') this.quietRunSawSignal = true
-    // 说话时字与字之间的短暂停顿（<~300ms）不清零已累计的正常音量，否则一句话里的自然
-    // 停顿会反复把"清除进度"打回 0，导致明明在正常说话也凑不满连续 0.5s、警告始终清不掉。
-    // 只有持续安静超过这个小间隙，才认为不是说话停顿、归零重新计。
-    if (this.consecutiveNonVoicedSamples >= VOICED_GAP_TOLERANCE) this.consecutiveVoicedSamples = 0
-
-    if (this.consecutiveSilentSamples < firstWarn) return
-
-    // 只有从未正常说过话且整段所有采样均为 0，才允许提示「未检测到声音」。
-    const kind: 'muted' | 'low' =
-      !this.hasDetectedVoiceThisSession && !this.quietRunSawSignal ? 'muted' : 'low'
-
-    const now = Date.now()
-    // 切换到不同档位立即刷新文案；同档位按节流重弹，避免频繁催促
-    if (kind === this.currentVolumeWarning && now - this.lastLowVolumeWarnAt < REWARN_MS) return
-    this.lastLowVolumeWarnAt = now
-    this.currentVolumeWarning = kind
-    if (kind === 'muted') {
-      addRuntimeEvent('warn', 'recorder', 'No microphone signal detected; device may be wrong or unavailable')
-      this.overlayService.showNoSignalWarning()
-    } else {
-      addRuntimeEvent('warn', 'recorder', 'Microphone volume is low')
-      this.overlayService.showLowVolumeWarning()
-    }
-  }
-
-  /**
-   * 录音开始时查询系统麦克风的静音标志，作为「麦克风已被静音」红色高警的**线索**记录下来；
-   * 真正弹警告要等音频帧证实 PCM 全 0（见 pendingOsMicMuted）——系统标志会骗人。
-   * 仅在能可靠定位设备时才采信（系统默认设备，或按名字唯一匹配到选中设备），
-   * 否则（如选了特定设备但拿不到名字/同名多个）返回不判定，交给基于信号的琥珀提醒兜底。
-   */
-  private async checkMicMuted(
-    activeDeviceLabel: string | null,
-    runId: number,
-    probeSequence: number,
-  ) {
-    try {
-      // 查询本次 getUserMedia 实际打开的端点，而不是根据设置值或 deviceId 猜测。
-      // 设备名无法唯一匹配时 Rust 返回 matched=false，继续交给信号检测兜底。
-      const res = await invoke<{ matched: boolean; muted: boolean }>('get_mic_mute_state', {
-        deviceLabel: activeDeviceLabel,
-      })
-      // 后发的实际设备复核优先；旧探测、旧录音或已恢复正常说话时都不能再弹。
-      if (probeSequence !== this.micMuteProbeSequence || !this.isRunCurrent(runId)) return
-      if (this.state !== 'recording' && !(this.state === 'idle' && this.startRecordingLock)) return
-      if (this.hasDetectedVoiceThisSession || !res.matched) return
-
-      if (res.muted) {
-        // 只记线索、不弹 UI：等音频帧证实真的全 0（原因见 pendingOsMicMuted 注释）。
-        // 已确认、或已在等待证实时都不要重置累计进度（预检查与实际设备复核都会走到这里）。
-        if (this.osMicMuted || this.pendingOsMicMuted) return
-        this.pendingOsMicMuted = true
-        this.pendingOsMicMutedSamples = 0
-        addRuntimeEvent('info', 'recorder', 'System reports the microphone endpoint is muted; waiting for audio to confirm')
-      } else {
-        // 实际打开的端点与预检查不一致，或用户在初始化期间取消了静音。
-        this.pendingOsMicMuted = false
-        this.pendingOsMicMutedSamples = 0
-        if (this.osMicMuted) {
-          this.osMicMuted = false
-          this.clearMicMutedAutoCancelTimer()
-          this.overlayService.clearWarning()
-        }
-      }
-    } catch { /* 查询失败不影响录音，交给信号检测兜底 */ }
-  }
 
   private async stopRecording() {
     if (this.state !== 'recording') {
@@ -2431,7 +1847,7 @@ export class RecorderOrchestrator {
     }
 
     const runId = this.activeRunId
-    this.clearMicMutedAutoCancelTimer()
+    this.micLevel.clearAutoCancelTimer()
 
     // Wait for capture setup to complete (getUserMedia + AudioWorklet can take time)
     if (this.captureReadyPromise) {
@@ -2515,13 +1931,7 @@ export class RecorderOrchestrator {
     // 提出成局部变量：下面的 'Entered processing' 也要带上它。那条日志会落盘，
     // 而 'Stop sent' 不会 —— peakAmplitude=0 是「麦克风一个字节都没收到」的铁证，
     // 必须挂在一条真的进 sayit.log 的日志上，否则等于没记。
-    const audioStats = this.audioStatsTotalFrames > 0 ? {
-      avgRms: Math.round((this.audioStatsRmsSum / this.audioStatsTotalFrames) * 10000) / 10000,
-      peakRms: Math.round(this.audioStatsPeakRms * 10000) / 10000,
-      peakAmplitude: Math.round(this.audioStatsPeakAmplitude * 10000) / 10000,
-      silenceRatio: Math.round((this.audioStatsSilentFrames / this.audioStatsTotalFrames) * 1000) / 1000,
-      totalFrames: this.audioStatsTotalFrames,
-    } : undefined
+    const audioStats = this.micLevel.summary()
 
     const stopAccepted = this.provider.stop({
       pttHoldMs,
@@ -2545,7 +1955,7 @@ export class RecorderOrchestrator {
     this.processingCancelable = true
 
     // 音频先落盘，不等识别结果。此后无论超时、断连、还是进程被杀，这段录音都还在磁盘上。
-    this.beginAudioArchive(runId, this.recordedChunks.slice())
+    this.audioArchive.begin(runId, this.recordedChunks.slice())
 
     if (!stopAccepted) {
       // 请求根本没送出去（server 模式连接已断、或 provider 会话已失效）。以前这里照样
@@ -2654,7 +2064,7 @@ export class RecorderOrchestrator {
               historyMeta,
             })
           } else {
-            await this.archiveFailedRun({
+            await this.history.writeFailedRun({
               runId: timedOutCtx.runId,
               audioDurationSec: timedOutCtx.audioDurationSec,
               wallTimeSec: timedOutCtx.wallTimeSec,
@@ -2822,64 +2232,6 @@ export class RecorderOrchestrator {
     }
   }
 
-  /** 异步获取当前模式下的 ASR/AI 供应商信息 */
-  private async buildProviderMetadata(finalResult?: FinalResult): Promise<{
-    asrProvider?: string
-    aiProvider?: string
-    aiModel?: string
-    aiSource?: FinalResult['aiSource']
-    aiStatus?: FinalResult['aiStatus']
-  }> {
-    const mode = this.provider.mode
-    const executionMeta = {
-      aiSource: finalResult?.aiSource,
-      aiStatus: finalResult?.aiStatus,
-    }
-    if (mode === 'server') {
-      let asrProvider = finalResult?.asrModel || finalResult?.asrEngine || 'server'
-      // 后端返回 HuggingFace repo 全名如 "Qwen/Qwen3-ASR-1.7B"，只取模型名
-      const slashIdx = asrProvider.lastIndexOf('/')
-      if (slashIdx >= 0) asrProvider = asrProvider.slice(slashIdx + 1)
-      if (finalResult?.aiSource === 'custom') {
-        return {
-          asrProvider,
-          aiProvider: finalResult.aiProvider,
-          aiModel: finalResult.aiModel,
-          ...executionMeta,
-        }
-      }
-      return {
-        asrProvider,
-        aiProvider: finalResult?.aiSource === 'none' ? undefined : 'server',
-        ...executionMeta,
-      }
-    }
-    if (mode === 'cloud_api') {
-      const asrProviderKey = await getSetting('cloudAsr.provider', '') as string
-      // 选定的模型要一起读：Groq / OpenAI 那几个服务同一个 id 下有多个模型，
-      // 只按 id 推会把历史记录写成该服务的默认模型，而不是这次真正用的那个。
-      //
-      // 映射表以前在这里抄了第三份（lib/asrModels.ts、AsrTestSection 各一份），
-      // 加一个供应商就得改三处、漏一处只会静默显示错的模型名。现在只有一个出处。
-      const asrSelectedModel = await getSetting('cloudAsr.model', '') as string
-      const asrProvider = asrProviderKey
-        ? resolveAsrDisplayModel(asrProviderKey, asrSelectedModel)
-        : 'cloud'
-      const aiProvider = finalResult?.aiProvider || await getSetting('cloudAi.provider', '') as string
-      const aiModel = finalResult?.aiModel || await getSetting('cloudAi.model', '') as string
-      return { asrProvider, aiProvider: aiProvider || undefined, aiModel: aiModel || undefined, ...executionMeta }
-    }
-    if (mode === 'local') {
-      const modelId = await getSetting('localAsr.modelId', '') as string
-      const aiEnabled = Boolean(await getSetting('aiEnabled', false))
-      const aiProvider = finalResult?.aiProvider
-        || (aiEnabled ? await getSetting('cloudAi.provider', '') as string : undefined)
-      const aiModel = finalResult?.aiModel
-        || (aiEnabled ? await getSetting('cloudAi.model', '') as string : undefined)
-      return { asrProvider: modelId || 'local', aiProvider, aiModel: aiModel || undefined, ...executionMeta }
-    }
-    return executionMeta
-  }
 
   private computeProcessingTimeoutMs(audioDurationSec: number) {
     return _computeProcessingTimeoutMs(audioDurationSec, this.provider.mode)
@@ -2966,70 +2318,25 @@ export class RecorderOrchestrator {
       contextApplied: result.contextApplied,
     })
 
-    try {
-      const historyEnabled = await getSetting('historyEnabled', true)
-      if (!this.isRunCurrent(runId)) return
-      if (historyEnabled) {
-        // 音频在 stopRecording 时就开始写盘了；这里只等它落定，不再写第二份。
-        const archived = await this.takeArchivedAudio(runId)
-        const recordId = archived?.recordId
-          ?? (Date.now().toString(36) + Math.random().toString(36).slice(2, 6))
-        historyArtifact = { runId, recordId, audioFilePath: archived?.audioFilePath }
-
-        if (this.isRunCanceled(runId)) {
-          await this.discardCanceledHistory(historyArtifact)
-          return
-        }
-        const providerMeta = await this.buildProviderMetadata(result)
-        if (this.isRunCanceled(runId)) {
-          await this.discardCanceledHistory(historyArtifact)
-          return
-        }
-
-        this.pendingHistoryArtifact = historyArtifact
-        await addHistory({
-          id: recordId,
-          timestamp: Date.now(),
-          asrText: result.asrText,
-          llmText: textToPaste,
-          asrMs: result.asrMs,
-          llmMs: result.llmMs,
-          durationSec: wallSec,
-          audioDurationSec: audioDur > 0 ? audioDur : undefined,
-          asrDurationSec: result.durationSec > 0 ? result.durationSec : undefined,
-          charCount: hasText ? textToPaste.length : 0,
-          isEmpty: !hasText,
-          // 区分「ASR 本来就没出字」和「ASR 出了字但后处理把它清空了」——
-          // 后者是我们自己的问题（替换规则/格式化），别让用户以为是没识别到
-          failReason: hasText
-            ? undefined
-            : result.asrText?.trim()
-              ? t('recorder.emptyAfterProcessing')
-              : t('recorder.noTranscript'),
-          failReasonCode: hasText
-            ? undefined
-            : result.asrText?.trim()
-              ? 'empty_after_processing'
-              : 'no_transcript',
-          audioFilePath: historyArtifact.audioFilePath,
-          ...this.buildHistoryMetadata(promptResolution, appContext),
-          ...providerMeta,
-        })
-        if (this.isRunCanceled(runId)) {
-          await this.discardCanceledHistory(historyArtifact)
-          return
-        }
-        void bridge.emit('history-updated')
-      }
-    } catch (error) {
-      if (historyArtifact) await this.discardCanceledHistory(historyArtifact)
-      addRuntimeEvent('warn', 'recorder', 'Failed to write history entry', { error: String(error), runId })
-    }
+    const written = await this.history.writeFinalRun({
+      runId,
+      result,
+      textToPaste,
+      hasText,
+      audioDurationSec: audioDur,
+      wallTimeSec: wallSec,
+      mode: () => this.provider.mode,
+      isRunCurrent: () => this.isRunCurrent(runId),
+      // 与原来一样在写入那一刻才取：promptResolution 为空时会回落到「当前」的那份。
+      metadata: () => this.buildHistoryMetadata(promptResolution, appContext),
+    })
+    if (written.aborted) return
+    historyArtifact = written.artifact
 
     // 历史已经落定；下面是 UI 与文本插入，那些必须归当前代所有。
     if (!this.isRunCurrent(runId)) {
-      if (this.isRunCanceled(runId) && historyArtifact) {
-        await this.discardCanceledHistory(historyArtifact)
+      if (this.history.isRunCanceled(runId) && historyArtifact) {
+        await this.history.discard(historyArtifact)
       }
       return
     }
@@ -3042,7 +2349,7 @@ export class RecorderOrchestrator {
       //     热词回显被判空），说成"没声音"会把用户直接引去查麦克风
       // asrLen / llmLen 只记长度不记内容。
       const asrHadText = Boolean(result.asrText?.trim())
-      const silenceProven = !asrHadText && this.hasSilenceEvidence()
+      const silenceProven = !asrHadText && this.micLevel.hasSilenceEvidence()
       const diagnostic = {
         reason: 'final_empty',
         mode: this.provider.mode,
@@ -3053,7 +2360,7 @@ export class RecorderOrchestrator {
         llmLen: result.llmText?.length ?? 0,
         asrHadText,
         silenceProven,
-        peakAmplitude: Math.round(this.audioStatsPeakAmplitude * 10000) / 10000,
+        peakAmplitude: this.micLevel.roundedPeakAmplitude(),
         runId,
       }
       // 只有「ASR 出了字、被后处理清空」才弹失败卡：那指向用户自己的文本替换规则配错了，
