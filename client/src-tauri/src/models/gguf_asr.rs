@@ -24,6 +24,8 @@ use transcribe_cpp::{
 #[cfg(test)]
 use transcribe_cpp::TimestampKind;
 
+// 生产路径一律走 checked_model_dir（先校验 id 再拼路径），未校验的版本只留给测试。
+#[cfg(test)]
 use super::downloader::model_dir;
 
 /// 已加载的引擎。Session 内部持有 Model 的 Arc，所以重复推理不会重新加载权重。

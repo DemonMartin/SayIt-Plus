@@ -64,7 +64,7 @@ Local recognition ships seven GGUF models, with GPU acceleration when available:
 
 <br>
 
-<img src="docs/images/readme/ai-cleanup-en.png" width="760" alt="AI cleanup settings showing built-in presets and per-app prompt rules">
+<img src="docs/images/readme/ai-cleanup-en.png" width="760" alt="AI cleanup settings showing built-in presets and per-app rules">
 
 *AI cleanup — every built-in preset is editable, and per-app rules can switch presets based on the app you are typing into.*
 
