@@ -4,6 +4,7 @@
 import type { ActiveAppContext, TextContext } from '../../types/appContext'
 import type { ClientRuntimeInfo } from '../../types/appApi'
 import type { AiConfigSnapshot, AiPolicy } from './aiPolicy'
+import type { ClientAiConfig } from './selectionAi'
 
 export type WorkMode = 'server' | 'cloud_api' | 'local'
 
@@ -85,6 +86,8 @@ export interface StartOptions {
    * 这条记录的原因也不能跟着变。
    */
   aiConfig?: AiConfigSnapshot
+  /** Frozen selection-edit credentials for this run only. Never serialize to logs or history. */
+  selectionAiConfig?: ClientAiConfig | null
   systemPrompt?: string
   disableAi?: boolean
   /** 录音未达到该时长时只做识别，不调用 AI。0 / undefined = 不设门槛。 */

@@ -29,6 +29,7 @@ import {
   CONTEXT_SELECTION_EDIT_PROMPT_SETTING_KEY,
   normalizeContextSelectionEditPrompt,
 } from '@/services/contextAware'
+import ContextSelectionModelSetting from './ContextSelectionModelSetting'
 
 /** 语言名一律用该语言自己的写法（English / 简体中文），不做翻译 —— 看不懂当前
  *  界面语言的人，正是靠认出自己的语言名才能切回去的。 */
@@ -377,7 +378,7 @@ export default function GeneralSettingsPage() {
             <div className="flex items-start justify-between gap-4">
               <div className="min-w-0">
                 <div className="flex items-center gap-1.5">
-                  <h2 className="text-lg font-semibold">{t('settings.contextAware.title')}</h2>
+                  <h2 id="context-aware-title" className="text-lg font-semibold">{t('settings.contextAware.title')}</h2>
                   <Tooltip
                     variant="light"
                     content={(
@@ -407,8 +408,9 @@ export default function GeneralSettingsPage() {
                   {t('settings.contextAware.editPrompt')}
                 </button>
               </div>
-              <Switch checked={contextAwareWriting} onChange={() => void toggleContextAwareWriting()} noAnimation={!animate} hidden={!ready} />
+              <Switch checked={contextAwareWriting} labelledBy="context-aware-title" onChange={() => void toggleContextAwareWriting()} noAnimation={!animate} hidden={!ready} />
             </div>
+            <ContextSelectionModelSetting />
           </CardContent>
         </Card>
 

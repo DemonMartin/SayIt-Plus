@@ -126,4 +126,5 @@ export async function saveAiProfiles(state: AiProfileState): Promise<void> {
     setSetting(AI_ACTIVE_PROFILE_KEY, active?.id ?? ''),
   ])
   await syncRuntimeActive(active)
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('ai-profiles-changed'))
 }

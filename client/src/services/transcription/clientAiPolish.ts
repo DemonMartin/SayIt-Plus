@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { addRuntimeEvent, AI_EVENT_REQUEST, AI_LOG_SOURCE } from '../debugLog'
 import { getSetting } from '../store'
+import type { ClientAiConfig } from './selectionAi'
 import {
   resolveAndLogAiOutcome,
   type AiEvidence,
@@ -15,13 +16,6 @@ interface AiResult {
 }
 
 const CLIENT_AI_TIMEOUT_MS = 8_000
-
-interface ClientAiConfig {
-  provider: string
-  apiUrl: string
-  apiKey: string
-  model: string
-}
 
 export interface ClientAiPolishResult {
   llmText: string
@@ -129,7 +123,7 @@ export async function polishWithClientAi(
     return toResult(policy, {}, options)
   }
 
-  const config = await loadClientAiConfig()
+  const config = startOptions?.selectionAiConfig ?? await loadClientAiConfig()
   if (!isCurrent()) return null
 
   if (!isClientAiConfigComplete(config)) {
