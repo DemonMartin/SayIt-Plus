@@ -3,6 +3,7 @@ import { startCapture, stopCapture } from '../audio'
 import { getProvider, MID_SESSION_DISCONNECT_ERROR, type TranscriptionProvider, type TranscriptionCallbacks, type FinalResult } from '../transcription'
 import { resolveAiPolicy, serverShouldPolish, type AiConfigSnapshot } from '../transcription/aiPolicy'
 import { getRuntimeServerAiSource } from '../transcription/serverAiSource'
+import { loadSelectionAiConfig } from '../transcription/selectionAi'
 import { isStreamingDisplayReady, resolveAsrDisplayModel } from '@/lib/asrModels'
 import {
   addHistory,
@@ -2101,11 +2102,14 @@ export class RecorderOrchestrator {
 
     // 冻结本次的 AI 配置。理由是事后解释：用户录完之后改了设置（这次排查里他就把
     // 门槛从 60 改成了 0），这一条的原因也不能跟着变。
+    const selectionAiConfig = this.cachedAiEnabled ? await loadSelectionAiConfig(textContext) : null
+    if (!this.isRunCurrent(runId)) return
     this.currentAiConfig = {
       workMode: this.provider.mode,
       aiEnabled: this.cachedAiEnabled,
       aiMinDurationSec: this.cachedAiMinDurationSec,
       serverAiSource: getRuntimeServerAiSource(),
+      selectionAiOverride: Boolean(selectionAiConfig),
     }
     this.currentOperationId = `${runId}-${Date.now().toString(36)}`
 
@@ -2114,6 +2118,7 @@ export class RecorderOrchestrator {
         runId,
         operationId: this.currentOperationId,
         aiConfig: this.currentAiConfig,
+        selectionAiConfig,
         systemPrompt: this.cachedAiEnabled ? this.currentPromptResolution.systemPrompt : undefined,
         disableAi: !this.cachedAiEnabled,
         aiMinDurationSec: this.cachedAiMinDurationSec,
@@ -2128,6 +2133,7 @@ export class RecorderOrchestrator {
         runId,
         operationId: this.currentOperationId,
         aiConfig: this.currentAiConfig,
+        selectionAiConfig,
         disableAi: !this.cachedAiEnabled,
         aiMinDurationSec: this.cachedAiMinDurationSec,
         clientMeta: this.cachedClientRuntimeInfo,

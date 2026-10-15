@@ -88,6 +88,22 @@ describe('resolveAiPolicy：路由与是否允许调用', () => {
 })
 
 describe('serverShouldPolish：压成线上那个布尔', () => {
+  it.each(['local', 'cloud_api', 'server'] as const)('routes a separate selection model through client AI in %s mode', (workMode) => {
+    const result = policy({ workMode, selectionAiOverride: true, integratedAsr: true })
+    expect(result).toMatchObject({ route: 'custom', allowCall: true })
+    expect(serverShouldPolish(result)).toBe(false)
+  })
+
+  it('keeps the AI switch and duration threshold when a separate editing model is selected', () => {
+    expect(policy({ selectionAiOverride: true, aiEnabled: false })).toMatchObject({ allowCall: false, reason: 'ai_off' })
+    expect(policy({ selectionAiOverride: true, aiMinDurationSec: 60, audioDurationSec: 1 })).toMatchObject({
+      route: 'custom', allowCall: false, reason: 'duration_below_min',
+    })
+    expect(policyFromSnapshot({ ...SERVER_MANAGED, selectionAiOverride: true }, 'server', 4)).toMatchObject({
+      route: 'custom', allowCall: true,
+    })
+  })
+
   it('只有 managed 且允许调用时才让服务端整理', () => {
     expect(serverShouldPolish(policy())).toBe(true)
     expect(serverShouldPolish(policy({ serverAiSource: 'custom' }))).toBe(false)

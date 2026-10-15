@@ -25,6 +25,7 @@ const SETTINGS_EXPORT_KEYS = [
   'aiEnabled',
   'aiMinDurationSec',
   'contextAwareWritingEnabled',
+  'contextSelectionAiProfileId',
   'hotwordLearning',
   'overlayShowDuration',
   'overlayWaveTheme',

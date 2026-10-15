@@ -618,7 +618,7 @@ export class CloudAPIProvider implements TranscriptionProvider {
       }
 
       // AI 校对（Qwen Omni 已内置 AI，由 policy 判成不允许调用，这里走同一条返回）
-      const polish = isQwenOmni
+      const polish = policy.route === 'integrated_asr'
         ? (() => {
           const outcome = resolveAndLogAiOutcome(outcomeContext, policy)
           return {

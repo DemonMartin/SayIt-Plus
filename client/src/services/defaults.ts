@@ -49,6 +49,7 @@ export const DEFAULTS: Record<string, unknown> = {
   aiMinDurationSec: 0,
   // 读取光标附近文字/选区并交给 AI，用于上下文续写与语音编辑。涉及正文读取，默认关闭。
   contextAwareWritingEnabled: false,
+  contextSelectionAiProfileId: '', // 空字符串 = 选区编辑沿用当前 AI；否则引用已保存的 AI 服务
   aiPromptAppend: '', // 全局附加 prompt
   'ai.builtinPromptLanguage': 'zh-CN', // 内置 Prompt 内容语言；与界面语言相互独立
 
