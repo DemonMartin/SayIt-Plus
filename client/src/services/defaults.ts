@@ -87,6 +87,7 @@ export const DEFAULTS: Record<string, unknown> = {
   // 服务列表：一张卡 = 一份完整配置（供应商 + 该平台凭据），同一家可存多份
   'cloudAsr.profiles': [],
   'cloudAsr.activeProfileId': '',
+  'asr.fallback': { enabled: false, steps: [] },
   // 已经自动补建过哪些服务。刻意不是「迁移完成」那种布尔标记 —— 记「补过谁」才能
   // 既在逻辑修好后自愈，又不把用户主动删掉的卡救回来。
   'cloudAsr.autoCreatedProviders': [],

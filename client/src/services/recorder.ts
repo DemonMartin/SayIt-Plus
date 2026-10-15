@@ -2,7 +2,7 @@ import { RecorderOrchestrator } from './recorder/RecorderOrchestrator'
 import type { RecorderState } from './recorder/types'
 import type { PromptPreset } from './store'
 
-let orchestrator = new RecorderOrchestrator()
+const orchestrator = new RecorderOrchestrator()
 
 // HMR cleanup: dispose old orchestrator when module is hot-replaced
 if ((import.meta as unknown as Record<string, unknown>).hot) {

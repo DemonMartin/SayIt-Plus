@@ -597,7 +597,7 @@ export default function LocalModeSection() {
 
           {selectedModelId && downloadedIds.has(selectedModelId) && (
             <p className="mb-2 text-sm text-muted-foreground">
-              {t('local.currentModel', { name: availableModels.find((m) => m.id === selectedModelId)?.name || selectedModelId })}
+              {t('local.currentModel', { name: localModelDisplayName(availableModels.find((m) => m.id === selectedModelId) || { id: selectedModelId, name: selectedModelId }) })}
             </p>
           )}
           {selectedModelId && !downloadedIds.has(selectedModelId) && listState === 'ready' && (
