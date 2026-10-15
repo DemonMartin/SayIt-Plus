@@ -18,7 +18,7 @@ pub async fn cloud_polish(request: CloudPolishRequest) -> Result<AiResult, Strin
         //
         // ⚠️ 这个清单是白名单：前端 AI_PROVIDERS 里新增一家却漏了这里，用户会拿到
         // 「Unknown AI provider: xxx」，而那句话看不出问题在路由层。两处必须一起改。
-        "openai_compat" | "deepseek" | "doubao" | "qwen" | "mimo" | "groq" | "zhipu" => {
+        "openai_compat" | "deepseek" | "doubao" | "qwen" | "mimo" | "groq" | "zhipu" | "openrouter" => {
             ai_openai_compat::polish(
                 &request.text,
                 config,
@@ -49,7 +49,7 @@ pub async fn test_ai_connection(config: AiProviderConfig) -> Result<TestResult, 
     match config.provider.as_str() {
         // 与 cloud_polish 的清单必须一致：只加一处会出现「测试通了但校对报未知供应商」
         // 或者反过来，两种都很难从错误信息看出是路由问题。
-        "openai_compat" | "deepseek" | "doubao" | "qwen" | "mimo" | "groq" | "zhipu" => {
+        "openai_compat" | "deepseek" | "doubao" | "qwen" | "mimo" | "groq" | "zhipu" | "openrouter" => {
             Ok(ai_openai_compat::test_connection(&config).await)
         }
         "ollama" => Ok(ai_ollama::test_connection(&config).await),
