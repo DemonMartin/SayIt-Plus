@@ -26,6 +26,8 @@ export interface AiProvider {
    */
   label: string
   defaultUrl: string
+  /** A blank URL uses the provider's default when saving. */
+  urlOptional?: boolean
   /** 建议的模型，第一个作为新建时的默认值；同时作为表单里的快速选择 */
   defaultModels: string[]
   /** 不需要 API Key（目前只有本机 Ollama） */
@@ -92,6 +94,7 @@ export const AI_PROVIDERS: AiProvider[] = [
     value: 'openrouter',
     label: 'OpenRouter',
     defaultUrl: 'https://openrouter.ai/api/v1',
+    urlOptional: true,
     defaultModels: ['deepseek/deepseek-v4.1-flash'],
     consoleUrl: 'https://openrouter.ai/settings/keys',
   },

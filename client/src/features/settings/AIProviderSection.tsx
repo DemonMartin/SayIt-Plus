@@ -512,7 +512,7 @@ export default function AIProviderSection() {
 
     const base = {
       provider: draft.provider,
-      apiUrl: draft.apiUrl.trim(),
+      apiUrl: draft.apiUrl.trim() || (draftProvider.urlOptional ? draftProvider.defaultUrl : ''),
       apiKey: draft.apiKey.trim(),
     }
     const urlError = checkApiUrl(base.apiUrl)
@@ -1001,7 +1001,7 @@ export default function AIProviderSection() {
 
             <div>
               <label htmlFor="ai-api-url" className="mb-1 block text-sm text-muted-foreground">
-                {draftProvider.keyless ? t('ai.ollamaUrl') : t('ai.apiUrl')}
+                {draftProvider.urlOptional ? t('ai.apiUrlOptional') : draftProvider.keyless ? t('ai.ollamaUrl') : t('ai.apiUrl')}
               </label>
               <input
                 id="ai-api-url"
@@ -1011,8 +1011,12 @@ export default function AIProviderSection() {
                 onChange={(e) => patchDraft({ apiUrl: e.target.value })}
                 onKeyDown={(e) => { if (e.key === 'Enter') void handleSave(true) }}
                 placeholder={draftProvider.defaultUrl}
+                aria-describedby={draftProvider.urlOptional ? 'ai-api-url-hint' : undefined}
                 className={inputClass}
               />
+              {draftProvider.urlOptional && (
+                <p id="ai-api-url-hint" className="mt-1 text-xs text-muted-foreground">{t('ai.apiUrlOptionalHint')}</p>
+              )}
               {draftUrlError && <FormatHint text={draftUrlError} />}
             </div>
 

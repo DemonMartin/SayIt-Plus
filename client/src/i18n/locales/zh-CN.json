@@ -763,6 +763,8 @@
   "ai.provider": "供应商",
   "ai.ollamaUrl": "Ollama 地址",
   "ai.apiUrl": "API 地址",
+  "ai.apiUrlOptional": "API 地址（可选）",
+  "ai.apiUrlOptionalHint": "留空时使用官方地址。",
   "ai.keyPlaceholder": "粘贴 API Key",
   "ai.keyReused": "已沿用「{provider}」上一份配置的地址和密钥，改个模型名即可。",
   "ai.openConsole": "打开{provider}控制台",
