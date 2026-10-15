@@ -799,6 +799,7 @@
   "aiProvider.mimo": "小米 MiMo",
   "aiProvider.zhipu": "智谱 GLM",
   "aiProvider.openaiCompat": "OpenAI 兼容",
+  "aiProvider.openrouter": "OpenRouter",
   "aiProvider.ollama": "Ollama（本机）",
   "aiProvider.noModel": "未填写模型",
   "aiProvider.keyHasSpace": "密钥里有空格或换行，通常是粘贴时带进了多余字符",

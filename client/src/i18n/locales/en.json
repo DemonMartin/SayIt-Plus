@@ -799,6 +799,7 @@
   "aiProvider.mimo": "Xiaomi MiMo",
   "aiProvider.zhipu": "Zhipu GLM",
   "aiProvider.openaiCompat": "OpenAI-compatible",
+  "aiProvider.openrouter": "OpenRouter",
   "aiProvider.ollama": "Ollama (local)",
   "aiProvider.noModel": "no model set",
   "aiProvider.keyHasSpace": "The key contains a space or line break, usually picked up while pasting",

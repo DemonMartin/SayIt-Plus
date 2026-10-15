@@ -89,6 +89,13 @@ export const AI_PROVIDERS: AiProvider[] = [
     consoleUrl: 'https://console.groq.com/keys',
   },
   {
+    value: 'openrouter',
+    label: 'OpenRouter',
+    defaultUrl: 'https://openrouter.ai/api/v1',
+    defaultModels: ['openai/gpt-4o-mini'],
+    consoleUrl: 'https://openrouter.ai/settings/keys',
+  },
+  {
     value: 'openai_compat',
     get label() { return t('aiProvider.openaiCompat') },
     defaultUrl: 'https://api.openai.com',
