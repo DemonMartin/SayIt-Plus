@@ -22,7 +22,7 @@ export default function GitHubContributors() {
       <h3 id="contributors-heading" className="mb-3 text-sm font-medium">{t('about.contributors')}</h3>
       {!contributors && !failed && (
         <p role="status" className="text-sm text-muted-foreground">
-          <span className="contributors-loading">{t('about.contributorsLoading')}</span>
+          <span className="loading-text">{t('common.loading')}</span>
         </p>
       )}
       {failed && <p role="status" className="text-sm text-muted-foreground">{t('about.contributorsUnavailable')}</p>}

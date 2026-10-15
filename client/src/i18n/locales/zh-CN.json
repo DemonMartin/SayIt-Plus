@@ -161,7 +161,6 @@
   "about.title": "关于",
   "about.contributors": "贡献者",
   "about.contributorOwner": "所有者",
-  "about.contributorsLoading": "加载中",
   "about.contributorsUnavailable": "暂时无法加载贡献者。",
   "about.contributorsOnGitHub": "在 GitHub 查看贡献者",
   "about.tagline": "语音输入，AI 润色",
