@@ -8,6 +8,7 @@ import { RELEASE_HIGHLIGHTS } from '@/features/update/releaseHighlights'
 import appIcon from '@/assets/icon-128.png'
 import { getLocale, t } from '@/i18n'
 import { useT } from '@/i18n/useT'
+import GitHubContributors from '@/components/GitHubContributors'
 
 const currentVersion = __APP_VERSION__
 
@@ -66,7 +67,6 @@ export default function About() {
                 SayIt
               </h2>
               <p className="text-sm text-muted-foreground">{t('about.tagline')}</p>
-              <p className="mt-0.5 text-xs text-muted-foreground/60">by Liu Qianglong & Claude</p>
               <div className="mt-1.5 flex items-center gap-2">
                 {/* 版本号做成和右边 GitHub 图标同一种药丸按钮：点开 releases 页，
                     想看历史版本或某一版改了什么的人第一反应就是点这里的版本号。 */}
@@ -91,6 +91,8 @@ export default function About() {
               </div>
             </div>
           </div>
+
+          <GitHubContributors />
 
           {/* 更新 */}
           <div className="mt-5 border-t border-border pt-5">
