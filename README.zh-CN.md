@@ -264,12 +264,9 @@ cd backend && uvicorn app.main:app --port 8000
 
 欢迎提交 Bug 报告和功能建议！请阅读 [贡献指南](./CONTRIBUTING.md)。
 
-## Contributors
+## 贡献者
 
-<!-- ALL-CONTRIBUTORS-LIST:START -->
-| [<img src="https://github.com/crosswk.png" width="60"><br><sub>crosswk</sub>](https://github.com/crosswk) | [<img src="https://avatars.githubusercontent.com/u/76263028" width="60"><br><sub>Claude (Anthropic)</sub>](https://claude.ai) |
-|:---:|:---:|
-<!-- ALL-CONTRIBUTORS-LIST:END -->
+由 [crosswk](https://github.com/crosswk) 创建和维护，[社区贡献者](https://github.com/crosswk/SayIt/graphs/contributors)共同参与改进。
 
 ## 许可证
 

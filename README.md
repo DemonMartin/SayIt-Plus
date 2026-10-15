@@ -181,10 +181,7 @@ Bug reports, focused pull requests, and feature discussions are welcome. Please 
 
 ## Contributors
 
-<!-- ALL-CONTRIBUTORS-LIST:START -->
-| [<img src="https://github.com/crosswk.png" width="60"><br><sub>crosswk</sub>](https://github.com/crosswk) | [<img src="https://avatars.githubusercontent.com/u/76263028" width="60"><br><sub>Claude (Anthropic)</sub>](https://claude.ai) |
-|:---:|:---:|
-<!-- ALL-CONTRIBUTORS-LIST:END -->
+Created and maintained by [crosswk](https://github.com/crosswk), with contributions from the [community](https://github.com/crosswk/SayIt/graphs/contributors).
 
 ## License
 
