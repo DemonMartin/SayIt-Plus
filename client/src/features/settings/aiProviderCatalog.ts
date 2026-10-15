@@ -92,7 +92,7 @@ export const AI_PROVIDERS: AiProvider[] = [
     value: 'openrouter',
     label: 'OpenRouter',
     defaultUrl: 'https://openrouter.ai/api/v1',
-    defaultModels: ['openai/gpt-4o-mini'],
+    defaultModels: ['deepseek/deepseek-v4.1-flash'],
     consoleUrl: 'https://openrouter.ai/settings/keys',
   },
   {
