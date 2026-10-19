@@ -53,11 +53,11 @@ describe('AI_PROVIDERS 清单', () => {
 describe('地区相关的供应商默认值', () => {
   afterEach(() => setLocale('zh-CN'))
 
-  it('英文界面优先 OpenAI-compatible', () => {
+  it('英文界面优先 OpenRouter', () => {
     setLocale('en')
-    expect(preferredAiProviderValue()).toBe('openai_compat')
-    expect(aiProvidersForDisplay()[0].value).toBe('openai_compat')
-    expect(blankProfile().provider).toBe('openai_compat')
+    expect(preferredAiProviderValue()).toBe('openrouter')
+    expect(aiProvidersForDisplay()[0].value).toBe('openrouter')
+    expect(blankProfile().provider).toBe('openrouter')
   })
 
   it('中文界面保持 DeepSeek 优先', () => {
