@@ -508,7 +508,8 @@ export default function History() {
     if (!record.audioFilePath) return
 
     const bytes = await bridge.readAudioFileBytes(record.audioFilePath)
-    if (!bytes) return
+    // 录音已被保留期清掉或被手动删了。原来这里静默 return，按钮转一下就没下文。
+    if (!bytes) throw new Error(t('record.audioMissing'))
 
     // WAV → PCM（去掉 44 字节文件头）
     const pcmData = bytes.slice(44)

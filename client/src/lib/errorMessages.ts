@@ -93,6 +93,11 @@ function decodeError(error: unknown): DecodedError {
     : { code: null, text }
 }
 
+/** 去掉 `sayit_error:<code>:` 协议前缀后的原始说明，给只需要「原样告诉用户哪里错了」的地方用。 */
+export function errorDetailText(error: unknown): string {
+  return decodeError(error).text
+}
+
 /**
  * 从各种异常文本里抠出 HTTP 状态码（`HTTP 401` / `status: 403` / `http=403` / `(404)`）。
  *
