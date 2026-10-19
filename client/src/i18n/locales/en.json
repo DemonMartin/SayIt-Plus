@@ -793,6 +793,8 @@
   "ai.provider": "Provider",
   "ai.ollamaUrl": "Ollama URL",
   "ai.apiUrl": "API URL",
+  "ai.apiUrlOptional": "API URL (optional)",
+  "ai.apiUrlOptionalHint": "Leave blank to use the official endpoint.",
   "ai.keyPlaceholder": "Paste your API key",
   "ai.keyReused": "Reusing the URL and key from your previous {provider} config. Change the model as needed.",
   "ai.openConsole": "Open the {provider} console",
