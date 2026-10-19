@@ -3,6 +3,7 @@ import { startCapture, stopCapture } from '../audio'
 import { getProvider, MID_SESSION_DISCONNECT_ERROR, type TranscriptionProvider, type TranscriptionCallbacks, type FinalResult } from '../transcription'
 import { resolveAiPolicy, serverShouldPolish, type AiConfigSnapshot } from '../transcription/aiPolicy'
 import { getRuntimeServerAiSource } from '../transcription/serverAiSource'
+import { loadSelectionAiConfig } from '../transcription/selectionAi'
 import { isStreamingDisplayReady } from '@/lib/asrModels'
 import {
   getActivePresetId,
@@ -1577,6 +1578,14 @@ export class RecorderOrchestrator {
     }
     this.run.currentOperationId = `${runId}-${Date.now().toString(36)}`
 
+    // 选区编辑单独选了模型时，这次录音改由本机用那个模型整理（见 selectionAi.ts）。
+    // 读设置放进下面和建连、开麦并行的那一组里，不在这里 await：这一段处在
+    // startRecordingLock 置位之后、外层兜底之外，多一个 await 就多一处让热键卡死的
+    // 可能，开始录音也会慢一拍。没有选区时它不读设置，直接返回 null。
+    const selectionAiConfigPromise = this.settings.aiEnabled
+      ? loadSelectionAiConfig(textContext)
+      : Promise.resolve(null)
+
     const promptOpts = this.run.currentPromptResolution
       ? {
         runId,
@@ -1613,7 +1622,7 @@ export class RecorderOrchestrator {
     try {
 
       // 并行执行 WebSocket 连接和麦克风采集，减少等待时间
-      const [, captureResult] = await Promise.all([
+      const [, captureResult, selectionAiConfig] = await Promise.all([
         this.provider.connect(this.buildProviderCallbacks()),
         startCapture(
           this.settings.micId || undefined,
@@ -1643,6 +1652,7 @@ export class RecorderOrchestrator {
           },
           this.settings.noiseSuppression,
         ),
+        selectionAiConfigPromise,
       ])
       resolveCaptureReady!()
       if (!this.isRunCurrent(runId)) {
@@ -1650,8 +1660,20 @@ export class RecorderOrchestrator {
         return
       }
 
+      // 冻结的 AI 配置要带上 selectionAiOverride：停止录音时 aiPolicy 靠它判成本机整理，
+      // 服务器模式下才会让服务端只做识别。
+      let startOpts: typeof promptOpts & { selectionAiConfig?: typeof selectionAiConfig } = promptOpts
+      if (selectionAiConfig && this.run.currentAiConfig) {
+        this.run.currentAiConfig = { ...this.run.currentAiConfig, selectionAiOverride: true }
+        startOpts = { ...promptOpts, aiConfig: this.run.currentAiConfig, selectionAiConfig }
+        addRuntimeEvent('info', 'ai', 'Selection edit uses its own AI service', {
+          provider: selectionAiConfig.provider,
+          model: selectionAiConfig.model,
+        })
+      }
+
       // Both WebSocket and mic are ready — send start command
-      const started = this.provider.start(promptOpts)
+      const started = this.provider.start(startOpts)
       if (!started) {
         throw new Error('sendStart failed')
       }

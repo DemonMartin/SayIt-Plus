@@ -162,8 +162,10 @@ export class ServerProvider implements TranscriptionProvider {
   }
 
   start(opts: StartOptions): boolean {
-    // 设置页可在不切换工作模式的情况下改变来源；每次 start 都同步取运行时真值。
-    this.aiSource = getRuntimeServerAiSource()
+    // 选区模型只覆盖本次录音；普通录音沿用开始时冻结的来源或当前运行时设置。
+    this.aiSource = opts.aiConfig?.selectionAiOverride
+      ? 'custom'
+      : opts.aiConfig?.serverAiSource ?? getRuntimeServerAiSource()
     this.activeRunId = opts.runId
     this.activeStartOpts = {
       ...opts,
@@ -179,6 +181,7 @@ export class ServerProvider implements TranscriptionProvider {
         ...opts,
         // 自定义 AI 由本机调用：服务端只做 ASR，也不需要收到 Prompt 或编辑器正文。
         disableAi: true,
+        selectionAiConfig: undefined,
         systemPrompt: undefined,
         textContext: undefined,
       }
@@ -244,6 +247,7 @@ export class ServerProvider implements TranscriptionProvider {
       aiEnabled: snapshot?.aiEnabled ?? !(this.activeStartOpts?.disableAi ?? false),
       aiMinDurationSec: snapshot?.aiMinDurationSec ?? this.activeStartOpts?.aiMinDurationSec ?? 0,
       serverAiSource: snapshot?.serverAiSource ?? this.aiSource,
+      selectionAiOverride: snapshot?.selectionAiOverride,
       audioDurationSec: durationSec,
     })
     this.activePolicy = fallback

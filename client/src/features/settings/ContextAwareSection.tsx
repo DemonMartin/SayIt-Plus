@@ -16,6 +16,7 @@ import {
   normalizeContextSelectionEditPrompt,
 } from '@/services/contextAware'
 import { useT } from '@/i18n/useT'
+import ContextSelectionModelSetting from './ContextSelectionModelSetting'
 
 export default function ContextAwareSection() {
   const t = useT()
@@ -93,7 +94,7 @@ export default function ContextAwareSection() {
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
               <div className="flex items-center gap-1.5">
-                <h2 className={`text-lg font-semibold ${aiEnabled ? '' : 'text-muted-foreground'}`}>{t('settings.contextAware.title')}</h2>
+                <h2 id="context-aware-title" className={`text-lg font-semibold ${aiEnabled ? '' : 'text-muted-foreground'}`}>{t('settings.contextAware.title')}</h2>
                 <Tooltip
                   variant="light"
                   content={(
@@ -133,12 +134,16 @@ export default function ContextAwareSection() {
                 所以开关画成关闭 + 禁用，不显示一个"开着却不生效"的状态；保存的值不动，AI 整理打开后照旧。 */}
             <Switch
               checked={enabled && aiEnabled}
+              labelledBy="context-aware-title"
               onChange={() => void toggle()}
               disabled={!aiEnabled}
               noAnimation={!animate}
               hidden={!ready}
             />
           </div>
+          {/* 只有开关真正生效时才给选模型：关着时录音器不读选区，这个选择不会被用到。
+              ready 之前也不渲染，免得读回已保存值前先闪出一行再消失。 */}
+          {ready && enabled && aiEnabled && <ContextSelectionModelSetting />}
         </CardContent>
       </Card>
 
