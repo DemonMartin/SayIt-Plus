@@ -108,7 +108,8 @@ export function DragHandle({
       role="button"
       tabIndex={0}
       className={cn(
-        'shrink-0 cursor-grab select-none rounded p-1 text-muted-foreground/0 transition-colors',
+        // 平时常显一个很淡的手柄：完全透明时，行首那块空白看着像排版没对齐
+        'shrink-0 cursor-grab select-none rounded p-1 text-muted-foreground/30 transition-colors',
         'group-hover:text-muted-foreground/60 hover:bg-accent hover:text-foreground',
         'focus-visible:text-muted-foreground active:cursor-grabbing',
         className,

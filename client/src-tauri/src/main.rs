@@ -11,6 +11,10 @@ mod context;
 mod inject;
 mod providers;
 mod models;
+mod defaults;
+mod net_policy;
+mod path_guard;
+mod ipc_body;
 
 use storage::Storage;
 use window::WindowState;
@@ -28,9 +32,11 @@ use std::thread;
 // 该参数会抢先自动处理权限请求，使 PermissionRequested 事件不触发，权限停留在 "prompt"，
 // 导致新版 WebView2 隐藏 enumerateDevices 的设备名/deviceId。麦克风授权改由下面的
 // PermissionRequested 处理器负责（显式 Allow → 变为持久 granted → 恢复设备枚举）。
+// 也不要加回 --ignore-certificate-errors：它让所有主机都不校验证书，网络被截获时
+// 识别结果和更新清单都能被换掉。自建服务器的自签名证书改由主窗的
+// ServerCertificateErrorDetected 处理器按地址放行（见 net_policy::cert_error_allowed）。
 const WEBVIEW2_BROWSER_ARGS: &str =
-    "--ignore-certificate-errors \
-     --disable-backgrounding-occluded-windows --disable-renderer-backgrounding \
+    "--disable-backgrounding-occluded-windows --disable-renderer-backgrounding \
      --disable-background-timer-throttling";
 
 fn browser_args_fingerprint(value: &str) -> String {
@@ -145,6 +151,292 @@ fn cleanup_expired_logs(storage: &Storage) {
     }
 }
 
+/// 本地库坏了、已换新库启动时告诉用户：设置和历史看起来全没了，但旧数据在备份文件里。
+/// 用独立线程弹系统对话框，不挡启动（开机自启时也不会卡在这里）。
+fn notify_storage_recovery(recovery: storage::StorageRecovery) {
+    match &recovery {
+        storage::StorageRecovery::MovedAside { backup, error } => {
+            commands::system::write_log_line(&format!("[storage] recovered: moved the unreadable database to {} error={}", backup.display(), error));
+        }
+        storage::StorageRecovery::InMemory { error } => {
+            commands::system::write_log_line(&format!("[storage] recovered: running on an in-memory database error={}", error));
+        }
+    }
+    let zh = matches!(locale::system_ui_lang(), locale::Lang::ZhCn);
+    let text = match &recovery {
+        storage::StorageRecovery::MovedAside { backup, .. } => if zh {
+            format!("SayIt 的本地数据文件损坏，无法读取。\n\n已用全新的数据启动，设置和历史记录暂时为空。\n原文件已保留在：\n{}\n\n如需找回，请把这个文件发给开发者。", backup.display())
+        } else {
+            format!("SayIt could not read its local data file because it is damaged.\n\nIt has started with fresh data, so settings and history are empty for now.\nThe original file was kept at:\n{}\n\nSend this file to the developer if you need it recovered.", backup.display())
+        },
+        storage::StorageRecovery::InMemory { .. } => if zh {
+            "SayIt 无法创建本地数据文件（磁盘已满或没有写入权限）。\n\n本次可以正常使用，但设置和历史记录在退出后不会保存。".to_string()
+        } else {
+            "SayIt could not create its local data file (the disk may be full or not writable).\n\nYou can use it now, but settings and history will not be saved after you quit.".to_string()
+        },
+    };
+    #[cfg(target_os = "windows")]
+    thread::spawn(move || {
+        use windows::core::HSTRING;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND};
+        unsafe {
+            MessageBoxW(None, &HSTRING::from(text), &HSTRING::from("SayIt"), MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+        }
+    });
+    #[cfg(not(target_os = "windows"))]
+    let _ = text;
+}
+
+/// 主窗的图标和 WebView2 事件处理器（麦克风权限、证书、渲染进程崩溃）。
+/// 启动时和主窗被重建时都要走一遍。
+fn prepare_main_window(app: &tauri::AppHandle, main_window: &tauri::WebviewWindow) {
+    let ico_bytes = include_bytes!("../icons/icon.ico");
+    if let Ok(icon) = tauri::image::Image::from_bytes(ico_bytes) {
+        let _ = main_window.set_icon(icon);
+    }
+
+    // 麦克风/摄像头权限：--auto-accept-camera-and-microphone-capture 只放行采集，
+    // 不会把权限置为持久 granted，导致新版 WebView2 隐藏 enumerateDevices 的设备名与
+    // deviceId（设置里麦克风列表只剩一个通用项）。挂 PermissionRequested 显式 Allow，
+    // 使权限变为 granted，恢复完整设备枚举与选择。失败仅记录日志、不影响其余功能。
+    #[cfg(target_os = "windows")]
+    {
+        let _ = main_window.with_webview(|webview| {
+            use webview2_com::Microsoft::Web::WebView2::Win32::{
+                COREWEBVIEW2_PERMISSION_KIND_CAMERA,
+                COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
+                COREWEBVIEW2_PERMISSION_STATE_ALLOW,
+            };
+            use webview2_com::PermissionRequestedEventHandler;
+            unsafe {
+                let controller = webview.controller();
+                if let Ok(core) = controller.CoreWebView2() {
+                    let handler = PermissionRequestedEventHandler::create(Box::new(
+                        |_sender, args| {
+                            if let Some(args) = args {
+                                let mut kind = Default::default();
+                                args.PermissionKind(&mut kind)?;
+                                if kind == COREWEBVIEW2_PERMISSION_KIND_MICROPHONE
+                                    || kind == COREWEBVIEW2_PERMISSION_KIND_CAMERA
+                                {
+                                    args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)?;
+                                    log::info!(
+                                        "WebView2 permission allowed: kind={:?}",
+                                        kind
+                                    );
+                                }
+                            }
+                            Ok(())
+                        },
+                    ));
+                    let mut token = Default::default();
+                    match core.add_PermissionRequested(&handler, &mut token) {
+                        Ok(_) => log::info!(
+                            "WebView2 PermissionRequested handler attached"
+                        ),
+                        Err(e) => log::error!(
+                            "failed to attach PermissionRequested handler: {e:?}"
+                        ),
+                    }
+                }
+            }
+        });
+    }
+
+    // 证书错误：只对用户自己填的、非官方的 https 服务器放行（自建 + 自签名证书）。
+    // 2026-10 实测这个事件对 wss:// 同样触发，所以 WebSocket 也走这里。
+    // 每次都从数据库读当前地址：用户改地址后不用重启就生效。
+    // 只挂在主窗上 —— 联网的只有主窗；挂不上（运行时太旧）就退回"一律严格校验"。
+    #[cfg(target_os = "windows")]
+    {
+        let cert_app = app.clone();
+        let _ = main_window.with_webview(move |webview| {
+            use webview2_com::Microsoft::Web::WebView2::Win32::{
+                ICoreWebView2_14,
+                COREWEBVIEW2_SERVER_CERTIFICATE_ERROR_ACTION_ALWAYS_ALLOW,
+            };
+            use webview2_com::ServerCertificateErrorDetectedEventHandler;
+            use windows_core::{Interface, PWSTR};
+            unsafe {
+                let controller = webview.controller();
+                let Ok(core) = controller.CoreWebView2() else { return };
+                // 主窗网页进程崩溃后自动重载。录音、连接、插字调度都跑在这个进程里，
+                // 它一退出就是「托盘还在、热键全没反应、没有任何提示」，以前只能重启 SayIt。
+                // 只处理「已退出」：「无响应」只记日志，导出大量历史这类长任务也会短暂无响应，
+                // 那时重载会把用户正在做的事打断。5 分钟内超过 3 次就不再重载，免得反复崩溃时死循环。
+                // 和证书处理器挂在同一次 with_webview 里：单独再调一次 with_webview 时
+                // 主窗 webview 稳定建不起来（0x80070057，2026-10-12 复现 5 次），原因未查明。
+                {
+                    use webview2_com::Microsoft::Web::WebView2::Win32::{
+                        COREWEBVIEW2_PROCESS_FAILED_KIND, COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
+                        COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE,
+                    };
+                    use webview2_com::ProcessFailedEventHandler;
+                    let handler = ProcessFailedEventHandler::create(Box::new(move |sender, args| {
+                        let Some(args) = args else { return Ok(()) };
+                        let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                        args.ProcessFailedKind(&mut kind)?;
+                        if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED {
+                            let now = chrono::Utc::now().timestamp_millis();
+                            let allowed = window::main_renderer_reload_allowed(now);
+                            commands::system::write_log_line(&format!(
+                                "[main-webview] renderer process exited; reload={}",
+                                allowed
+                            ));
+                            if allowed {
+                                if let Some(sender) = sender {
+                                    sender.Reload()?;
+                                }
+                            }
+                        } else if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE {
+                            commands::system::write_log_line("[main-webview] renderer process is unresponsive");
+                        } else {
+                            commands::system::write_log_line(&format!("[main-webview] process failed kind={:?}", kind));
+                        }
+                        Ok(())
+                    }));
+                    let mut token = Default::default();
+                    match core.add_ProcessFailed(&handler, &mut token) {
+                        Ok(_) => log::info!("[main-webview] ProcessFailed handler attached"),
+                        Err(e) => log::error!("[main-webview] failed to attach ProcessFailed handler: {e:?}"),
+                    }
+                }
+                let core14: ICoreWebView2_14 = match core.cast() {
+                    Ok(value) => value,
+                    Err(e) => {
+                        log::warn!("[cert] ServerCertificateErrorDetected unavailable, self-signed servers will be rejected: {e:?}");
+                        return;
+                    }
+                };
+                let handler = ServerCertificateErrorDetectedEventHandler::create(Box::new(
+                    move |_sender, args| {
+                        let Some(args) = args else { return Ok(()) };
+                        let mut uri = PWSTR::null();
+                        args.RequestUri(&mut uri)?;
+                        let request_uri = webview2_com::take_pwstr(uri);
+                        let storage: tauri::State<Storage> = cert_app.state();
+                        let configured = storage
+                            .get(net_policy::BACKEND_BASE_URL_KEY, None)
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        let host = reqwest::Url::parse(&request_uri)
+                            .ok()
+                            .and_then(|u| u.host_str().map(|h| format!("{}:{}", h, u.port_or_known_default().unwrap_or(0))))
+                            .unwrap_or_default();
+                        if net_policy::cert_error_allowed(&request_uri, &configured) {
+                            args.SetAction(COREWEBVIEW2_SERVER_CERTIFICATE_ERROR_ACTION_ALWAYS_ALLOW)?;
+                            log::info!("[cert] certificate error allowed for the configured server host={host}");
+                        } else {
+                            log::warn!("[cert] certificate error rejected host={host}");
+                        }
+                        Ok(())
+                    },
+                ));
+                let mut token = Default::default();
+                match core14.add_ServerCertificateErrorDetected(&handler, &mut token) {
+                    Ok(_) => log::info!("[cert] ServerCertificateErrorDetected handler attached"),
+                    Err(e) => log::error!("[cert] failed to attach ServerCertificateErrorDetected handler: {e:?}"),
+                }
+            }
+        });
+    }
+}
+
+/// 主窗 webview 建不起来时（`failed to create webview ... 0x80070057`），窗口对象没了，
+/// 托盘和悬浮窗还在，但录音、连接全在主窗网页里 —— 用户看到的是「热键没反应」，没有任何提示。
+/// 2026-10-12 开发期间撞到 7 次（多在 tauri dev 连续重启时），正式版少见但一旦发生就是整个软件失灵。
+///
+/// 启动 5 秒后查一次，坏了就按配置重建一次；重建后还坏就弹窗请用户重启。
+fn spawn_main_window_watchdog(app: tauri::AppHandle, launched_minimized: bool) {
+    thread::spawn(move || {
+        // 只在开发版：设了这个环境变量就在启动后故意毁掉主窗，用来验证下面的重建（真故障没法稳定复现）。
+        if cfg!(debug_assertions) && std::env::var_os("SAYIT_DEBUG_BREAK_MAIN_WINDOW").is_some() {
+            thread::sleep(std::time::Duration::from_secs(2));
+            let break_app = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Some(window) = break_app.get_webview_window("main") {
+                    commands::system::write_log_line("[main-webview] debug: destroying the main window to test recovery");
+                    let _ = window.destroy();
+                }
+            });
+        }
+        for attempt in 1..=2u32 {
+            thread::sleep(std::time::Duration::from_secs(5));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let check_app = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                let _ = tx.send(main_window_is_broken(&check_app));
+            });
+            if !rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or(false) {
+                return;
+            }
+            if attempt == 2 {
+                commands::system::write_log_line("[main-webview] main window is still unavailable after recreating; asking the user to restart");
+                notify_main_window_unavailable();
+                return;
+            }
+            commands::system::write_log_line("[main-webview] main window webview is unavailable; recreating it");
+            let destroy_app = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Some(window) = destroy_app.get_webview_window("main") {
+                    let _ = window.destroy();
+                }
+            });
+            // 等旧窗口的标签真正释放，否则同名重建会报「label already exists」
+            thread::sleep(std::time::Duration::from_millis(800));
+            let build_app = app.clone();
+            let _ = app.run_on_main_thread(move || recreate_main_window(&build_app, launched_minimized));
+        }
+    });
+}
+
+fn main_window_is_broken(app: &tauri::AppHandle) -> bool {
+    match app.get_webview_window("main") {
+        None => true,
+        // 正常窗口这里一定拿得到；建失败的那种是 Err（日志里的 visible=None）
+        Some(window) => window.is_visible().is_err(),
+    }
+}
+
+fn recreate_main_window(app: &tauri::AppHandle, launched_minimized: bool) {
+    let Some(config) = app.config().app.windows.iter().find(|w| w.label == "main").cloned() else {
+        commands::system::write_log_line("[main-webview] no main window in the app config; cannot recreate");
+        return;
+    };
+    match tauri::WebviewWindowBuilder::from_config(app, &config).and_then(|builder| builder.build()) {
+        Ok(window) => {
+            prepare_main_window(app, &window);
+            if launched_minimized {
+                window::set_main_window_memory_low(&window, true);
+            } else {
+                window::show_main_window(&window);
+            }
+            commands::system::write_log_line("[main-webview] main window recreated");
+        }
+        Err(e) => commands::system::write_log_line(&format!("[main-webview] failed to recreate the main window: {e}")),
+    }
+}
+
+fn notify_main_window_unavailable() {
+    let zh = matches!(locale::system_ui_lang(), locale::Lang::ZhCn);
+    let text = if zh {
+        "SayIt 的主界面没能启动，语音输入暂时不可用。\n\n请从托盘图标右键退出 SayIt，再重新打开。如果反复出现，请在设置里提交诊断。"
+    } else {
+        "SayIt's main window failed to start, so voice input is unavailable for now.\n\nPlease quit SayIt from the tray icon and open it again. If this keeps happening, send a diagnostics report from Settings."
+    };
+    #[cfg(target_os = "windows")]
+    thread::spawn(move || {
+        use windows::core::HSTRING;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND};
+        unsafe {
+            MessageBoxW(None, &HSTRING::from(text), &HSTRING::from("SayIt"), MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+        }
+    });
+    #[cfg(not(target_os = "windows"))]
+    let _ = text;
+}
+
 fn main() {
     // Mirror the Rust log facade to sayit.log as well as stderr. This is essential on
     // Windows release builds (`windows_subsystem = "windows"`), where stderr is invisible.
@@ -206,9 +498,8 @@ fn main() {
         .join("logs")
         .join("sayit.log"));
 
-    // Allow self-signed certificates and auto-grant microphone for backend connection (WebView2)
     // This must be set before any WebView2 instance is created.
-    // Also disable Chromium's background tab/window throttling: SayIt keeps a long-lived
+    // Disable Chromium's background tab/window throttling: SayIt keeps a long-lived
     // WebSocket connection alive via a 30s JS heartbeat even when the window is minimized
     // or not focused. Without these flags, WebView2 throttles setInterval timers in the
     // background, delaying the heartbeat well past the server's idle timeout and causing
@@ -236,7 +527,10 @@ fn main() {
         .join("com.sayit.app")
         .join("sayit.db");
 
-    let storage = Storage::new(db_path).expect("failed to initialize SQLite storage");
+    let (storage, storage_recovery) = Storage::open_or_recover(db_path);
+    if let Some(recovery) = storage_recovery {
+        notify_storage_recovery(recovery);
+    }
 
     // One-time migration from Electron app's SQLite database
     if let Err(e) = storage.migrate_from_electron() {
@@ -251,12 +545,11 @@ fn main() {
 
     // Read PTT setting before moving storage into managed state
     let ptt_setting_val = storage.get("shortcutPTT", None);
-    // 兜底键与 storage 种子、前端 defaults.ts 保持一致；绝不能是 Shift（会触发筛选键）
-    let ptt_str = ptt_setting_val.as_str().unwrap_or("ControlRight").to_string();
+    let ptt_str = ptt_setting_val.as_str().unwrap_or(defaults::SHORTCUT_PTT).to_string();
     let hf_setting_val = storage.get("shortcutHandsFree", None);
-    let hf_str = hf_setting_val.as_str().unwrap_or("AltRight").to_string();
+    let hf_str = hf_setting_val.as_str().unwrap_or(defaults::SHORTCUT_HANDS_FREE).to_string();
     let ai_toggle_setting_val = storage.get("shortcutToggleAi", None);
-    let ai_toggle_str = ai_toggle_setting_val.as_str().unwrap_or("").to_string();
+    let ai_toggle_str = ai_toggle_setting_val.as_str().unwrap_or(defaults::SHORTCUT_TOGGLE_AI).to_string();
     log::info!("PTT setting from DB: raw={:?} parsed={:?}", ptt_setting_val, ptt_str);
     log::info!("HF setting from DB: raw={:?} parsed={:?}", hf_setting_val, hf_str);
 
@@ -332,9 +625,7 @@ fn main() {
         // 而是唤起已有窗口，避免两个客户端同时收全局热键、各插一份文本。
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.unminimize();
-                let _ = w.set_focus();
+                window::show_main_window(&w);
                 if args.iter().any(|a| a == "--open-about") {
                     let _ = w.emit("open-about", ());
                 }
@@ -387,66 +678,13 @@ fn main() {
             // 用于自动打开并跳转到关于页，让用户能确认更新已生效。
             let launched_open_about = std::env::args().any(|arg| arg == "--open-about");
             if let Some(main_window) = app.get_webview_window("main") {
-                let ico_bytes = include_bytes!("../icons/icon.ico");
-                if let Ok(icon) = tauri::image::Image::from_bytes(ico_bytes) {
-                    let _ = main_window.set_icon(icon);
-                }
-
-                // 麦克风/摄像头权限：--auto-accept-camera-and-microphone-capture 只放行采集，
-                // 不会把权限置为持久 granted，导致新版 WebView2 隐藏 enumerateDevices 的设备名与
-                // deviceId（设置里麦克风列表只剩一个通用项）。挂 PermissionRequested 显式 Allow，
-                // 使权限变为 granted，恢复完整设备枚举与选择。失败仅记录日志、不影响其余功能。
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = main_window.with_webview(|webview| {
-                        use webview2_com::Microsoft::Web::WebView2::Win32::{
-                            COREWEBVIEW2_PERMISSION_KIND_CAMERA,
-                            COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
-                            COREWEBVIEW2_PERMISSION_STATE_ALLOW,
-                        };
-                        use webview2_com::PermissionRequestedEventHandler;
-                        unsafe {
-                            let controller = webview.controller();
-                            if let Ok(core) = controller.CoreWebView2() {
-                                let handler = PermissionRequestedEventHandler::create(Box::new(
-                                    |_sender, args| {
-                                        if let Some(args) = args {
-                                            let mut kind = Default::default();
-                                            args.PermissionKind(&mut kind)?;
-                                            if kind == COREWEBVIEW2_PERMISSION_KIND_MICROPHONE
-                                                || kind == COREWEBVIEW2_PERMISSION_KIND_CAMERA
-                                            {
-                                                args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)?;
-                                                log::info!(
-                                                    "WebView2 permission allowed: kind={:?}",
-                                                    kind
-                                                );
-                                            }
-                                        }
-                                        Ok(())
-                                    },
-                                ));
-                                let mut token = Default::default();
-                                match core.add_PermissionRequested(&handler, &mut token) {
-                                    Ok(_) => log::info!(
-                                        "WebView2 PermissionRequested handler attached"
-                                    ),
-                                    Err(e) => log::error!(
-                                        "failed to attach PermissionRequested handler: {e:?}"
-                                    ),
-                                }
-                            }
-                        }
-                    });
-                }
+                prepare_main_window(app.handle(), &main_window);
 
                 if !launched_minimized {
                     // show() 只清 SW_HIDE，不解除最小化（iconic）状态：窗口若以
                     // 最小化状态诞生，只 show 会停在 -32000 的停车位上，看起来"没启动"。
                     // 托盘/单实例路径都是 show + unminimize，这里保持一致。
-                    let _ = main_window.show();
-                    let _ = main_window.unminimize();
-                    let _ = main_window.set_focus();
+                    window::show_main_window(&main_window);
                     log::info!(
                         "Main window shown (minimized={:?} visible={:?})",
                         main_window.is_minimized().ok(),
@@ -454,11 +692,13 @@ fn main() {
                     );
                 } else {
                     log::info!("Launched with --minimized, staying hidden in tray");
+                    window::set_main_window_memory_low(&main_window, true);
                 }
                 if launched_open_about {
                     let _ = main_window.emit("open-about", ());
                 }
             }
+            spawn_main_window_watchdog(app.handle().clone(), launched_minimized);
 
             // 系统托盘图标
             {
@@ -498,9 +738,7 @@ fn main() {
                                 MouseButton::Left => {
                                     commands::tray::hide_tray_menu(tray.app_handle().clone());
                                     if let Some(w) = tray.app_handle().get_webview_window("main") {
-                                        let _ = w.show();
-                                        let _ = w.unminimize();
-                                        let _ = w.set_focus();
+                                        window::show_main_window(&w);
                                     }
                                 }
                                 MouseButton::Right => {
@@ -567,14 +805,11 @@ fn main() {
 
             Ok(())
         })
+        // 前端只用 shell(open) 和 dialog；global-shortcut、autostart 是 Rust 自己在用。
+        // 更新走自己的 download_update / install_downloaded_update（system.rs），不用 updater 插件。
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        // updater plugin disabled until signing keys are generated
-        // .plugin(tauri_plugin_updater::Builder::new().build())
-        // .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
@@ -631,6 +866,9 @@ fn main() {
             // Audio
             commands::audio::save_audio_file,
             commands::audio::save_pcm_as_wav,
+            commands::audio::save_pcm_as_wav_raw,
+            commands::audio::read_audio_file_bytes,
+            commands::audio::save_recording_to_downloads,
             commands::audio::read_audio_file,
             commands::audio::audio_file_exists,
             commands::audio::delete_audio_file,
@@ -668,6 +906,8 @@ fn main() {
             commands::diagnostics::collect_settings,
             commands::diagnostics::get_diagnostics_preview,
             commands::diagnostics::create_diagnostics_zip,
+            commands::diagnostics::create_diagnostics_zip_raw,
+            commands::diagnostics::read_diagnostics_zip_bytes,
             commands::diagnostics::read_diagnostics_zip,
             commands::diagnostics::copy_diagnostics_zip,
             commands::diagnostics::read_log_file,
@@ -675,6 +915,7 @@ fn main() {
             // Providers (cloud ASR / AI)
             providers::registry::cloud_polish,
             providers::registry::cloud_transcribe,
+            providers::registry::cloud_transcribe_raw,
             providers::registry::test_ai_connection,
             providers::registry::test_asr_connection,
             // 「这家 ASR 拿热词做什么」的唯一权威来源。前端不再自己维护一份清单 ——
@@ -718,6 +959,7 @@ fn main() {
             models::registry::get_models_dir,
             models::registry::set_models_dir,
             models::local_asr::local_transcribe,
+            models::local_asr::local_transcribe_raw,
             models::local_asr::preload_local_model,
             models::local_asr::unload_local_model,
             models::local_asr::set_local_model_idle_unload,
@@ -731,7 +973,7 @@ fn main() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     api.prevent_close();
-                    let _ = window.hide();
+                    window::hide_main_window(window);
                 }
             }
         })
@@ -778,6 +1020,14 @@ mod config_tests {
         assert!(
             offenders.is_empty(),
             "WebView2 args must be global; per-window overrides found on: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn webview2_args_keep_certificate_validation() {
+        assert!(
+            !super::WEBVIEW2_BROWSER_ARGS.contains("ignore-certificate-errors"),
+            "certificate errors are handled per host by ServerCertificateErrorDetected; do not disable validation globally"
         );
     }
 }

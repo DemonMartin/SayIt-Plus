@@ -30,7 +30,7 @@ Typing is often the slowest part of working with AI. SayIt turns speech into tex
 
 - **Voice typing anywhere** — dictate into editors, chat apps, browsers, and other Windows software.
 - **Editable AI cleanup** — remove filler words, repair recognition errors, format ideas, or keep a faithful transcript. Every prompt is yours to change.
-- **Context-aware writing** (off by default) — reads the text around your cursor so new dictation matches its tone and terminology. Select text first and your speech becomes an editing instruction—translate, tighten, rewrite, or ask a question—replacing the selection directly. Selection edits use your current AI model by default; choose a separate saved model in Settings → Context awareness. Password fields are skipped.
+- **Context-aware writing** (off by default) — reads the text around your cursor so new dictation matches its tone and terminology. Select text first and your speech becomes an editing instruction—translate, tighten, rewrite, or ask a question—replacing the selection directly. Selection edits use your current AI model by default; choose a separate saved model in AI cleanup → Context awareness. Password fields are skipped.
 - **Flexible speech recognition** — use a cloud ASR provider, run a local GGUF model on your own GPU, connect to the public trial server, or host your own backend.
 - **English and Chinese interface** — the UI follows your system language and can be switched at any time.
 - **Hotwords and per-app rules** — improve names and technical terms, then change cleanup behavior automatically for different apps.
@@ -64,7 +64,7 @@ Local recognition ships seven GGUF models, with GPU acceleration when available:
 
 <br>
 
-<img src="docs/images/readme/ai-cleanup-en.png" width="760" alt="AI cleanup settings showing built-in presets and per-app prompt rules">
+<img src="docs/images/readme/ai-cleanup-en.png" width="760" alt="AI cleanup settings showing built-in presets and per-app rules">
 
 *AI cleanup — every built-in preset is editable, and per-app rules can switch presets based on the app you are typing into.*
 

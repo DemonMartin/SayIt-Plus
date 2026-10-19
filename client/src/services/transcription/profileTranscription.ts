@@ -1,4 +1,3 @@
-import { invoke } from '@tauri-apps/api/core'
 import {
   asrEndpointUrl,
   effectiveAsrCredentials,
@@ -8,8 +7,7 @@ import {
   type AsrProfile,
 } from '@/features/settings/asrProviderCatalog'
 import { buildAsrExtra } from '@/lib/asrModels'
-import { uint8ArrayToBase64 } from '@/lib/encoding'
-import { notifyAsrCapabilityMaybeChanged } from '../bridge'
+import { cloudTranscribeRaw, notifyAsrCapabilityMaybeChanged } from '../bridge'
 import { restoreHotwordSpacing } from '../textPostProcess'
 import { policyFromSnapshot, resolveAndLogAiOutcome } from './aiPolicy'
 import { polishWithClientAi } from './clientAiPolish'
@@ -40,13 +38,10 @@ export async function transcribeWithProfile(
     baseUrl: asrEndpointUrl(profile),
     protocol: profile.protocol,
   })
-  const result = await invoke<{ text: string; elapsed_ms: number }>('cloud_transcribe', {
-    request: {
-      audio_b64: uint8ArrayToBase64(bytes),
-      sample_rate: 16000,
-      asr_config: { provider, api_key: credentials.apiKey, app_id: credentials.appId, extra },
-      hotwords: options.hotwords ?? [],
-    },
+  const result = await cloudTranscribeRaw<{ text: string; elapsed_ms: number }>(bytes, {
+    sample_rate: 16000,
+    asr_config: { provider, api_key: credentials.apiKey, app_id: credentials.appId, extra },
+    hotwords: options.hotwords ?? [],
   })
   notifyAsrCapabilityMaybeChanged()
   if (!isCurrent()) return null

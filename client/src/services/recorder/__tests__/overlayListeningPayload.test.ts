@@ -109,3 +109,93 @@ describe('listening 更新必须始终携带布局判据', () => {
     }
   })
 })
+
+/**
+ * 录音时悬浮窗只该收到约 30 次/秒的更新：PCM 在流动时由波形那一路驱动，
+ * 定时器只在 33ms 内没人发过时补位。原来两路各自 33ms，合起来接近 60 次/秒。
+ */
+describe('listening 更新频率', () => {
+  beforeEach(() => {
+    mocks.updateOverlay.mockClear()
+    mocks.presentOverlay.mockClear()
+    vi.useFakeTimers()
+  })
+
+  it('PCM 流动时定时器不再重复发送', () => {
+    const service = new OverlayService(() => 7)
+    service.startListeningTicker(0)
+    mocks.updateOverlay.mockClear()
+    // 一秒钟：每 8ms 一帧 PCM（AudioWorklet 一个渲染块）
+    for (let t = 0; t < 1000; t += 8) {
+      vi.advanceTimersByTime(8)
+      service.pushListeningBars([3, 5, 8])
+    }
+    const count = mocks.updateOverlay.mock.calls.length
+    expect(count).toBeGreaterThanOrEqual(24)
+    expect(count).toBeLessThanOrEqual(32)
+    service.stopListeningTicker()
+    vi.useRealTimers()
+  })
+
+  it('没有 PCM 时定时器照样推进计时', () => {
+    const service = new OverlayService(() => 7)
+    service.startListeningTicker(0)
+    mocks.updateOverlay.mockClear()
+    vi.advanceTimersByTime(1000)
+    expect(mocks.updateOverlay.mock.calls.length).toBeGreaterThanOrEqual(24)
+    service.stopListeningTicker()
+    vi.useRealTimers()
+  })
+})
+
+/**
+ * 提示音播完必须把 AudioContext 挂起：running 状态的 AudioContext 空闲时也持续耗 CPU，
+ * 正式版从第一次录音起一直多耗约 1.8% 个核（2026-10 实测）。
+ */
+describe('就绪提示音的 AudioContext', () => {
+  class FakeOscillator {
+    onended: (() => void) | null = null
+    frequency = { value: 0 }
+    type = ''
+    connect() {}
+    start() {}
+    stop() {}
+  }
+  class FakeAudioContext {
+    static instances: FakeAudioContext[] = []
+    state: 'running' | 'suspended' | 'closed' = 'running'
+    currentTime = 0
+    destination = {}
+    oscillators: FakeOscillator[] = []
+    suspend = vi.fn(async () => { this.state = 'suspended' })
+    resume = vi.fn(async () => { this.state = 'running' })
+    constructor() { FakeAudioContext.instances.push(this) }
+    createOscillator() { const o = new FakeOscillator(); this.oscillators.push(o); return o }
+    createGain() { return { connect() {}, gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} } } }
+  }
+
+  beforeEach(() => {
+    FakeAudioContext.instances = []
+    vi.stubGlobal('AudioContext', FakeAudioContext)
+  })
+
+  it('播完挂起，下次播放前恢复，只建一个 AudioContext', async () => {
+    const service = new OverlayService(() => 0)
+    service.startListeningTicker(0)
+    service.stopListeningTicker()
+    const ctx = FakeAudioContext.instances[0]
+    expect(ctx).toBeDefined()
+    ctx.oscillators[0].onended?.()
+    expect(ctx.suspend).toHaveBeenCalledTimes(1)
+    expect(ctx.state).toBe('suspended')
+
+    service.startListeningTicker(0)
+    service.stopListeningTicker()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(ctx.resume).toHaveBeenCalledTimes(1)
+    expect(FakeAudioContext.instances).toHaveLength(1)
+    expect(ctx.oscillators).toHaveLength(2)
+    vi.unstubAllGlobals()
+  })
+})

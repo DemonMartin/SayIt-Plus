@@ -1,9 +1,9 @@
 // 文本格式规范开关 — 不依赖 AI 的客户端文本处理
 
 import { useEffect, useRef, useState } from 'react'
-import { HelpCircle } from 'lucide-react'
 import { Switch } from '@/components/ui/switch'
-import { Tooltip } from '@/components/ui/tooltip'
+import { Card, CardContent } from '@/components/ui/card'
+import { InfoTip } from '@/components/ui/info-tip'
 import { cn } from '@/lib/utils'
 import {
   getTextPostProcessOptions,
@@ -102,53 +102,52 @@ export default function TextFormatSection() {
     aiReady && aiEnabled && !APPLIES_WITH_AI[key]
 
   return (
-    <div className="mb-6 rounded-lg border border-border">
-      <div className="border-b border-border px-4 py-3">
+    // 卡片样式与其他页统一（原来是小一号标题 + 分隔线头部，边距也不同）；开关放在右侧，和全软件一致
+    <Card className="mb-6">
+      <CardContent className="p-6">
         <h2 className="text-lg font-semibold">{t('textFormat.title')}</h2>
         {/* 说清生效条件：这几项是"没有 AI 时我们自己做的排版兜底"。开了 AI 整理，
             排版就归 AI 管，置灰的项不生效——两边都做会互相打架。文本替换不在此列，见热词页的「文本替换」。
             AI 开着时换成一句更直接的话，并指出去哪表达同样的诉求（输出约束在 AI 整理页）。 */}
-        <p className="mt-0.5 text-xs text-muted-foreground">
+        <p className="mt-1 text-xs text-muted-foreground">
           {aiReady && aiEnabled ? t('textFormat.descAiOn') : t('textFormat.desc')}
         </p>
-      </div>
-      <div className="divide-y divide-border/60">
+      <div className="mt-2 divide-y divide-border">
         {/* 变量名从 t 改成 def：t 现在是翻译函数，同名会被遮蔽掉 */}
         {TOGGLES.map((def) => {
           const inert = isInert(def.key)
           return (
-            <div key={def.key} className="flex items-center gap-2.5 px-4 py-2.5">
+            <div key={def.key} className="flex items-center justify-between gap-4 py-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <span className={cn('text-sm font-medium', inert && 'text-muted-foreground')}>
+                    {t(def.titleKey)}
+                  </span>
+                  {/* aiNote 只加在"确实会被 AI 接管"的项上；穿透 AI 的项不该声称自己会失效。
+                      AI 已经开着时也不重复——下面那句已经说了。 */}
+                  <InfoTip
+                    content={`${t(def.detailKey)}${!APPLIES_WITH_AI[def.key] && !inert ? t('textFormat.aiNote') : ''}`}
+                    label={t(def.titleKey)}
+                  />
+                </div>
+                {/* 不生效时把说明换成原因，而不是再加一段文字：原因就落在用户此刻正在看的位置。 */}
+                <p className={cn('text-xs', inert ? 'italic text-muted-foreground/70' : 'text-muted-foreground')}>
+                  {inert ? t('textFormat.inertByAi') : t(def.hintKey)}
+                </p>
+              </div>
               <Switch
                 checked={opts[def.key]}
                 onChange={() => toggle(def.key)}
-                size="sm"
                 disabled={inert}
                 noAnimation={!animate}
                 hidden={!ready}
                 className="shrink-0"
               />
-              <span className={cn('shrink-0 text-sm font-medium', inert && 'text-muted-foreground')}>
-                {t(def.titleKey)}
-              </span>
-              <div className="flex min-w-0 flex-1 items-center gap-1.5">
-                {/* 不生效时把行内说明换成原因，而不是再加第四段文字：行高不变，
-                    而且原因就落在用户此刻正在看的位置。 */}
-                <span className={cn('min-w-0 truncate text-xs', inert ? 'italic text-muted-foreground/70' : 'text-muted-foreground')}>
-                  {inert ? t('textFormat.inertByAi') : t(def.hintKey)}
-                </span>
-                {/* aiNote 只加在"确实会被 AI 接管"的项上；穿透 AI 的项不该声称自己会失效。
-                    AI 已经开着时也不重复——行内那句已经说了。 */}
-                <Tooltip
-                  content={`${t(def.detailKey)}${!APPLIES_WITH_AI[def.key] && !inert ? t('textFormat.aiNote') : ''}`}
-                  variant="light"
-                >
-                  <HelpCircle className="h-3.5 w-3.5 shrink-0 cursor-help text-muted-foreground/50 hover:text-muted-foreground" />
-                </Tooltip>
-              </div>
             </div>
           )
         })}
       </div>
-    </div>
+      </CardContent>
+    </Card>
   )
 }

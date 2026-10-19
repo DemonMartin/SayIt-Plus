@@ -35,6 +35,7 @@ client/src-tauri/transcribe-libs/
 # ── Claude Code ──
 CLAUDE.md
 .claude/
+.agents/
 
 # ── Node ──
 node_modules/

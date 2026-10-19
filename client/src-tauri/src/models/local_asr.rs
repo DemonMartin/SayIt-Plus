@@ -17,6 +17,16 @@ use super::gguf_asr;
 /// 采样率固定 16 kHz —— 前端采集就重采样到这个值，引擎也只接受这个值。
 const SR: usize = 16000;
 
+/// 一次交给模型的最长音频。超过就在停顿处切块、逐块识别再拼起来。
+///
+/// 原来是「模型吃得下多长就一次喂多长」（Qwen3-ASR 上限约 87 分钟），结果 220 秒的
+/// 录音在集成显卡上一次跑太久，触发 Windows 显卡看门狗、显卡被重置，之后本地识别
+/// 全部失败（见 local_vad::plan_chunks 的说明）。30 秒：日常口述基本不切、结果与原来
+/// 一致；实测 1.7B 在 Arc 140T 上 30 s 一块约 5 s，单个任务离 2 秒上限很远；
+/// 也正好是 SenseVoice 的上限，那边不再走按固定长度硬切的旧分段。
+/// 代价：块与块之间互相看不到上下文，切口两边的标点、专有名词偶尔会受影响。
+const MAX_CHUNK_SEC: usize = 30;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LocalAsrResult {
     pub text: String,
@@ -55,6 +65,36 @@ pub async fn local_transcribe(
     let samples = decode_pcm(&audio_b64).map_err(|e| {
         crate::providers::diag::fail("local/asr", "decode_pcm", e)
     })?;
+    transcribe_samples(samples, model_id, language, accelerator, gpu_device).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalTranscribeMeta {
+    model_id: String,
+    language: Option<String>,
+    accelerator: Option<String>,
+    gpu_device: Option<String>,
+}
+
+/// 同 local_transcribe，但 PCM 以原始字节发过来（见 ipc_body），省掉网页里的 base64 转码。
+#[tauri::command]
+pub async fn local_transcribe_raw(request: tauri::ipc::Request<'_>) -> Result<LocalAsrResult, String> {
+    let (meta, pcm): (LocalTranscribeMeta, Vec<u8>) = crate::ipc_body::split_framed(&request)?;
+    let samples = pcm
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+        .collect();
+    transcribe_samples(samples, meta.model_id, meta.language, meta.accelerator, meta.gpu_device).await
+}
+
+async fn transcribe_samples(
+    samples: Vec<f32>,
+    model_id: String,
+    language: Option<String>,
+    accelerator: Option<String>,
+    gpu_device: Option<String>,
+) -> Result<LocalAsrResult, String> {
     if samples.is_empty() {
         crate::providers::diag::empty_result("local/asr", "Input audio was empty; model inference was skipped");
         return Ok(LocalAsrResult { text: String::new(), elapsed_ms: 0 });
@@ -75,10 +115,11 @@ pub async fn local_transcribe(
                 model_id, accel, lang, audio_sec
             ),
         );
-        // 先砍掉首尾静音：解码耗时基本与音频长度成正比，两头的空白是纯浪费
-        let trimmed = match super::local_vad::detect_speech_span(&samples, SR) {
-            Ok(Some(span)) => &samples[span],
-            Ok(None) => {
+        // 先砍掉首尾静音：解码耗时基本与音频长度成正比，两头的空白是纯浪费。
+        // 长录音再按停顿切块（MAX_CHUNK_SEC），短录音只有一块，等同于只裁首尾。
+        let segments = match super::local_vad::detect_speech_segments(&samples, SR) {
+            Ok(segments) if !segments.is_empty() => segments,
+            Ok(_) => {
                 // 这是「真的没人说话」，与识别失败要分得清 —— 前端两种都显示
                 // 「未检测到有效声音」，只有日志能区分
                 diag::empty_result(
@@ -100,7 +141,21 @@ pub async fn local_transcribe(
                 ));
             }
         };
-        let text = gguf_asr::transcribe(&model_id, lang, &accel, &gpu, trimmed, SR)
+        let chunks = super::local_vad::plan_chunks(&samples, &segments, MAX_CHUNK_SEC * SR);
+        if chunks.len() > 1 {
+            // 排查「长录音为什么慢 / 切口处丢字」时先看这一行：有它才说明走了切块
+            diag::log(
+                "local/asr",
+                "chunked",
+                &format!(
+                    "audio_sec={:.1} chunks={} longest_sec={:.1}",
+                    audio_sec,
+                    chunks.len(),
+                    chunks.iter().map(|c| c.end - c.start).max().unwrap_or(0) as f64 / SR as f64
+                ),
+            );
+        }
+        let text = transcribe_chunks(&model_id, lang, &accel, &gpu, &samples, &chunks)
             .map_err(|e| diag::fail("local/asr", "transcribe", e))?;
         let elapsed_ms = start.elapsed().as_millis() as u64;
         if text.trim().is_empty() {
@@ -121,6 +176,24 @@ pub async fn local_transcribe(
     .map_err(|e| {
         crate::providers::diag::fail("local/asr", "join", format!("Inference task failed: {}", e))
     })?
+}
+
+/// 逐块识别再按顺序拼接。任何一块失败整次算失败：拼出半段文字插进去，
+/// 比明确报错更难让用户发现少了内容。
+fn transcribe_chunks(
+    model_id: &str,
+    lang: &str,
+    accel: &str,
+    gpu: &str,
+    samples: &[f32],
+    chunks: &[std::ops::Range<usize>],
+) -> Result<String, String> {
+    let mut text = String::new();
+    for chunk in chunks {
+        let part = gguf_asr::transcribe(model_id, lang, accel, gpu, &samples[chunk.clone()], SR)?;
+        gguf_asr::append_segment_text(&mut text, &part);
+    }
+    Ok(text)
 }
 
 #[tauri::command]
@@ -357,6 +430,60 @@ mod tests {
             "VAD 后仍应识别出内容，got {:?}",
             result.text
         );
+        super::super::gguf_asr::unload();
+    }
+
+    /// 220 秒的长录音走真实路径：按停顿切块、逐块上显卡，而不是一次喂整段。
+    ///
+    /// 2026-10-19 一段 220 秒的录音一次喂进 Qwen3-ASR 1.7B，把集成显卡跑到被 Windows
+    /// 看门狗重置（LiveKernelEvent 141）。这条要几十秒、会占满显卡，平时不跑：
+    /// `cargo test --bins long_audio_is_chunked -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn long_audio_is_chunked_and_transcribed_on_gpu() {
+        let model_id = "qwen3-asr-1.7b-gguf";
+        if !super::super::gguf_asr::model_is_downloaded(model_id) {
+            eprintln!("skip: {model_id} 未下载");
+            return;
+        }
+        let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/test_zh.wav");
+        let bytes = std::fs::read(&wav).unwrap();
+        let speech = &bytes[44..];
+        let pause = vec![0u8; SR * 2]; // 1 s 静音，够 VAD 认作停顿
+        let mut pcm_bytes = Vec::new();
+        while pcm_bytes.len() < 220 * SR * 2 {
+            pcm_bytes.extend_from_slice(speech);
+            pcm_bytes.extend_from_slice(&pause);
+        }
+
+        // 判据先钉「切块真的发生了」，再看结果：只断言有文字的话，一次喂整段侥幸没出事也会绿
+        let samples: Vec<f32> = pcm_bytes
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+            .collect();
+        let segments = super::super::local_vad::detect_speech_segments(&samples, SR).unwrap();
+        let chunks = super::super::local_vad::plan_chunks(&samples, &segments, MAX_CHUNK_SEC * SR);
+        assert!(chunks.len() >= 7, "220 s 应切成至少 7 块，实际 {}", chunks.len());
+        assert!(chunks.iter().all(|c| c.end - c.start <= MAX_CHUNK_SEC * SR));
+
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &pcm_bytes);
+        let t0 = std::time::Instant::now();
+        let result = run_local_transcribe(b64, model_id).expect("长录音识别失败");
+        let backend = super::super::gguf_asr::current_backend().unwrap_or_default();
+        eprintln!(
+            "[long-audio] audio={:.1}s chunks={} elapsed={:.1}s chars={} backend={}",
+            samples.len() as f64 / SR as f64,
+            chunks.len(),
+            t0.elapsed().as_secs_f64(),
+            result.text.chars().count(),
+            backend,
+        );
+        assert!(result.text.chars().count() > 200, "长录音识别结果太短：{:?}", result.text);
+        // 机器上有显卡时，必须是在显卡上跑完的：落到 CPU 说明中途出了后端错误
+        let has_gpu = transcribe_cpp::devices().iter().any(|d| d.kind != "cpu");
+        if has_gpu {
+            assert!(!backend.to_lowercase().contains("cpu"), "显卡中途失败、回落到了 CPU：{backend}");
+        }
         super::super::gguf_asr::unload();
     }
 

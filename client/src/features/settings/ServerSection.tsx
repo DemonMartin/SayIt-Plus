@@ -7,6 +7,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Tooltip } from '@/components/ui/tooltip'
 import { Feedback, type FeedbackTone } from '@/components/ui/feedback'
 import { Segmented } from '@/components/ui/segmented'
+import { InfoTip } from '@/components/ui/info-tip'
 import {
   getBackendBaseUrl,
   getDefaultBackendBaseUrl,
@@ -241,8 +242,11 @@ export default function ServerSection() {
         <CardContent className="p-6">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0">
-              <h2 id="server-language-heading" className="text-lg font-semibold">{t('server.languageTitle')}</h2>
-              <p className="mt-2 text-xs text-muted-foreground">{t('server.languageNote')}</p>
+              <div className="flex items-center gap-1.5">
+                <h2 id="server-language-heading" className="text-lg font-semibold">{t('server.languageTitle')}</h2>
+                <InfoTip content={t('server.languageNote')} label={t('server.languageTitle')} />
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">{t('server.languageShortNote')}</p>
             </div>
             <Segmented
               labelledBy="server-language-heading"

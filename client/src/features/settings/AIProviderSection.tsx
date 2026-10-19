@@ -39,6 +39,7 @@ import {
   type ServerAiSource,
 } from '@/services/transcription/serverAiSource'
 import { setEngineDraftDirty } from '@/stores/engineDraft'
+import { useAiEnabled } from '@/hooks/useAiEnabled'
 import { describeProviderError } from '@/lib/errorMessages'
 import {
   aiProvidersForDisplay,
@@ -288,6 +289,17 @@ export default function AIProviderSection() {
   /** 工作模式与来源都读回后才渲染那一段（见 useEffect 里的注释） */
   const [serverAiSourceLoaded, setServerAiSourceLoaded] = useState(false)
   const [isServerMode, setIsServerMode] = useState(false)
+  const aiEnabled = useAiEnabled()
+  /**
+   * 下面这组服务此刻会不会被调用。不会的时候照样能编辑、测速（服务器模式下先调好再切过去是正常用法），
+   * 但要让人一眼看出「选中的那张现在没在用」，否则打着勾的卡片会被当成正在整理文字的那个。
+   * 来源没读回之前按「生效」画，免得本地/云模式的用户看见标记闪一下。
+   */
+  const servicesInactiveReason: 'aiOff' | 'serverManaged' | null = !aiEnabled
+    ? 'aiOff'
+    : serverAiSourceLoaded && isServerMode && serverAiSource === 'managed'
+      ? 'serverManaged'
+      : null
   /** 「测试全部」的进度；null = 没在批量测试 */
   const [batch, setBatch] = useState<{ done: number; total: number } | null>(null)
   /** 批量测试是并发的，所以「正在测哪个」是一组而不是一个 */
@@ -919,9 +931,18 @@ export default function AIProviderSection() {
               <Tooltip variant="light" content={pickAdvice()}>
                 <Info aria-label={t('ai.helpAria')} className={helpIconClass} />
               </Tooltip>
+              {servicesInactiveReason && (
+                <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                  {t('ai.inactiveBadge')}
+                </span>
+              )}
             </div>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              {t('ai.desc')}
+              {servicesInactiveReason === 'aiOff'
+                ? t('ai.inactiveAiOff')
+                : servicesInactiveReason === 'serverManaged'
+                  ? t('ai.inactiveServerManaged')
+                  : t('ai.desc')}
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
@@ -963,7 +984,11 @@ export default function AIProviderSection() {
             <div
               role="radiogroup"
               aria-labelledby="ai-service-heading"
-              className="grid gap-2.5 sm:grid-cols-3"
+              // 未生效时整组调淡；鼠标移上去或键盘聚焦时恢复，表示仍然可以编辑和测试
+              className={cn(
+                'grid gap-2.5 sm:grid-cols-3',
+                servicesInactiveReason && 'opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100',
+              )}
             >
               {profiles.map(renderCard)}
             </div>

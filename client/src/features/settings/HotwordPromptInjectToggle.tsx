@@ -5,10 +5,12 @@ import { useEffect, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
 import { getSetting, setSetting } from '@/services/store'
+import { useAiEnabled } from '@/hooks/useAiEnabled'
 import { useT } from '@/i18n/useT'
 
 export default function HotwordPromptInjectToggle() {
   const t = useT()
+  const aiEnabled = useAiEnabled()
   const [enabled, setEnabled] = useState(false)
   // 读到已保存值之前，开关先隐藏、且不放动画：避免先画出默认值再跳到已保存值（闪一下）。
   // 用 finally 兜底，读取失败也让开关出现（呈默认值），不至于一直隐藏。
@@ -39,12 +41,14 @@ export default function HotwordPromptInjectToggle() {
       <CardContent className="p-6">
         <div className="flex items-center justify-between">
           <div className="pr-4">
-            <h2 className="text-lg font-semibold">{t('hotwordInject.title')}</h2>
+            <h2 className={`text-lg font-semibold ${aiEnabled ? '' : 'text-muted-foreground'}`}>{t('hotwordInject.title')}</h2>
             <p className="mt-1 text-xs text-muted-foreground">
-              {t('hotwordInject.desc')}
+              {aiEnabled ? t('hotwordInject.desc') : t('aiInstructions.requiresAiCleanup')}
             </p>
           </div>
-          <Switch checked={enabled} onChange={toggle} noAnimation={!animate} hidden={!ready} />
+          {/* 热词只注入 AI 整理的提示词，AI 整理关着时这项不生效：画成关闭 + 禁用，
+              不显示"开着却不生效"。保存的值不动，AI 整理打开后照旧。 */}
+          <Switch checked={enabled && aiEnabled} onChange={toggle} disabled={!aiEnabled} noAnimation={!animate} hidden={!ready} />
         </div>
       </CardContent>
     </Card>

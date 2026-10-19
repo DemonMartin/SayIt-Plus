@@ -3,8 +3,10 @@ import { emptyAsrProfile } from '@/features/settings/asrProviderCatalog'
 import { transcribeWithProfile } from '../profileTranscription'
 
 const mocks = vi.hoisted(() => ({ invoke: vi.fn(), polish: vi.fn() }))
-vi.mock('@tauri-apps/api/core', () => ({ invoke: (...args: unknown[]) => mocks.invoke(...args) }))
-vi.mock('../../bridge', () => ({ notifyAsrCapabilityMaybeChanged: vi.fn() }))
+vi.mock('../../bridge', () => ({
+  cloudTranscribeRaw: (...args: unknown[]) => mocks.invoke(...args),
+  notifyAsrCapabilityMaybeChanged: vi.fn(),
+}))
 vi.mock('../../debugLog', () => ({ addRuntimeEvent: vi.fn(), AI_LOG_SOURCE: 'ai', AI_EVENT_OUTCOME: 'outcome' }))
 vi.mock('../clientAiPolish', () => ({ polishWithClientAi: (...args: unknown[]) => mocks.polish(...args) }))
 
@@ -34,8 +36,9 @@ describe('transcribeWithProfile', () => {
       },
       () => true,
     )
-    expect(mocks.invoke).toHaveBeenCalledWith('cloud_transcribe', {
-      request: expect.objectContaining({
+    expect(mocks.invoke).toHaveBeenCalledWith(
+      new Uint8Array(32000),
+      expect.objectContaining({
         sample_rate: 16000,
         hotwords: ['SayIt'],
         asr_config: expect.objectContaining({
@@ -44,7 +47,7 @@ describe('transcribeWithProfile', () => {
           extra: expect.objectContaining({ model: 'my-asr', baseUrl: profile.apiUrl }),
         }),
       }),
-    })
+    )
     expect(result).toMatchObject({ asrText: 'Hello', asrModel: 'my-asr', durationSec: 1 })
     expect(mocks.polish.mock.calls[0][0].policy.allowCall).toBe(false)
   })

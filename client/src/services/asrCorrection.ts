@@ -72,13 +72,6 @@ export function buildCorrectionId(recordId: string): string {
 // 不写返回类型注解：显式写 `Uint8Array` 会退化成 Uint8Array<ArrayBufferLike>，
 // 而 BlobPart 只接受 Uint8Array<ArrayBuffer>，会在 new Blob 那行报类型错。
 // 让它从 new Uint8Array(length) 推断出来正好是对的。
-function base64ToBytes(base64: string) {
-  const binary = atob(base64)
-  const bytes = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
-  return bytes
-}
-
 function messageForCode(code: AsrCorrectionErrorCode, status?: number): string {
   switch (code) {
     case 'audio_missing':
@@ -129,12 +122,11 @@ export async function submitAsrCorrection(
     return { ok: false, code: 'audio_missing', message: messageForCode('audio_missing') }
   }
   // 保留期到了之后 Rust 只删文件不清路径，所以这里必须按"读不到就是没有"处理
-  const base64 = await bridge.readAudioFile(record.audioFilePath).catch(() => null)
-  if (!base64) {
+  const bytes = await bridge.readAudioFileBytes(record.audioFilePath).catch(() => null)
+  if (!bytes) {
     return { ok: false, code: 'audio_missing', message: messageForCode('audio_missing') }
   }
 
-  const bytes = base64ToBytes(base64)
   if (bytes.byteLength > MAX_CORRECTION_AUDIO_BYTES) {
     // 本地先拦一次，别让用户传完 10MB 才看到失败
     return { ok: false, code: 'audio_too_large', message: messageForCode('audio_too_large') }

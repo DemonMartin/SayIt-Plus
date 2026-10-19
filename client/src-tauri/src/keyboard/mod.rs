@@ -50,7 +50,64 @@ pub fn set_shortcut_capture(on: bool) {
     // 若在结束时就清掉，这个“抬起”就会漏给 webview（后退键会导致页面返回）。
     if on {
         CONSUME_XUP_VK.store(0, Ordering::SeqCst);
+        // 录制时可能按侧键，鼠标钩子必须在场才能把它吞掉（见 needs_mouse_hook）。
+        // 钩子只能装在钩子线程上，所以发消息让那边装。
+        #[cfg(windows)]
+        {
+            let tid = HOOK_THREAD_ID.load(Ordering::SeqCst);
+            if tid != 0 {
+                unsafe {
+                    let _ = PostThreadMessageW(tid, WM_SAYIT_NEED_MOUSE_HOOK, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
     }
+}
+
+/// 键盘钩子线程的 id，用来从别的线程让它装上鼠标钩子。0 = 钩子线程没在跑。
+static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+/// 发给钩子线程的私有消息（WM_APP + 0x51）：「现在需要鼠标钩子」。
+#[cfg(windows)]
+const WM_SAYIT_NEED_MOUSE_HOOK: u32 = 0x8000 + 0x51;
+/// 发给钩子线程的私有消息（WM_APP + 0x52）：「钩子可能被系统摘了，重装一遍」。
+#[cfg(windows)]
+const WM_SAYIT_REFRESH_HOOKS: u32 = 0x8000 + 0x52;
+/// 已经因为怀疑被摘而重装过几次（写进 [ptt-watchdog] 日志）。
+static HOOK_REFRESH_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// 低级钩子回调超过 LowLevelHooksTimeout（系统卡顿、休眠唤醒时常见）会被 Windows **静默摘除**，
+/// 不发任何通知；之后热键全部失灵，直到重启 SayIt。
+///
+/// 判据：系统记录的「最后一次输入」比钩子最后一次被调用晚了 5 秒以上，说明有输入没经过我们。
+/// 会误报：没绑鼠标键时不装鼠标钩子，只动鼠标也算输入。误报的代价只是重装一次钩子
+/// （几微秒，在钩子线程里先装新的再卸旧的，中间不会处理任何按键，所以不会漏也不会重复），
+/// 所以宁可多装，每分钟最多一次。
+fn hook_looks_removed(callback_age_ms: i64, input_age_ms: i64) -> bool {
+    callback_age_ms >= 0 && input_age_ms >= 0 && callback_age_ms - input_age_ms > 5_000
+}
+
+/// 系统最后一次输入（键盘或鼠标）距今多少毫秒。
+#[cfg(windows)]
+fn last_input_age_ms() -> Option<i64> {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    unsafe {
+        if !GetLastInputInfo(&mut info).as_bool() {
+            return None;
+        }
+        Some(GetTickCount().wrapping_sub(info.dwTime) as i64)
+    }
+}
+
+/// 鼠标钩子只在用得上时才装：某个热键绑在鼠标键上（侧键 / 中键），或者正在录制快捷键。
+///
+/// 原来它随键盘钩子一直挂着。回调虽然对鼠标移动最先放行，但每次移动仍要经过一次
+/// 跨进程回调，高回报率的游戏鼠标每秒上千次。绝大多数用户根本没绑鼠标键。
+/// 录制时装上的钩子留到下次重配（保存绑定后就会重配）才按绑定重新决定，
+/// 这样捕获到侧键后配对的那个抬起照样能被吞掉（pitfalls #6）。
+fn needs_mouse_hook(ptt: &[u32], hf: &[u32], ai_toggle: &[u32], capturing: bool) -> bool {
+    capturing || ptt.iter().chain(hf).chain(ai_toggle).any(|vk| is_mouse_vk(*vk))
 }
 
 // ── 全局 Esc 动作 ──
@@ -406,9 +463,8 @@ impl PttKeyConfig {
 /// 机器开箱就绑在那个键上（前端也一样，见 services/defaults.ts）。
 /// 右 Ctrl 位置相近、没有辅助功能陷阱，也不和免提的默认键（右 Alt）撞。
 ///
-/// ⚠️ 改这里要同步：src/services/defaults.ts、storage/mod.rs 的种子默认值、
-/// main.rs 读设置时的兜底。
-const DEFAULT_PTT_SETTING: &str = "ControlRight";
+/// 值在 crate::defaults，那里有与前端 defaults.ts 的对账测试。
+const DEFAULT_PTT_SETTING: &str = crate::defaults::SHORTCUT_PTT;
 const DEFAULT_PTT_VK: u32 = 0xA3;
 
 /// 解析向后兼容的 PTT 物理键格式。旧单键仍是单成员；组合成员用 `+` 分隔。
@@ -1183,8 +1239,9 @@ pub fn write_health_snapshot(reason: &str) {
     let max_dur_us = MAX_CALLBACK_DURATION_US.load(Ordering::SeqCst);
     crate::commands::system::write_log_line(&format!(
         "[ptt-watchdog] reason={} hook_running={} dispatcher_alive={} last_callback_age_ms={} \
-         try_send_fail_count={} max_callback_duration_us={}",
+         try_send_fail_count={} max_callback_duration_us={} hook_refreshes={}",
         reason, hook_running, dispatcher_alive, last_cb_age_ms, fail_count, max_dur_us,
+        HOOK_REFRESH_COUNT.load(Ordering::SeqCst),
     ));
 }
 
@@ -1197,8 +1254,35 @@ pub fn spawn_health_watchdog() {
     let _ = thread::Builder::new()
         .name("ptt-watchdog".to_string())
         .spawn(|| {
+            let mut last_refresh_ms: i64 = 0;
+            let mut refresh_logged_at_ms: i64 = 0;
             loop {
-                thread::sleep(std::time::Duration::from_secs(60));
+                // 15 秒查一次：钩子被摘后最多一刻钟内（有输入的前提下）就能装回来。
+                // 采样本身只是几次原子读和一次 GetLastInputInfo。
+                thread::sleep(std::time::Duration::from_secs(15));
+
+                #[cfg(windows)]
+                if HOOK_RUNNING.load(Ordering::SeqCst) && now_ms() - last_refresh_ms >= 60_000 {
+                    let last_cb = LAST_CALLBACK_MS.load(Ordering::SeqCst);
+                    let callback_age = if last_cb == 0 { -1 } else { now_ms() - last_cb };
+                    let tid = HOOK_THREAD_ID.load(Ordering::SeqCst);
+                    if let Some(input_age) = last_input_age_ms() {
+                        if tid != 0 && hook_looks_removed(callback_age, input_age) {
+                            last_refresh_ms = now_ms();
+                            unsafe {
+                                let _ = PostThreadMessageW(tid, WM_SAYIT_REFRESH_HOOKS, WPARAM(0), LPARAM(0));
+                            }
+                            // 只动鼠标时每分钟都会走到这里，日志半小时最多一行。
+                            if now_ms() - refresh_logged_at_ms >= 30 * 60_000 {
+                                refresh_logged_at_ms = now_ms();
+                                crate::commands::system::write_log_line(&format!(
+                                    "[ptt-watchdog] input without hook callback (callback_age_ms={} input_age_ms={}); reinstalling hooks, total refreshes={}",
+                                    callback_age, input_age, HOOK_REFRESH_COUNT.load(Ordering::SeqCst),
+                                ));
+                            }
+                        }
+                    }
+                }
 
                 let hook_running = HOOK_RUNNING.load(Ordering::SeqCst);
                 let dispatcher_alive = DISPATCHER_ALIVE.load(Ordering::SeqCst);
@@ -1252,7 +1336,7 @@ impl KeyboardHookManager {
             "[ptt-lifecycle] start() called ptt_setting={} hf_setting={} ai_toggle_setting={}",
             ptt_setting, hf_setting, ai_toggle_setting,
         ));
-        let has_hook_thread = self.hook_thread.lock().unwrap().is_some();
+        let has_hook_thread = self.hook_thread.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some();
         if self.running.load(Ordering::SeqCst) || has_hook_thread {
             self.stop();
         }
@@ -1298,7 +1382,7 @@ impl KeyboardHookManager {
             app_handle: app.clone(),
         });
 
-        *self.shared_state.lock().unwrap() = Some(state.clone());
+        *self.shared_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(state.clone());
         self.running.store(true, Ordering::SeqCst);
 
         let state_for_thread = state.clone();
@@ -1307,11 +1391,11 @@ impl KeyboardHookManager {
         let hook_thread = thread::spawn(move || {
             Self::hook_thread(state_for_thread, tx);
         });
-        *self.hook_thread.lock().unwrap() = Some(hook_thread);
+        *self.hook_thread.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook_thread);
 
         // Wait for the thread to report its ID
         if let Ok(thread_id) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            *self.hook_thread_id.lock().unwrap() = Some(thread_id);
+            *self.hook_thread_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(thread_id);
             HOOK_RUNNING.store(true, Ordering::SeqCst);
             log::info!("Keyboard hook started, thread_id={}", thread_id);
             crate::commands::system::write_log_line(&format!(
@@ -1336,7 +1420,7 @@ impl KeyboardHookManager {
         // 先清成员位，但不在调用线程清活动代次。hook 线程退出时会在最后一个 callback
         // 完成后，用同一个 sender 依次排入配对 up 和 Shutdown，避免 stop 与 down 入队竞态。
         #[cfg(windows)]
-        if let Some(state) = self.shared_state.lock().unwrap().as_ref() {
+        if let Some(state) = self.shared_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref() {
             let had_active = state.ptt_active_generation.load(Ordering::SeqCst) != 0;
             clear_ptt_members(state);
 
@@ -1364,7 +1448,7 @@ impl KeyboardHookManager {
             }
         }
 
-        if let Some(thread_id) = self.hook_thread_id.lock().unwrap().take() {
+        if let Some(thread_id) = self.hook_thread_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             #[cfg(windows)]
             unsafe {
                 let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
@@ -1373,7 +1457,7 @@ impl KeyboardHookManager {
 
         // 等 hook 线程卸载钩子，并等它内部的 dispatcher 处理 Shutdown 后真正退出。
         // 这是重配的跨实例屏障：旧实例不可能在新实例 ptt-down 之后再发旧 ptt-up。
-        if let Some(hook_thread) = self.hook_thread.lock().unwrap().take() {
+        if let Some(hook_thread) = self.hook_thread.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             if hook_thread.join().is_err() {
                 crate::commands::system::write_log_line(
                     "[ptt-lifecycle] hook thread panicked while stopping",
@@ -1382,12 +1466,12 @@ impl KeyboardHookManager {
         }
 
         #[cfg(windows)]
-        if let Some(state) = self.shared_state.lock().unwrap().as_ref() {
+        if let Some(state) = self.shared_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref() {
             // 安装失败/panic 时 hook 线程可能没机会排 up；至少不要把 native 状态留住。
             clear_ptt_members(state);
             let _ = clear_ptt_press(&state.ptt_active_generation);
         }
-        *self.shared_state.lock().unwrap() = None;
+        *self.shared_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// Reconfigure with new PTT, hands-free, and AI-cleanup settings.
@@ -1405,7 +1489,7 @@ impl KeyboardHookManager {
     /// Set hands-free mode active (suppresses PTT up events temporarily)
     #[allow(dead_code)]
     pub fn set_hands_free(&self, active: bool) {
-        if let Some(state) = self.shared_state.lock().unwrap().as_ref() {
+        if let Some(state) = self.shared_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref() {
             state.hands_free_active.store(active, Ordering::SeqCst);
             if active {
                 clear_ptt_members(state);
@@ -1566,7 +1650,7 @@ impl KeyboardHookManager {
                 }
             };
 
-            let hook = match install_hook() {
+            let mut hook = match install_hook() {
                 Some(h) => h,
                 None => {
                     state.ptt_hook_alive.store(false, Ordering::SeqCst);
@@ -1586,11 +1670,7 @@ impl KeyboardHookManager {
                 }
             };
 
-            // 低级鼠标钩子始终随键盘钩子一起挂上：一是支持侧键做 PTT/免提，二是设置页
-            // 录制侧键时需要靠它在 OS 层把侧键吞掉（否则 webview 会先把侧键当“后退”）。
-            // 它与键盘钩子共用本线程的同一个消息循环；回调对鼠标移动等有最前置的快速放行，
-            // 开销可忽略。只有真正命中侧键（录制捕获 / 已绑为热键）时才会吞事件。
-            let mouse_hook: Option<windows::Win32::UI::WindowsAndMessaging::HHOOK> =
+            let install_mouse_hook = || -> Option<windows::Win32::UI::WindowsAndMessaging::HHOOK> {
                 match SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), None, 0) {
                     Ok(h) => {
                         log::info!("SetWindowsHookExW(WH_MOUSE_LL) succeeded: {:?}", h.0);
@@ -1606,18 +1686,59 @@ impl KeyboardHookManager {
                         ));
                         None
                     }
-                };
+                }
+            };
+            let mut mouse_hook = if needs_mouse_hook(
+                &state.ptt_vk_codes,
+                &state.hf_vk_codes,
+                &state.ai_toggle_vk_codes,
+                SHORTCUT_CAPTURE.load(Ordering::SeqCst),
+            ) {
+                install_mouse_hook()
+            } else {
+                crate::commands::system::write_log_line(
+                    "[ptt-lifecycle] mouse hook not installed (no mouse button is bound)",
+                );
+                None
+            };
 
             let thread_id = GetCurrentThreadId();
             let _ = tx.send(thread_id);
+            HOOK_THREAD_ID.store(thread_id, Ordering::SeqCst);
             log::info!("keyboard hook message loop starting on thread {}", thread_id);
+            // 消息循环开始前录制可能已经打开（那条消息发给了旧线程或还没线程），补一次。
+            if mouse_hook.is_none() && SHORTCUT_CAPTURE.load(Ordering::SeqCst) {
+                mouse_hook = install_mouse_hook();
+            }
 
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                if msg.hwnd.0.is_null() && msg.message == WM_SAYIT_NEED_MOUSE_HOOK {
+                    if mouse_hook.is_none() {
+                        mouse_hook = install_mouse_hook();
+                    }
+                    continue;
+                }
+                if msg.hwnd.0.is_null() && msg.message == WM_SAYIT_REFRESH_HOOKS {
+                    // 先装新的再卸旧的：这段代码跑在消息循环线程上，期间不会处理任何钩子回调。
+                    if let Some(new_hook) = install_hook() {
+                        let _ = UnhookWindowsHookEx(hook);
+                        hook = new_hook;
+                    }
+                    if let Some(old_mouse) = mouse_hook {
+                        if let Some(new_mouse) = install_mouse_hook() {
+                            let _ = UnhookWindowsHookEx(old_mouse);
+                            mouse_hook = Some(new_mouse);
+                        }
+                    }
+                    HOOK_REFRESH_COUNT.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
 
+            let _ = HOOK_THREAD_ID.compare_exchange(thread_id, 0, Ordering::SeqCst, Ordering::SeqCst);
             log::info!("keyboard hook message loop exited");
             let _ = UnhookWindowsHookEx(hook);
             if let Some(mh) = mouse_hook {
@@ -2269,7 +2390,7 @@ mod tests {
         press_ptt_member, ptt_key_config, release_ptt_member, set_card_hotkeys,
         set_escape_action_mode, should_consume_combo_main_down, single_key_requires_bare_press,
         CARD_HOTKEY_COPY, CARD_HOTKEY_DEADLINE_MS, CARD_HOTKEY_FOREGROUND, DEFAULT_PTT_SETTING,
-        DEFAULT_PTT_VK, SINGLE_KEY_TABLE,
+        DEFAULT_PTT_VK, SINGLE_KEY_TABLE, needs_mouse_hook, hook_looks_removed,
     };
     #[cfg(windows)]
     use super::queue_ptt_release;
@@ -2513,6 +2634,32 @@ mod tests {
         assert_eq!(active_generation.load(Ordering::SeqCst), active_gen);
         assert_eq!(claim_ptt_release(&active_generation, Some(active_gen)), Some(active_gen));
         assert!(complete_ptt_release(&active_generation, active_gen));
+    }
+
+    #[test]
+    fn hook_removal_is_suspected_only_when_input_outran_the_callback() {
+        // 按键刚经过钩子：回调和输入一样新
+        assert!(!hook_looks_removed(1_000, 1_000));
+        // 用户已经很久没动：两边差不多一样旧
+        assert!(!hook_looks_removed(600_000, 598_000));
+        // 很久没按键、10 秒前动了下鼠标：也会判成可疑（没装鼠标钩子时的已知误报，代价只是重装一次）
+        assert!(hook_looks_removed(600_000, 590_000));
+        // 2 分钟没回调，但 3 秒前有输入：可能被摘了
+        assert!(hook_looks_removed(120_000, 3_000));
+        // 差距在 5 秒以内不算
+        assert!(!hook_looks_removed(8_000, 4_000));
+        // 还没收到过任何回调（-1）时不判
+        assert!(!hook_looks_removed(-1, 0));
+    }
+
+    #[test]
+    fn mouse_hook_is_only_needed_for_mouse_bindings_or_capture() {
+        let keyboard = [0xA3u32];
+        assert!(!needs_mouse_hook(&keyboard, &[0xA5], &[], false));
+        assert!(needs_mouse_hook(&keyboard, &[0xA5], &[], true));
+        assert!(needs_mouse_hook(&[0x05], &[0xA5], &[], false));
+        assert!(needs_mouse_hook(&keyboard, &[0x06], &[], false));
+        assert!(needs_mouse_hook(&keyboard, &[], &[0x04], false));
     }
 
     /// 鼠标按键清单必须与 `is_mouse_vk` 保持一致。

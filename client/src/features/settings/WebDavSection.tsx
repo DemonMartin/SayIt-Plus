@@ -40,6 +40,7 @@ import { getSetting, setSetting } from '@/services/store'
 import { restartApp } from '@/services/backup'
 import {
   describeWebDavError,
+  webDavErrorDetail,
   listWebDavBackups,
   onWebDavBackupProgress,
   restoreWebDavBackup,
@@ -431,6 +432,12 @@ export default function WebDavSection() {
               {!uploading && lastResult && !lastResult.ok && (
                 <p className="mt-1.5 text-[11px] text-destructive">
                   {describeWebDavError(lastResult.error ?? '')}
+                  {/* 翻成中文后原始报错放进「详情」，排查时还能看到 */}
+                  {webDavErrorDetail(lastResult.error ?? '') && (
+                    <Tooltip variant="light" content={webDavErrorDetail(lastResult.error ?? '')}>
+                      <span className="ml-1.5 cursor-help text-muted-foreground underline underline-offset-2">{t('webdav.errorDetail')}</span>
+                    </Tooltip>
+                  )}
                 </p>
               )}
 

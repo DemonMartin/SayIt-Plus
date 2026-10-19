@@ -114,6 +114,31 @@ fn looks_like_wrong_route(error: &str) -> bool {
         || lower.contains("method not allowed")
 }
 
+/// 这条错误像不像「密钥/权限被拒」。
+///
+/// 用处只有一个：对话接口第二次尝试（data URL）失败后，决定还要不要试标准格式。
+/// 认证失败与音频形态无关，再试只会把整段录音多传一遍。判据同样故意窄 ——
+/// 误判成认证失败会让本该成功的第三种格式没机会试；漏判只是多一次请求。
+/// 状态码只认 `http=401`（diag::http_summary 的形状）和两边带空格的写法，
+/// 免得追踪 ID 里恰好有 "401" 被误判。
+fn looks_like_auth_failure(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    [
+        "http=401",
+        "http=403",
+        " 401 ",
+        " 403 ",
+        "unauthorized",
+        "invalid api key",
+        "invalid_api_key",
+        "incorrect api key",
+        "permission denied",
+        "permission_denied",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 async fn run(
     provider: &str,
     audio_pcm_b64: &str,
@@ -175,6 +200,26 @@ pub async fn transcribe(
             Ok(result)
         }
         Err(second_error) => {
+            // 密钥错就别再试第三种：同一地址同一把钥匙，换个音频形态照样被拒，
+            // 而失败不进缓存 —— 不拦的话每次口述都要把整段录音多传一遍。
+            if looks_like_auth_failure(&second_error) {
+                // 两边都失败：报**更可能是真正原因**的那一条。第一条像「路由不存在」
+                // 而第二条不像，说明协议其实是 chat、错在别处（密钥、模型名），
+                // 那就报第二条；否则报第一条。
+                let show_second =
+                    looks_like_wrong_route(&first_error) && !looks_like_wrong_route(&second_error);
+                diag::log(
+                    SCOPE,
+                    "auth_failed",
+                    &format!(
+                        "reporting={} chat_standard=skipped transcriptions_error={} chat_error={}",
+                        if show_second { "chat" } else { "transcriptions" },
+                        diag::truncate(&first_error, 200),
+                        diag::truncate(&second_error, 200),
+                    ),
+                );
+                return Err(if show_second { second_error } else { first_error });
+            }
             // 百炼 data URL 不一定能被兼容网关解析；换标准 OpenAI 对象再试一次。
             match run(AS_CHAT_STANDARD, audio_pcm_b64, sample_rate, config, hotwords).await {
                 Ok(result) => {
@@ -185,15 +230,31 @@ pub async fn transcribe(
                 Err(standard_error) => {
                     // 优先反馈标准格式的真实错误；但别用它的 404
                     // 覆盖另一个协议更具体的报错。
-                    let error = if !looks_like_wrong_route(&standard_error) {
-                        standard_error
+                    let reporting = if !looks_like_wrong_route(&standard_error) {
+                        "chat_standard"
                     } else if !looks_like_wrong_route(&second_error) {
-                        second_error
+                        "chat"
                     } else {
-                        first_error
+                        "transcriptions"
                     };
-                    diag::log(SCOPE, "all_failed", &format!("error={}", diag::truncate(&error, 200)));
-                    Err(error)
+                    // 三条错误都要留：只记选中的那条，就看不出另外两条协议是怎么挂的。
+                    diag::log(
+                        SCOPE,
+                        "all_failed",
+                        &format!(
+                            "reporting={} transcriptions_error={} chat_error={} \
+                             chat_standard_error={}",
+                            reporting,
+                            diag::truncate(&first_error, 200),
+                            diag::truncate(&second_error, 200),
+                            diag::truncate(&standard_error, 200),
+                        ),
+                    );
+                    Err(match reporting {
+                        "chat_standard" => standard_error,
+                        "chat" => second_error,
+                        _ => first_error,
+                    })
                 }
             }
         }
@@ -219,6 +280,20 @@ pub async fn test_connection(config: &AsrProviderConfig) -> TestResult {
     if second.ok {
         remember_protocol(&key, AS_CHAT);
         return labelled(AS_CHAT, second);
+    }
+    // 密钥错不试第三种，报错规则回到两条时的样子（理由同 transcribe）。
+    if looks_like_auth_failure(&second.message) {
+        let show_second =
+            looks_like_wrong_route(&first.message) && !looks_like_wrong_route(&second.message);
+        diag::log(
+            SCOPE,
+            "test_auth_failed",
+            &format!(
+                "reporting={} chat_standard=skipped",
+                if show_second { "chat" } else { "transcriptions" },
+            ),
+        );
+        return if show_second { second } else { first };
     }
     let third = run_test(AS_CHAT_STANDARD, config).await;
     if third.ok {
@@ -340,6 +415,34 @@ mod tests {
         assert!(!looks_like_wrong_route("model not_a_model does not exist"));
         assert!(!looks_like_wrong_route("Transcription error 401 [http=401]: unauthorized"));
         assert!(!looks_like_wrong_route("insufficient balance"));
+    }
+
+    /// 密钥/权限被拒才跳过第三次尝试，其余错误一律照试。
+    #[test]
+    fn auth_failure_detection_catches_rejected_keys() {
+        assert!(looks_like_auth_failure(
+            "Transcription error 401 Unauthorized [http=401]: {\"error\":\"bad key\"}"
+        ));
+        assert!(looks_like_auth_failure("Connection failed 403 Forbidden [http=403]: denied"));
+        assert!(looks_like_auth_failure("Incorrect API key provided: sk-***"));
+        assert!(looks_like_auth_failure(r#"{"error":{"code":"invalid_api_key"}}"#));
+        assert!(looks_like_auth_failure("PERMISSION DENIED: project has no access"));
+
+        assert!(!looks_like_auth_failure("Transcription error 404 [http=404]: not found"));
+        assert!(!looks_like_auth_failure("model not_a_model does not exist"));
+        // 追踪 ID 里恰好带 401 不算
+        assert!(!looks_like_auth_failure("error 500 [http=500 x-request-id=ab401cd]: boom"));
+    }
+
+    /// 促成 chat_standard 的那个场景：Gemini 网关不认 data URL，回 400。
+    /// 它必须继续去试第三种格式，绝不能被当成密钥错跳过。
+    #[test]
+    fn gemini_data_url_rejection_is_not_an_auth_failure() {
+        let gemini = "Transcription error 400 Bad Request [http=400]: \
+            [{\"error\":{\"code\":400,\"message\":\"* GenerateContentRequest.contents: \
+            contents is not specified\\n\",\"status\":\"INVALID_ARGUMENT\"}}]";
+        assert!(!looks_like_auth_failure(gemini));
+        assert!(!looks_like_wrong_route(gemini));
     }
 
     /// 成功信息里要写明走的是哪条协议；失败信息不加料（那会盖住真正的错误）。

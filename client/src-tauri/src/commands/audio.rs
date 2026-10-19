@@ -7,8 +7,28 @@ fn audio_dir() -> PathBuf {
     base.join("com.sayit.app").join("audio")
 }
 
+/// id 会拼进文件名，带 `..\` 就能写到录音目录外面去。
+fn check_record_id(id: &str) -> Result<(), String> {
+    if crate::path_guard::is_record_id(id) {
+        Ok(())
+    } else {
+        Err("Invalid recording id".to_string())
+    }
+}
+
+/// 读、删、判存在只认录音目录里的 .wav。历史记录里的路径会被导入的备份改写，
+/// 不能当成可信输入（见 backup.rs 的 rewrite_audio_path）。
+fn audio_file_in_dir(file_path: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(file_path);
+    if !crate::path_guard::has_extension(&path, &["wav"]) {
+        return None;
+    }
+    crate::path_guard::existing_file_in_dir(&path, &audio_dir())
+}
+
 #[tauri::command]
 pub fn save_audio_file(id: String, wav_base64: String) -> Result<String, String> {
+    check_record_id(&id)?;
     let dir = audio_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
@@ -23,10 +43,29 @@ pub fn save_audio_file(id: String, wav_base64: String) -> Result<String, String>
 /// 避免前端拼 WAV + base64 编码的开销。
 #[tauri::command]
 pub fn save_pcm_as_wav(id: String, pcm_base64: String, sample_rate: Option<u32>) -> Result<String, String> {
+    let pcm = STANDARD.decode(&pcm_base64).map_err(|e| e.to_string())?;
+    write_pcm_wav(&id, &pcm, sample_rate)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavePcmMeta {
+    id: String,
+    sample_rate: Option<u32>,
+}
+
+/// 同 save_pcm_as_wav，但 PCM 以原始字节发过来（见 ipc_body）。录完每次都走这里。
+#[tauri::command]
+pub fn save_pcm_as_wav_raw(request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let (meta, pcm): (SavePcmMeta, Vec<u8>) = crate::ipc_body::split_framed(&request)?;
+    write_pcm_wav(&meta.id, &pcm, meta.sample_rate)
+}
+
+fn write_pcm_wav(id: &str, pcm: &[u8], sample_rate: Option<u32>) -> Result<String, String> {
+    check_record_id(id)?;
     let dir = audio_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let pcm = STANDARD.decode(&pcm_base64).map_err(|e| e.to_string())?;
     let sr = sample_rate.unwrap_or(16000);
     let data_len = pcm.len() as u32;
 
@@ -45,7 +84,7 @@ pub fn save_pcm_as_wav(id: String, pcm_base64: String, sample_rate: Option<u32>)
     wav.extend_from_slice(&16u16.to_le_bytes());   // bits per sample
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_len.to_le_bytes());
-    wav.extend_from_slice(&pcm);
+    wav.extend_from_slice(pcm);
 
     let path = dir.join(format!("{}.wav", id));
     fs::write(&path, &wav).map_err(|e| e.to_string())?;
@@ -60,23 +99,50 @@ pub fn save_pcm_as_wav(id: String, pcm_base64: String, sample_rate: Option<u32>)
 /// 历史列表里每条记录都要判一次。
 #[tauri::command]
 pub fn audio_file_exists(file_path: String) -> bool {
-    !file_path.is_empty() && PathBuf::from(&file_path).is_file()
+    audio_file_in_dir(&file_path).is_some()
 }
 
+/// 目录外的路径按"文件不在"处理，与原来文件缺失时的表现一致，界面显示"录音已不存在"。
 #[tauri::command]
 pub fn read_audio_file(file_path: String) -> Result<Option<String>, String> {
-    let path = PathBuf::from(&file_path);
-    if !path.exists() {
+    let Some(path) = audio_file_in_dir(&file_path) else {
         return Ok(None);
-    }
+    };
     let bytes = fs::read(&path).map_err(|e| e.to_string())?;
     Ok(Some(STANDARD.encode(&bytes)))
 }
 
+/// 同 read_audio_file，但直接返回字节（前端拿到 ArrayBuffer），不转 base64。
+/// 五分钟录音转 base64 是 13 MB 的字符串，前端还要再解一遍；点播放、重新识别、提交纠错都走这里。
+/// 文件不在 / 不在录音目录里时返回空字节。
+#[tauri::command]
+pub fn read_audio_file_bytes(file_path: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = match audio_file_in_dir(&file_path) {
+        Some(path) => fs::read(&path).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// 把一条录音复制到「下载」文件夹。原来是前端读成 base64、再整份发回 Rust 写文件。
+#[tauri::command]
+pub fn save_recording_to_downloads(file_path: String, filename: String) -> Result<String, String> {
+    if !crate::path_guard::is_plain_file_name(&filename, "wav") {
+        return Err("Invalid audio file name".to_string());
+    }
+    let source = audio_file_in_dir(&file_path).ok_or_else(|| "The recording no longer exists".to_string())?;
+    let downloads = dirs::download_dir().ok_or_else(|| "Could not locate the Downloads directory".to_string())?;
+    let dest = downloads.join(&filename);
+    fs::copy(&source, &dest).map_err(|e| format!("Failed to write file: {}", e))?;
+    let path_str = dest.to_string_lossy().to_string();
+    crate::commands::system::write_log_line(&format!("[INFO] [audio] Audio saved to {}", path_str));
+    Ok(path_str)
+}
+
+/// 目录外的路径静默忽略：删除是清理动作，删不到别人的文件就是正确结果。
 #[tauri::command]
 pub fn delete_audio_file(file_path: String) -> Result<(), String> {
-    let path = PathBuf::from(&file_path);
-    if path.exists() {
+    if let Some(path) = audio_file_in_dir(&file_path) {
         fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
     Ok(())

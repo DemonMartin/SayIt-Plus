@@ -25,13 +25,11 @@ pub fn shortcuts_changed(
 ) {
     // Read settings
     let ptt_setting = storage.get("shortcutPTT", None);
-    // 兜底键与 keyboard::DEFAULT_PTT_SETTING、storage 种子、前端 defaults.ts 一致。
-    // 绝不能是 Shift：长按右 Shift 会触发 Windows 筛选键，录音就停不下来了。
-    let ptt_str = ptt_setting.as_str().unwrap_or("ControlRight");
+    let ptt_str = ptt_setting.as_str().unwrap_or(crate::defaults::SHORTCUT_PTT);
     let hf_val = storage.get("shortcutHandsFree", None);
-    let hf_key = hf_val.as_str().unwrap_or("AltRight");
+    let hf_key = hf_val.as_str().unwrap_or(crate::defaults::SHORTCUT_HANDS_FREE);
     let ai_toggle_val = storage.get("shortcutToggleAi", None);
-    let ai_toggle_key = ai_toggle_val.as_str().unwrap_or("");
+    let ai_toggle_key = ai_toggle_val.as_str().unwrap_or(crate::defaults::SHORTCUT_TOGGLE_AI);
 
     // Reconfigure PTT + hands-free + AI cleanup single-key/mouse hook
     hook.reconfigure(&app, ptt_str, hf_key, ai_toggle_key);
@@ -52,7 +50,7 @@ pub fn register_all_global_shortcuts(app: &AppHandle, storage: &Storage) {
 
     // 免提组合键
     let hf_val = storage.get("shortcutHandsFree", None);
-    let hf_key = hf_val.as_str().unwrap_or("AltRight").to_string();
+    let hf_key = hf_val.as_str().unwrap_or(crate::defaults::SHORTCUT_HANDS_FREE).to_string();
     if !hf_key.is_empty() && hf_key.contains('+') {
         if let Err(e) = gs.on_shortcut(hf_key.as_str(), move |app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
@@ -70,7 +68,7 @@ pub fn register_all_global_shortcuts(app: &AppHandle, storage: &Storage) {
 
     // AI 整理开关快捷键。留空即不注册，避免默认占用用户已有组合键。
     let ai_toggle = storage.get("shortcutToggleAi", None);
-    let ai_toggle_key = ai_toggle.as_str().unwrap_or("").to_string();
+    let ai_toggle_key = ai_toggle.as_str().unwrap_or(crate::defaults::SHORTCUT_TOGGLE_AI).to_string();
     if !ai_toggle_key.is_empty() && ai_toggle_key.contains('+') {
         let ai_toggle_for_log = ai_toggle_key.clone();
         if let Err(e) = gs.on_shortcut(ai_toggle_key.as_str(), move |app, _shortcut, event| {
@@ -211,7 +209,7 @@ pub fn set_ptt_lab_config(data: Value, app: AppHandle) -> Result<(), String> {
             }
             LAB_RUNNING.store(false, Ordering::SeqCst);
             LAB_THREAD_ID.store(0, Ordering::SeqCst);
-            *LAB_APP.lock().unwrap() = None;
+            *LAB_APP.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             // Small delay to let old thread exit
             thread::sleep(std::time::Duration::from_millis(100));
             log::info!("[ptt-lab] stopped lab hook");
@@ -227,7 +225,7 @@ pub fn set_ptt_lab_config(data: Value, app: AppHandle) -> Result<(), String> {
             .map(|v| v as u32)
             .unwrap_or(0xA3); // VK_RCONTROL
 
-        *LAB_APP.lock().unwrap() = Some(app.clone());
+        *LAB_APP.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(app.clone());
         LAB_RUNNING.store(true, Ordering::SeqCst);
 
         thread::spawn(move || {

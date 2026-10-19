@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Info } from 'lucide-react'
 import { Feedback } from '@/components/ui/feedback'
+import { Select, type SelectOption } from '@/components/ui/select'
 import { Tooltip } from '@/components/ui/tooltip'
 import { useT } from '@/i18n/useT'
 import { getSetting, setSetting } from '@/services/store'
@@ -14,8 +15,8 @@ export default function ContextSelectionModelSetting() {
   const [profileId, setProfileId] = useState('')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [helpFocused, setHelpFocused] = useState(false)
   const [error, setError] = useState<'load' | 'save' | null>(null)
-  const [infoFocused, setInfoFocused] = useState(false)
   const revision = useRef(0)
   const savingRef = useRef(false)
 
@@ -67,67 +68,70 @@ export default function ContextSelectionModelSetting() {
   }
   const selected = profiles.find((profile) => profile.id === profileId)
   const missing = Boolean(profileId && !selected)
+  const usable = profiles.filter(isProfileComplete)
 
+  // 用应用自己的 Select，不用原生 <select>：原生下拉在 WebView2 里弹的是系统列表，
+  // 宽度跟着最长那一项走（「模型名 · 供应商 · 主机名」很长），会伸出卡片甚至窗口。
+  // 这个组件的列表与触发器同宽，长名字截断，悬停看全称。
+  // 它不支持禁用单项，所以没填齐的服务干脆不列；只有已经选中的那条例外，
+  // 否则触发器上什么都不显示，用户看不出自己选过什么（下面另有警告说明原因）。
+  const options: SelectOption[] = [
+    { value: '', label: t('settings.contextAware.sameModel') },
+    ...(missing ? [{ value: profileId, label: t('settings.contextAware.modelMissingOption') }] : []),
+    ...profiles
+      .filter((profile) => isProfileComplete(profile) || profile.id === profileId)
+      .map((profile) => {
+        const incomplete = isProfileComplete(profile) ? '' : ` · ${t('ai.status.incomplete')}`
+        const hint = `${profileSubtitle(profile)}${incomplete}`
+        return { value: profile.id, label: profileTitle(profile), hint, title: `${profileTitle(profile)} · ${hint}` }
+      }),
+  ]
+
+  // 和卡片标题那一行同一个结构：左边名称 + 一行说明，右边控件。下拉框固定窄宽度，
+  // 列表右对齐往左展开（menuAlign="end"），长模型名不会把控件撑宽。
   return (
-    <div className="mt-4 space-y-3 border-t border-border pt-4">
-      <div className="flex flex-wrap items-center justify-between gap-3 sm:gap-6">
+    <div className="mt-4 border-t border-border pt-4">
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2">
         <div className="flex min-w-0 flex-[1_1_14rem] items-center gap-1.5">
-          <label htmlFor="context-selection-ai-profile" className="text-sm font-medium">
+          <p id="context-selection-ai-label" className="text-sm text-foreground">
             {t('settings.contextAware.model')}
-          </label>
-          <Tooltip
-            variant="light"
-            forceVisible={infoFocused}
-            content={(
-              <div className="w-72 max-w-[calc(100vw-3rem)]">
-                {t('settings.contextAware.modelDesc')}
-              </div>
-            )}
-          >
+          </p>
+          <Tooltip variant="light" content={t('settings.contextAware.modelDesc')} forceVisible={helpFocused}>
             <button
               type="button"
               aria-label={t('settings.helpAria', { label: t('settings.contextAware.model') })}
               aria-describedby="context-selection-ai-help"
-              onFocus={() => setInfoFocused(true)}
-              onBlur={() => setInfoFocused(false)}
-              className="shrink-0 cursor-help rounded-sm text-muted-foreground/50 transition-colors hover:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              onFocus={() => setHelpFocused(true)}
+              onBlur={() => setHelpFocused(false)}
+              className="rounded text-muted-foreground/50 transition-colors hover:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <Info className="h-3.5 w-3.5" aria-hidden />
+              <Info className="h-3.5 w-3.5" aria-hidden="true" />
             </button>
           </Tooltip>
-          <span id="context-selection-ai-help" className="sr-only">
-            {t('settings.contextAware.modelDesc')}
-          </span>
+          <span id="context-selection-ai-help" className="sr-only">{t('settings.contextAware.modelDesc')}</span>
         </div>
-        <select
-          id="context-selection-ai-profile"
-          aria-describedby="context-selection-ai-help"
+        <Select
+          size="sm"
+          menuAlign="end"
+          labelledBy="context-selection-ai-label"
           value={profileId}
           disabled={loading || saving || error === 'load'}
-          onChange={(event) => void save(event.target.value)}
-          className="h-9 w-full min-w-0 max-w-full rounded-md border border-input-border bg-input-bg px-2 text-sm focus:border-input-focus-border disabled:opacity-50 sm:w-64"
-        >
-          <option value="">{t('settings.contextAware.sameModel')}</option>
-          {missing && <option value={profileId}>{t('settings.contextAware.modelMissingOption')}</option>}
-          {profiles.map((profile) => (
-            <option key={profile.id} value={profile.id} disabled={!isProfileComplete(profile)}>
-              {profileTitle(profile)} · {profileSubtitle(profile)}
-              {!isProfileComplete(profile) ? ` — ${t('ai.status.incomplete')}` : ''}
-            </option>
-          ))}
-        </select>
+          onChange={(value) => void save(value)}
+          options={options}
+          className="w-56 shrink-0"
+        />
       </div>
-      {!loading && !profiles.length && !error && (
-        <p className="text-xs text-muted-foreground">{t('settings.contextAware.modelEmpty')}</p>
+      {!loading && !usable.length && !error && (
+        <p className="mt-2 text-xs text-muted-foreground">{t('settings.contextAware.modelEmpty')}</p>
       )}
       {missing && !error && (
-        <Feedback tone="warning" message={t('settings.contextAware.modelMissing')} />
+        <Feedback className="mt-3" tone="warning" message={t('settings.contextAware.modelMissing')} />
       )}
       {selected && !isProfileComplete(selected) && !error && (
-        <Feedback tone="warning" message={t('settings.contextAware.modelIncomplete')} />
+        <Feedback className="mt-3" tone="warning" message={t('settings.contextAware.modelIncomplete')} />
       )}
       {error && (
-        <Feedback tone="error" message={t(error === 'load'
+        <Feedback className="mt-3" tone="error" message={t(error === 'load'
           ? 'settings.contextAware.modelLoadError'
           : 'settings.contextAware.modelSaveError')} />
       )}

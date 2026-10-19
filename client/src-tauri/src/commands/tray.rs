@@ -140,9 +140,7 @@ fn hide_menu(app: &AppHandle) {
 fn show_main(app: &AppHandle) {
     hide_menu(app);
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+        crate::window::show_main_window(&window);
     }
 }
 

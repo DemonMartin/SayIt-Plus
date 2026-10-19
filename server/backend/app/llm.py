@@ -7,6 +7,7 @@ import logging
 import re
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -114,13 +115,13 @@ class LLMEngine:
         try:
             t = time.monotonic()
             if provider == "azure":
-                raw = await self._call_azure(messages)
+                raw, usage = await self._call_azure(messages)
             elif provider == "openai":
-                raw = await self._call_openai(messages)
+                raw, usage = await self._call_openai(messages)
             elif provider == "groq":
-                raw = await self._call_groq(messages)
+                raw, usage = await self._call_groq(messages)
             else:
-                raw = await self._call_ollama(messages)
+                raw, usage = await self._call_ollama(messages)
             ms = int((time.monotonic() - t) * 1000)
 
             result = self._strip_thinking(raw) or text
@@ -137,6 +138,8 @@ class LLMEngine:
             debug = {
                 "provider": provider,
                 "model": model,
+                # guard 按它给润色额度记账（只有数字，不含任何文本）。接口没报用量时按字数估。
+                "usage": usage or self._estimate_usage(messages, raw),
             }
             if self._cfg.debug_llm and not text_context:
                 debug["messages"] = messages
@@ -151,7 +154,10 @@ class LLMEngine:
             return result, ms, debug
         except Exception as e:
             logger.exception("LLM %s failed, returning original", provider)
-            return text, 0, {"error": str(e)}
+            # 失败的调用也按输入估一份用量：请求可能已经计费，而且反复失败也不该能白调。
+            # error 只放异常类型名：llm_debug 会随结果发给客户端，原文里可能有上游服务地址等内部信息。
+            # 客户端和 guard 只看"这个字段有没有值"，类型名满足这个判断；原文在上面那行日志里。
+            return text, 0, {"error": type(e).__name__, "usage": self._estimate_usage(messages, "")}
 
     # ── internals ──
 
@@ -203,7 +209,37 @@ class LLMEngine:
             ).strip()
         return ""
 
-    async def _call_azure(self, messages: list[dict]) -> str:
+    @staticmethod
+    def _extract_usage(data: Any) -> dict | None:
+        """OpenAI 兼容接口报回的 token 用量；没有就返回 None，由调用方按字数估。
+
+        completion_tokens 已经包含推理模型的思考 token（计费也按它算），不用另加。
+        """
+        usage = data.get("usage") if isinstance(data, dict) else None
+        if not isinstance(usage, dict):
+            return None
+        try:
+            inp = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            out = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        except (TypeError, ValueError):
+            return None
+        if inp <= 0 and out <= 0:
+            return None
+        return {"input_tokens": inp, "output_tokens": out, "source": "api"}
+
+    @staticmethod
+    def _estimate_usage(messages: list[dict], output: str) -> dict:
+        """接口没报用量时按字数估：一个字符算一个 token。中文接近，英文偏多，宁可多算。"""
+        def _len(content: Any) -> int:
+            return len(content) if isinstance(content, str) else len(str(content or ""))
+
+        return {
+            "input_tokens": sum(_len(m.get("content")) for m in messages),
+            "output_tokens": len(output or ""),
+            "source": "estimate",
+        }
+
+    async def _call_azure(self, messages: list[dict]) -> tuple[str, dict | None]:
         ep = self._cfg.azure_endpoint.rstrip("/")
         dep = self._cfg.azure_deployment
         ver = self._cfg.azure_api_version
@@ -215,7 +251,8 @@ class LLMEngine:
             timeout=self._cfg.azure_timeout,
         )
         resp.raise_for_status()
-        return self._extract_text(resp.json())
+        data = resp.json()
+        return self._extract_text(data), self._extract_usage(data)
 
     @staticmethod
     def _chat_url(base_url: str) -> str:
@@ -254,7 +291,7 @@ class LLMEngine:
             payload["reasoning_effort"] = self._cfg.openai_reasoning_effort
         return payload
 
-    async def _call_openai(self, messages: list[dict]) -> str:
+    async def _call_openai(self, messages: list[dict]) -> tuple[str, dict | None]:
         url = self._chat_url(self._cfg.openai_base_url)
         resp = await self._client.post(
             url, json=self._openai_payload(messages),
@@ -262,9 +299,10 @@ class LLMEngine:
             timeout=self._cfg.openai_timeout,
         )
         self._raise_for_status(resp)
-        return self._extract_text(resp.json())
+        data = resp.json()
+        return self._extract_text(data), self._extract_usage(data)
 
-    async def _call_groq(self, messages: list[dict]) -> str:
+    async def _call_groq(self, messages: list[dict]) -> tuple[str, dict | None]:
         url = self._chat_url(self._cfg.groq_base_url)
         payload = {"model": self._cfg.groq_model, "temperature": 0.2, "messages": messages}
         resp = await self._client.post(
@@ -274,13 +312,22 @@ class LLMEngine:
             timeout=self._cfg.groq_timeout,
         )
         resp.raise_for_status()
-        return self._extract_text(resp.json())
+        data = resp.json()
+        return self._extract_text(data), self._extract_usage(data)
 
-    async def _call_ollama(self, messages: list[dict]) -> str:
+    async def _call_ollama(self, messages: list[dict]) -> tuple[str, dict | None]:
         combined = "\n\n".join(m["content"] for m in messages)
         payload = {"model": self._cfg.ollama_model, "stream": False, "prompt": combined}
         resp = await self._client.post(
             self._cfg.ollama_url, json=payload, timeout=self._cfg.ollama_timeout,
         )
         resp.raise_for_status()
-        return (resp.json().get("response") or "").strip()
+        data = resp.json()
+        usage = None
+        try:
+            inp, out = int(data.get("prompt_eval_count") or 0), int(data.get("eval_count") or 0)
+            if inp > 0 or out > 0:
+                usage = {"input_tokens": inp, "output_tokens": out, "source": "api"}
+        except (TypeError, ValueError, AttributeError):
+            usage = None
+        return (data.get("response") or "").strip(), usage

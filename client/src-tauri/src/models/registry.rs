@@ -36,61 +36,18 @@ pub fn list_downloaded_models() -> Vec<LocalModelInfo> {
         let mut complete = true;
         let mut actual_size: u64 = 0;
 
-        if model.archive_url.is_some() {
-            // archive 模型：检查目录中的 onnx 文件
-            if model_path.exists() {
-                for entry in std::fs::read_dir(&model_path).into_iter().flatten() {
-                    if let Ok(entry) = entry {
-                        let path = entry.path();
-                        if path.is_file() {
-                            actual_size += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        } else if path.is_dir() {
-                            // 递归计算子目录大小（如 Qwen3-0.6B/）
-                            for sub in std::fs::read_dir(&path).into_iter().flatten().flatten() {
-                                if sub.path().is_file() {
-                                    actual_size += std::fs::metadata(sub.path()).map(|m| m.len()).unwrap_or(0);
-                                }
-                            }
-                        }
-                    }
-                }
-                // 检查关键文件是否存在
-                if model.model_type == "funasr-nano" {
-                    complete = model_path.join("encoder_adaptor.int8.onnx").exists()
-                        && model_path.join("llm.int8.onnx").exists()
-                        && model_path.join("embedding.int8.onnx").exists()
-                        && model_path.join("Qwen3-0.6B").exists();
-                } else if model.model_type == "qwen3-asr" {
-                    complete = model_path.join("conv_frontend.onnx").exists()
-                        && model_path.join("encoder.int8.onnx").exists()
-                        && model_path.join("decoder.int8.onnx").exists()
-                        && model_path.join("tokenizer").exists();
-                } else if model.model_type == "paraformer" {
-                    complete = model_path.join("model.int8.onnx").exists()
-                        && model_path.join("tokens.txt").exists();
-                } else if model.model_type == "fire-red-ctc" {
-                    complete = model_path.join("model.int8.onnx").exists()
-                        && model_path.join("tokens.txt").exists();
-                } else if model.model_type == "fire-red-aed" {
-                    complete = model_path.join("encoder.int8.onnx").exists()
-                        && model_path.join("decoder.int8.onnx").exists()
-                        && model_path.join("tokens.txt").exists();
+        for source in &model.sources {
+            for file in &source.files {
+                let file_path = model_path.join(&file.name);
+                if file_path.exists() {
+                    actual_size += std::fs::metadata(&file_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                } else {
+                    complete = false;
                 }
             }
-        } else {
-            for source in &model.sources {
-                for file in &source.files {
-                    let file_path = model_path.join(&file.name);
-                    if file_path.exists() {
-                        actual_size += std::fs::metadata(&file_path)
-                            .map(|m| m.len())
-                            .unwrap_or(0);
-                    } else {
-                        complete = false;
-                    }
-                }
-                break; // 只检查第一个 source
-            }
+            break; // 只检查第一个 source
         }
 
         if actual_size > 0 {
@@ -124,37 +81,27 @@ pub async fn download_model(
     let dest_dir = downloader::model_dir(&model_id);
     let _download_lease = downloader::acquire_model_path(&dest_dir)?;
 
-    // 如果模型有 archive_url，使用 tar.bz2 下载+解压
-    if let Some(ref archive_url) = model.archive_url {
-        downloader::download_and_extract_tar_bz2(
+    let download_source = model
+        .sources
+        .iter()
+        .find(|s| s.source == source)
+        .or_else(|| model.sources.first())
+        .ok_or_else(|| error_protocol::encode("download_network", format!("Model {} has no available download source", model_id)))?;
+
+    let file_count = download_source.files.len() as u32;
+    for (i, file) in download_source.files.iter().enumerate() {
+        downloader::download_file(
             app.clone(),
             &model_id,
-            archive_url,
+            &file.name,
+            &file.url,
+            file.size_bytes,
+            file.sha256.as_deref(),
+            &dest_dir,
+            (i + 1) as u32,
+            file_count,
         )
         .await?;
-    } else {
-        let download_source = model
-            .sources
-            .iter()
-            .find(|s| s.source == source)
-            .or_else(|| model.sources.first())
-            .ok_or_else(|| error_protocol::encode("download_network", format!("Model {} has no available download source", model_id)))?;
-
-        let file_count = download_source.files.len() as u32;
-        for (i, file) in download_source.files.iter().enumerate() {
-            downloader::download_file(
-                app.clone(),
-                &model_id,
-                &file.name,
-                &file.url,
-                file.size_bytes,
-                file.sha256.as_deref(),
-                &dest_dir,
-                (i + 1) as u32,
-                file_count,
-            )
-            .await?;
-        }
     }
 
     // 写入 meta.json
@@ -162,7 +109,7 @@ pub async fn download_model(
         "id": model.id,
         "name": model.name,
         "model_type": model.model_type,
-        "source": if model.archive_url.is_some() { "archive" } else { &source },
+        "source": &source,
         "downloaded_at": chrono::Utc::now().to_rfc3339(),
     });
     let meta_path = dest_dir.join("meta.json");
@@ -175,7 +122,7 @@ pub async fn download_model(
 /// 删除已下载的模型
 #[tauri::command]
 pub fn delete_model(model_id: String) -> Result<(), String> {
-    let model_path = downloader::model_dir(&model_id);
+    let model_path = downloader::checked_model_dir(&model_id)?;
     let _delete_lease = downloader::acquire_model_path(&model_path)?;
     if model_path.exists() {
         std::fs::remove_dir_all(&model_path)
@@ -337,7 +284,7 @@ pub async fn set_models_dir(
 /// 打开指定模型的存储目录（不存在则创建）
 #[tauri::command]
 pub fn open_model_folder(model_id: String) -> Result<String, String> {
-    let dir = downloader::model_dir(&model_id);
+    let dir = downloader::checked_model_dir(&model_id)?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create directory: {}", e))?;
     let path = dir.to_string_lossy().to_string();
     #[cfg(target_os = "windows")]

@@ -205,6 +205,17 @@ fn build_body(
         AudioPayloadFormat::DataUrl => serde_json::json!(format!("data:audio/wav;base64,{}", data)),
         AudioPayloadFormat::OpenAi => serde_json::json!({ "data": data, "format": "wav" }),
     };
+    // 标准模式的语言只能写进指令：`asr_options` 是百炼私有的顶层字段，严格的网关
+    // （如 Gemini 的 OpenAI 兼容端点）碰到不认识的字段会直接 400。
+    // 测试连接不传语言，所以这条路只有真实转写才会走到，单测得替它把住。
+    let instruction = match (audio_format, language) {
+        (AudioPayloadFormat::OpenAi, Some(lang)) => Some(format!(
+            "{}\n\n音频的语言代码是 {}，按这个语言转写。",
+            instruction.unwrap_or(DEFAULT_TRANSCRIBE_INSTRUCTION),
+            lang
+        )),
+        _ => instruction.map(str::to_string),
+    };
     let mut messages = Vec::new();
     if let Some(text) = instruction {
         messages.push(serde_json::json!({
@@ -218,8 +229,8 @@ fn build_body(
     }));
 
     let mut body = serde_json::json!({ "model": model, "messages": messages });
-    if let Some(lang) = language {
-        // 非标准字段，百炼实测接受；不认识它的网关一般会忽略未知顶层字段。
+    if let (AudioPayloadFormat::DataUrl, Some(lang)) = (audio_format, language) {
+        // 非标准字段，百炼实测接受。只在百炼形态里发，理由见上面指令那段。
         body["asr_options"] = serde_json::json!({ "language": lang });
     }
     body
@@ -281,8 +292,9 @@ pub async fn transcribe(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .or_else(|| {
-            (needs_transcribe_instruction(&model) || matches!(audio_format, AudioPayloadFormat::OpenAi))
-                .then(|| DEFAULT_TRANSCRIBE_INSTRUCTION.to_string())
+            (needs_transcribe_instruction(&model)
+                || matches!(audio_format, AudioPayloadFormat::OpenAi))
+            .then(|| DEFAULT_TRANSCRIBE_INSTRUCTION.to_string())
         });
     if let Some(ctx) = super::asr_qwen::build_hotword_context_text(hotwords) {
         let base = instruction.take().unwrap_or_default();
@@ -303,7 +315,13 @@ pub async fn transcribe(
         ),
     );
 
-    let body = build_body(&model, &wav, instruction.as_deref(), language.as_deref(), audio_format);
+    let body = build_body(
+        &model,
+        &wav,
+        instruction.as_deref(),
+        language.as_deref(),
+        audio_format,
+    );
     let client = super::http_client::shared();
     let start = Instant::now();
 
@@ -386,8 +404,9 @@ pub async fn test_connection(config: &AsrProviderConfig) -> TestResult {
 
     // 0.5s 静音：够过服务端的「音频太短」门槛，又几乎不花钱。
     let wav = pcm_to_wav(&vec![0u8; 16000], 16000);
-    let instruction = (needs_transcribe_instruction(&model) || matches!(audio_format, AudioPayloadFormat::OpenAi))
-        .then_some(DEFAULT_TRANSCRIBE_INSTRUCTION);
+    let instruction = (needs_transcribe_instruction(&model)
+        || matches!(audio_format, AudioPayloadFormat::OpenAi))
+    .then_some(DEFAULT_TRANSCRIBE_INSTRUCTION);
     let body = build_body(&model, &wav, instruction, None, audio_format);
 
     let client = super::http_client::shared();
@@ -483,7 +502,13 @@ mod tests {
     /// 完全看不出少了前缀 —— 所以这条得钉住。
     #[test]
     fn legacy_audio_is_sent_as_a_data_url() {
-        let body = build_body("qwen3-asr-flash", &pcm_to_wav(&[0, 0, 0, 0], 16000), None, None, AudioPayloadFormat::DataUrl);
+        let body = build_body(
+            "qwen3-asr-flash",
+            &pcm_to_wav(&[0, 0, 0, 0], 16000),
+            None,
+            None,
+            AudioPayloadFormat::DataUrl,
+        );
         let audio = body["messages"][0]["content"][0]["input_audio"]
             .as_str()
             .expect("input_audio must be a string");
@@ -493,7 +518,13 @@ mod tests {
     #[test]
     fn standard_audio_is_sent_as_an_openai_object_with_raw_base64() {
         let wav = pcm_to_wav(&[1, 2, 3, 4], 16000);
-        let body = build_body("gemini-example", &wav, Some(DEFAULT_TRANSCRIBE_INSTRUCTION), None, AudioPayloadFormat::OpenAi);
+        let body = build_body(
+            "gemini-example",
+            &wav,
+            Some(DEFAULT_TRANSCRIBE_INSTRUCTION),
+            None,
+            AudioPayloadFormat::OpenAi,
+        );
         let audio = &body["messages"][1]["content"][0]["input_audio"];
         assert_eq!(audio["format"], "wav");
         let data = audio["data"].as_str().expect("input_audio.data must be a string");
@@ -502,11 +533,56 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
     }
 
+    /// 标准模式不许带百炼私有的 `asr_options`（严格网关会 400），语言改走指令。
+    #[test]
+    fn standard_body_carries_language_in_the_instruction_not_asr_options() {
+        let body = build_body(
+            "gemini-example",
+            &[],
+            Some(DEFAULT_TRANSCRIBE_INSTRUCTION),
+            Some("ja"),
+            AudioPayloadFormat::OpenAi,
+        );
+        assert!(body.get("asr_options").is_none(), "got {}", body);
+        assert_eq!(body["messages"][0]["role"], "system");
+        let text = body["messages"][0]["content"][0]["text"]
+            .as_str()
+            .expect("system text must be a string");
+        assert!(text.starts_with(DEFAULT_TRANSCRIBE_INSTRUCTION), "got {}", text);
+        assert!(text.contains("ja"), "got {}", text);
+    }
+
+    /// 百炼形态保持原样：语言照旧走 `asr_options`，指令不被改写。
+    #[test]
+    fn data_url_body_still_sends_asr_options_language() {
+        let body = build_body(
+            "qwen3.8-omni-flash",
+            &[],
+            Some(DEFAULT_TRANSCRIBE_INSTRUCTION),
+            Some("zh"),
+            AudioPayloadFormat::DataUrl,
+        );
+        assert_eq!(body["asr_options"]["language"], "zh");
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            DEFAULT_TRANSCRIBE_INSTRUCTION
+        );
+    }
+
     #[test]
     fn payload_format_is_selected_by_provider() {
-        assert!(matches!(audio_payload_format("openai_chat_audio_standard"), AudioPayloadFormat::OpenAi));
-        assert!(matches!(audio_payload_format("openai_chat_audio"), AudioPayloadFormat::DataUrl));
-        assert!(matches!(audio_payload_format("qwen_chat_audio"), AudioPayloadFormat::DataUrl));
+        assert!(matches!(
+            audio_payload_format("openai_chat_audio_standard"),
+            AudioPayloadFormat::OpenAi
+        ));
+        assert!(matches!(
+            audio_payload_format("openai_chat_audio"),
+            AudioPayloadFormat::DataUrl
+        ));
+        assert!(matches!(
+            audio_payload_format("qwen_chat_audio"),
+            AudioPayloadFormat::DataUrl
+        ));
     }
 
     /// Omni 是对话模型，不给指令它会回答想象出来的问题（实测拿到过
@@ -520,11 +596,18 @@ mod tests {
         assert!(!needs_transcribe_instruction("qwen3-asr-flash"));
         assert!(!needs_transcribe_instruction("whisper-1"));
 
-        let omni = build_body("qwen3.8-omni-flash", &[], Some(DEFAULT_TRANSCRIBE_INSTRUCTION), None, AudioPayloadFormat::DataUrl);
+        let omni = build_body(
+            "qwen3.8-omni-flash",
+            &[],
+            Some(DEFAULT_TRANSCRIBE_INSTRUCTION),
+            None,
+            AudioPayloadFormat::DataUrl,
+        );
         assert_eq!(omni["messages"][0]["role"], "system");
         assert_eq!(omni["messages"][1]["role"], "user");
 
-        let asr = build_body("qwen3-asr-flash", &[], None, None, AudioPayloadFormat::DataUrl);
+        let asr =
+            build_body("qwen3-asr-flash", &[], None, None, AudioPayloadFormat::DataUrl);
         assert_eq!(asr["messages"][0]["role"], "user");
         assert!(asr["messages"].as_array().unwrap().len() == 1);
     }
@@ -536,9 +619,11 @@ mod tests {
         let explicit = config_for("qwen_chat_audio", serde_json::json!({ "language": "zh" }));
         assert_eq!(resolve_language(&explicit).as_deref(), Some("zh"));
 
-        let body = build_body("qwen3-asr-flash", &[], None, Some("zh"), AudioPayloadFormat::DataUrl);
+        let body =
+            build_body("qwen3-asr-flash", &[], None, Some("zh"), AudioPayloadFormat::DataUrl);
         assert_eq!(body["asr_options"]["language"], "zh");
-        let without = build_body("qwen3-asr-flash", &[], None, None, AudioPayloadFormat::DataUrl);
+        let without =
+            build_body("qwen3-asr-flash", &[], None, None, AudioPayloadFormat::DataUrl);
         assert!(without.get("asr_options").is_none());
     }
 

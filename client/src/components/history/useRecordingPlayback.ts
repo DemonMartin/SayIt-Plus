@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { loadAudioAsDataUrl } from '@/services/audioFileService'
+import { loadAudioAsObjectUrl } from '@/services/audioFileService'
 
 /**
  * 历史录音的播放状态。
@@ -114,7 +114,7 @@ export function useRecordingPlayback(audioFilePath?: string, initialDurationSec 
 
     setLoading(true)
     try {
-      const dataUrl = await loadAudioAsDataUrl(audioFilePath)
+      const dataUrl = await loadAudioAsObjectUrl(audioFilePath)
       if (!dataUrl) {
         setLoading(false)
         return

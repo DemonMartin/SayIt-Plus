@@ -27,8 +27,6 @@ pub struct ModelInfo {
     pub total_size_bytes: u64,
     pub languages: Vec<String>,
     pub sources: Vec<DownloadSource>,
-    #[serde(default)]
-    pub archive_url: Option<String>,
     /// 速度评级 0–10（可带小数，10 最快）
     #[serde(default)]
     pub speed: f32,
@@ -141,7 +139,6 @@ pub fn get_available_models() -> Vec<ModelInfo> {
             quant: "Q4_K_M".into(),
             languages: vec!["en".into()],
             sources: PARAKEET_UNIFIED_EN_Q4.sources(),
-            archive_url: None,
         },
         // ── SenseVoice Small GGUF（ggml 引擎）──
         // 标点靠 RunOptions 的 itn=on 打开（默认是 <|woitn|> 分支、无标点），
@@ -161,7 +158,6 @@ pub fn get_available_models() -> Vec<ModelInfo> {
             quant: "Q8_0".into(),
             languages: vec!["zh".into(), "en".into(), "ja".into(), "ko".into(), "yue".into()],
             sources: SENSEVOICE.sources(),
-            archive_url: None,
         },
         // ── Nemotron 3.5 ASR Streaming 0.6B GGUF（NVIDIA，parakeet 族）──
         // 存在的意义是**语种覆盖面**：32 个 locale，含西/法/德/意/葡/荷/俄/阿/印地/
@@ -200,7 +196,6 @@ pub fn get_available_models() -> Vec<ModelInfo> {
                 "ko".into(),
             ],
             sources: NEMOTRON_STREAMING_Q4.sources(),
-            archive_url: None,
         },
         // ── Fun-ASR Nano 2512 GGUF（SenseVoice 编码器 + Qwen3 解码器）──
         // FunAudioLLM 出的，和 SenseVoice 同一个实验室，只做中/英/日三语。
@@ -225,7 +220,6 @@ pub fn get_available_models() -> Vec<ModelInfo> {
             quant: "Q8_0".into(),
             languages: vec!["zh".into(), "en".into(), "ja".into()],
             sources: FUNASR_NANO_Q8.sources(),
-            archive_url: None,
         },
         // ── Qwen3-ASR 0.6B GGUF（ggml 引擎，transcribe.cpp）──
         // GGUF 块量化 + ggml 推理：实测 9s 中文音频纯 CPU RTF 0.167（同一模型走
@@ -246,7 +240,6 @@ pub fn get_available_models() -> Vec<ModelInfo> {
             quant: "Q8_0".into(),
             languages: vec!["zh".into(), "en".into(), "yue".into(), "ja".into(), "ko".into()],
             sources: QWEN3_06B_Q8.sources(),
-            archive_url: None,
         },
         // ── Qwen3-ASR 1.7B GGUF Q4_K_M（1.7B 的轻量档）──
         // 存在的意义是让"想要 1.7B 的准确度但不想下 1.4 GB / 不想占 2 GB 内存"
@@ -268,7 +261,6 @@ pub fn get_available_models() -> Vec<ModelInfo> {
             quant: "Q4_K_M".into(),
             languages: vec!["zh".into(), "en".into(), "yue".into(), "ja".into(), "ko".into()],
             sources: QWEN3_17B_Q4.sources(),
-            archive_url: None,
         },
         // ── Qwen3-ASR 1.7B GGUF Q5_K_M（精度上限）──
         // 上游 WER 1.65%（Q8_0 是 1.61%，但要下 2.19 GB，性价比不值）；Q5_K_M
@@ -288,7 +280,6 @@ pub fn get_available_models() -> Vec<ModelInfo> {
             quant: "Q5_K_M".into(),
             languages: vec!["zh".into(), "en".into(), "yue".into(), "ja".into(), "ko".into()],
             sources: QWEN3_17B_Q5.sources(),
-            archive_url: None,
         },
     ]
 }

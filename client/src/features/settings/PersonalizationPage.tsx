@@ -216,7 +216,21 @@ export default function PersonalizationPage() {
   }, [range, records])
 
   const rangeDays = range === 'today' ? 1 : range === '7d' ? 7 : range === '30d' ? 30 : 0
-  const stats = useMemo(() => computeFullStats(filteredRecords, rangeDays), [filteredRecords, rangeDays])
+  const stats = useMemo(() => {
+    const computed = computeFullStats(filteredRecords, rangeDays)
+    // 「全部」的总量用首页那个累加计数器，否则两处同名的数字对不上（实测口述时长差了 20 多分钟：
+    // 逐条重算用的时长口径和入库时累加的不完全一样）。分时段统计没有计数器，只能逐条算。
+    if (range !== 'all' || (allStats.totalChars === 0 && allStats.totalDurationSec === 0)) return computed
+    const totalChars = allStats.totalChars
+    const totalDurationSec = Math.round(allStats.totalDurationSec)
+    return {
+      ...computed,
+      totalChars,
+      totalDurationSec,
+      avgSpeed: totalDurationSec > 60 ? Math.round(totalChars / (totalDurationSec / 60)) : 0,
+      savedTimeSec: Math.round(totalChars / 50) * 60,
+    }
+  }, [filteredRecords, rangeDays, range, allStats])
 
   // "全部"模式下合并 userStats 中的应用数据（历史记录可能缺少早期的 appName 字段）
   const appUsageEntries = useMemo(() => {

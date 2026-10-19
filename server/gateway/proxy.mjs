@@ -3,6 +3,7 @@ import path from "path";
 import https from "https";
 import httpProxy from "http-proxy";
 import { fileURLToPath } from "url";
+import { resolveStaticRequest } from "./static-path.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.HTTPS_PORT || 8443);
@@ -25,14 +26,23 @@ proxy.on("error", (err, req, res) => {
   }
 });
 
+// robots.txt / sitemap.xml / llms.txt are read by crawlers, which may skip a file served as
+// application/octet-stream; llms.txt also carries Chinese, hence the explicit charset.
 const MIME = {
-  ".html": "text/html",
-  ".js": "application/javascript",
-  ".css": "text/css",
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
   ".json": "application/json",
+  ".txt": "text/plain; charset=utf-8",
+  ".xml": "application/xml; charset=utf-8",
   ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
   ".svg": "image/svg+xml",
   ".ico": "image/x-icon",
+  ".woff2": "font/woff2",
 };
 
 const ADMIN_PUBLIC = process.env.ADMIN_PUBLIC === "true";
@@ -49,8 +59,19 @@ const server = https.createServer(tls, (req, res) => {
     proxy.web(req, res);
     return;
   }
-  let fp = path.join(STATIC_DIR, url === "/" ? "index.html" : url);
-  if (!fs.existsSync(fp)) fp = path.join(STATIC_DIR, "index.html");
+  // 路径判断见 static-path.mjs：越界（../）一律 404，不能回落到 index.html
+  const resolved = resolveStaticRequest(url, STATIC_DIR);
+  if (resolved.status === 301) {
+    res.writeHead(301, { Location: resolved.location, "Cache-Control": "no-cache" });
+    res.end();
+    return;
+  }
+  if (resolved.status !== 200) {
+    res.writeHead(resolved.status);
+    res.end(resolved.status === 400 ? "Bad Request" : "Not Found");
+    return;
+  }
+  const fp = resolved.file;
   const ext = path.extname(fp);
   fs.readFile(fp, (err, data) => {
     if (err) { res.writeHead(404); res.end("Not Found"); return; }

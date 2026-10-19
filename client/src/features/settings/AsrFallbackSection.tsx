@@ -4,6 +4,7 @@ import { ArrowDown, ArrowUp, Plus, X } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Feedback } from '@/components/ui/feedback'
+import { InfoTip } from '@/components/ui/info-tip'
 import { localModelDisplayName } from '@/i18n/displayNames'
 import type { AsrTarget } from '@/services/transcription/asrTarget'
 import { Switch } from '@/components/ui/switch'
@@ -183,9 +184,12 @@ export default function AsrFallbackSection({ workMode, onPrimaryChange }: Props)
     <Card>
       <CardContent className="p-6">
         <div className="flex items-center justify-between gap-3">
-          <h2 id="asr-fallback-title" className="text-base font-semibold">
-            {t('fallback.title')}
-          </h2>
+          <div className="flex items-center gap-2">
+            <h2 id="asr-fallback-title" className="text-base font-semibold">
+              {t('fallback.title')}
+            </h2>
+            <InfoTip content={t('fallback.description')} label={t('fallback.title')} />
+          </div>
           <div className="flex items-center gap-2">
             <span className="text-xs text-muted-foreground">
               {settings.enabled ? t('fallback.on') : t('fallback.off')}
@@ -202,7 +206,6 @@ export default function AsrFallbackSection({ workMode, onPrimaryChange }: Props)
             />
           </div>
         </div>
-        <p className="mt-1 text-sm text-muted-foreground">{t('fallback.description')}</p>
         {settings.enabled && (
           <div className="mt-4 space-y-3">
             <div className="space-y-2">

@@ -2,8 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { transcribeRecording } from '../transcribeRecording'
 import { applyFallback } from '../../fallback'
 
-const mocks = vi.hoisted(() => ({ invoke: vi.fn(), polish: vi.fn(), server: vi.fn(), cloud: vi.fn() }))
+const mocks = vi.hoisted(() => ({ invoke: vi.fn(), local: vi.fn(), polish: vi.fn(), server: vi.fn(), cloud: vi.fn() }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: (...args: unknown[]) => mocks.invoke(...args) }))
+vi.mock('../../bridge', () => ({ localTranscribeRaw: (...args: unknown[]) => mocks.local(...args) }))
 vi.mock('../../store', () => ({ getSetting: async (_key: string, fallback: unknown) => fallback }))
 vi.mock('../../debugLog', () => ({ addRuntimeEvent: vi.fn(), AI_LOG_SOURCE: 'ai', AI_EVENT_OUTCOME: 'outcome' }))
 vi.mock('../serverTranscription', () => ({ transcribeWithServer: (...args: unknown[]) => mocks.server(...args) }))
@@ -24,9 +25,9 @@ describe('recorded audio target execution', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.polish.mockResolvedValue({ llmText: 'Recognized', llmMs: 0 })
+    mocks.local.mockResolvedValue({ text: 'Recognized', elapsed_ms: 12 })
     mocks.invoke.mockImplementation(async (command) => {
       if (command === 'list_downloaded_models') return [{ id: 'backup-local', complete: true }]
-      if (command === 'local_transcribe') return { text: 'Recognized', elapsed_ms: 12 }
       return undefined
     })
   })
@@ -38,7 +39,7 @@ describe('recorded audio target execution', () => {
       options,
       new AbortController().signal,
     )
-    expect(mocks.invoke).toHaveBeenCalledWith('local_transcribe', expect.objectContaining({ modelId: 'backup-local' }))
+    expect(mocks.local).toHaveBeenCalledWith(new Uint8Array(32000), expect.objectContaining({ modelId: 'backup-local' }))
     expect(result).toMatchObject({ asrText: 'Recognized', asrModel: 'backup-local', durationSec: 1 })
     expect(mocks.polish.mock.calls[0][0].policy.workMode).toBe('local')
     expect(mocks.invoke.mock.calls.some((call) => call[0] === 'preload_local_model')).toBe(false)
@@ -46,13 +47,7 @@ describe('recorded audio target execution', () => {
 
   it('cancels pending local work without polishing a late result', async () => {
     let complete!: (value: unknown) => void
-    mocks.invoke.mockImplementation(async (command) => {
-      if (command === 'list_downloaded_models') return [{ id: 'backup-local', complete: true }]
-      if (command === 'local_transcribe')
-        return new Promise((resolve) => {
-          complete = resolve
-        })
-    })
+    mocks.local.mockImplementation(() => new Promise((resolve) => { complete = resolve }))
     const abort = new AbortController()
     const promise = transcribeRecording(
       { mode: 'local', modelId: 'backup-local' },
@@ -81,16 +76,16 @@ describe('recorded audio target execution', () => {
   })
 
   it('loads successive local targets on demand after an empty result', async () => {
-    mocks.invoke.mockImplementation(async (command, args) => {
+    mocks.invoke.mockImplementation(async (command) => {
       if (command === 'list_downloaded_models')
         return [
           { id: 'first-local', complete: true },
           { id: 'second-local', complete: true },
         ]
-      if (command === 'local_transcribe') {
-        return { text: args.modelId === 'first-local' ? '' : 'Recognized', elapsed_ms: 12 }
-      }
     })
+    mocks.local.mockImplementation(async (_pcm, args) => ({
+      text: args.modelId === 'first-local' ? '' : 'Recognized', elapsed_ms: 12,
+    }))
     const empty = { asrText: '', llmText: '', asrMs: 0, llmMs: 0, durationSec: 1 }
     const result = await applyFallback(empty, {
       shouldFallback: (value) => !value.asrText.trim(),
@@ -109,7 +104,7 @@ describe('recorded audio target execution', () => {
     })
     expect(result).toMatchObject({ asrText: 'Recognized', asrModel: 'second-local' })
     expect(
-      mocks.invoke.mock.calls.filter((call) => call[0] === 'local_transcribe').map((call) => call[1].modelId),
+      mocks.local.mock.calls.map((call) => call[1].modelId),
     ).toEqual(['first-local', 'second-local'])
     expect(mocks.invoke.mock.calls.some((call) => call[0] === 'preload_local_model')).toBe(false)
   })

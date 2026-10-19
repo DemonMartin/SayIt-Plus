@@ -11,6 +11,7 @@ import type { PromptPreset } from '@/services/store'
 import type { AppPromptRule } from '@/services/personalization/types'
 import { useT } from '@/i18n/useT'
 import { appPromptRuleDisplayName, promptPresetDisplayName } from '@/i18n/displayNames'
+import { InfoTip } from '@/components/ui/info-tip'
 
 /**
  * 「检测当前应用」的倒计时秒数。
@@ -227,15 +228,22 @@ export default function AppPromptRulesSection({
       <CardContent className="space-y-4 p-6">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h2 className="text-lg font-semibold">{t('appPrompt.title')}</h2>
+            <div className="flex items-center gap-1.5">
+              <h2 className="text-lg font-semibold">{t('appPrompt.title')}</h2>
+              {/* 完整说明（内置了哪些应用、匹配顺序）收进 ⓘ：应用清单就在下面，正文再列一遍是重复 */}
+              <InfoTip
+                content={(
+                  <div className="space-y-2">
+                    <p>{t('appPrompt.desc')}</p>
+                    <p>{t('appPrompt.orderHint')}</p>
+                  </div>
+                )}
+                label={t('appPrompt.title')}
+              />
+            </div>
             <p className="mt-1 text-xs text-muted-foreground">
-              {t('appPrompt.desc')}
+              {t('appPrompt.shortDesc')}
             </p>
-            {canSort && (
-              <p className="mt-1.5 text-xs text-muted-foreground/70">
-                {t('appPrompt.orderHint')}
-              </p>
-            )}
           </div>
           {!newRule && (
             <Button

@@ -306,19 +306,73 @@ struct DiagImage {
     name: String,
     #[serde(rename = "type")]
     mime_type: String,
-    #[allow(dead_code)]
     size: usize,
+    /// 旧命令里是 JSON 数字数组；create_diagnostics_zip_raw 里缺省，由二进制载荷按 size 切出来。
+    #[serde(default)]
     data: Vec<u8>,
 }
 
 #[tauri::command]
 pub fn create_diagnostics_zip(data: Value) -> Result<String, String> {
     let req: DiagnosticsZipRequest = serde_json::from_value(data).map_err(|e| e.to_string())?;
+    build_diagnostics_zip(req)
+}
 
-    let diag_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("com.sayit.app")
-        .join("diagnostics");
+/// 同 create_diagnostics_zip，但截图以原始字节发过来（见 ipc_body），按 images[].size 依次切开。
+///
+/// 原来截图在前端被 `Array.from(new Uint8Array(...))` 转成 JSON 数字数组，一张 20 MB 的图
+/// 变成六七十 MB 的字符串再解析一遍。
+#[tauri::command]
+pub fn create_diagnostics_zip_raw(request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let (mut req, payload): (DiagnosticsZipRequest, Vec<u8>) = crate::ipc_body::split_framed(&request)?;
+    attach_image_bytes(&mut req.images, &payload)?;
+    build_diagnostics_zip(req)
+}
+
+/// 按每张图声明的 size 依次从载荷里切出字节；总数对不上就拒绝（宁可报错也别把图切错位）。
+fn attach_image_bytes(images: &mut [DiagImage], payload: &[u8]) -> Result<(), String> {
+    let mut offset = 0usize;
+    for image in images.iter_mut() {
+        let end = offset
+            .checked_add(image.size)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| "Screenshot sizes do not match the uploaded bytes".to_string())?;
+        image.data = payload[offset..end].to_vec();
+        offset = end;
+    }
+    if offset != payload.len() {
+        return Err("Screenshot sizes do not match the uploaded bytes".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod raw_upload_tests {
+    use super::{attach_image_bytes, DiagImage};
+
+    fn image(size: usize) -> DiagImage {
+        DiagImage { name: String::new(), mime_type: "image/png".into(), size, data: Vec::new() }
+    }
+
+    #[test]
+    fn splits_payload_by_declared_sizes() {
+        let mut images = vec![image(2), image(3)];
+        attach_image_bytes(&mut images, &[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(images[0].data, vec![1, 2]);
+        assert_eq!(images[1].data, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn mismatched_sizes_are_rejected() {
+        assert!(attach_image_bytes(&mut [image(4)], &[1, 2]).is_err());
+        assert!(attach_image_bytes(&mut [image(1)], &[1, 2]).is_err());
+        assert!(attach_image_bytes(&mut [image(usize::MAX), image(2)], &[1, 2]).is_err());
+    }
+}
+
+fn build_diagnostics_zip(req: DiagnosticsZipRequest) -> Result<String, String> {
+
+    let diag_dir = diagnostics_dir();
     std::fs::create_dir_all(&diag_dir).map_err(|e| e.to_string())?;
 
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
@@ -394,21 +448,52 @@ pub fn create_diagnostics_zip(data: Value) -> Result<String, String> {
 
 // ─── Read helpers ───
 
+fn diagnostics_dir() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("com.sayit.app")
+        .join("diagnostics")
+}
+
+/// 诊断包只会是 create_diagnostics_zip 生成在诊断目录里的 .zip。
+/// 读命令把内容整个交给前端，复制命令复制完还会删掉源文件，所以两边都不能接受任意路径。
+fn diagnostics_zip_in_dir(path: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(path);
+    if !crate::path_guard::has_extension(&path, &["zip"]) {
+        return None;
+    }
+    crate::path_guard::existing_file_in_dir(&path, &diagnostics_dir())
+}
+
 #[tauri::command]
 pub fn read_diagnostics_zip(path: String) -> Result<Option<Vec<u8>>, String> {
-    let path = std::path::PathBuf::from(&path);
-    if !path.exists() {
+    let Some(path) = diagnostics_zip_in_dir(&path) else {
         return Ok(None);
-    }
+    };
     let data = std::fs::read(&path).map_err(|e| e.to_string())?;
     Ok(Some(data))
 }
 
+/// 同 read_diagnostics_zip，但直接回字节（前端拿到 ArrayBuffer）。
+/// 原来是 `Vec<u8>` 走 JSON，诊断包每个字节变成数组里的一个数字，最大 52 MB 的包是一两百 MB 的字符串。
+/// 文件不在时返回空字节。
+#[tauri::command]
+pub fn read_diagnostics_zip_bytes(path: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = match diagnostics_zip_in_dir(&path) {
+        Some(path) => std::fs::read(&path).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 #[tauri::command]
 pub fn copy_diagnostics_zip(source: String, destination: String) -> Result<(), String> {
-    let src = std::path::PathBuf::from(&source);
-    if !src.exists() {
+    let Some(src) = diagnostics_zip_in_dir(&source) else {
         return Err("The diagnostics file does not exist".to_string());
+    };
+    // 目标来自保存对话框（只给了 zip 过滤器），这里再确认一次扩展名，免得被拿来往任意位置写可执行文件。
+    if !crate::path_guard::has_extension(std::path::Path::new(&destination), &["zip"]) {
+        return Err("The diagnostics file must be saved as a .zip".to_string());
     }
     std::fs::copy(&src, &destination).map_err(|e| format!("Failed to copy diagnostics file: {}", e))?;
     // 清理临时文件

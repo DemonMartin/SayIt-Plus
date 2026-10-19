@@ -688,14 +688,10 @@ export default function Dictionary() {
                     className={cn('group', !active && 'border-dashed opacity-70', canSort && themeSortable.rowClassName(themeIndex))}
                   >
                     <CardContent className="p-4">
-                      <div className="mb-3 flex items-center justify-between gap-3">
+                      {/* 开关放右边（和全软件一致）；收起时没有下方内容，不留 mb-3 的空白 */}
+                      <div className={cn('flex items-center justify-between gap-3', active && 'mb-3')}>
                         <div className="flex items-center gap-3 min-w-0">
                           {canSort && <DragHandle {...themeSortable.handleProps(themeIndex, t('dict.dragCategory', { name: theme.name }))} />}
-                          <Switch
-                            checked={active}
-                            onChange={() => void toggleCustomTheme(theme.id)}
-                            size="sm"
-                          />
                           <div className="min-w-0">
                             <p className="text-sm font-medium">{theme.name}</p>
                             <p className="text-xs text-muted-foreground">
@@ -703,7 +699,7 @@ export default function Dictionary() {
                             </p>
                           </div>
                         </div>
-                        <div className="flex shrink-0 items-center">
+                        <div className="flex shrink-0 items-center gap-3">
                           <Tooltip content={t('dict.deleteCategory')}>
                             <button
                               type="button"
@@ -714,6 +710,11 @@ export default function Dictionary() {
                               <Trash2 className="h-3.5 w-3.5" />
                             </button>
                           </Tooltip>
+                          <Switch
+                            checked={active}
+                            onChange={() => void toggleCustomTheme(theme.id)}
+                            size="sm"
+                          />
                         </div>
                       </div>
 
@@ -767,13 +768,10 @@ export default function Dictionary() {
                 return (
                   <Card key={key} className={cn(!active && 'border-dashed opacity-70')}>
                     <CardContent className="p-4">
-                      <div className="mb-3 flex items-center justify-between gap-3">
+                      <div className={cn('flex items-center justify-between gap-3', active && activeWords.length > 0 && 'mb-3')}>
                         <div className="flex items-center gap-3 min-w-0">
-                          <Switch
-                            checked={active}
-                            onChange={() => void toggleBuiltinSet(key)}
-                            size="sm"
-                          />
+                          {/* 自建分类可拖动时左边有手柄，内置分类留同宽空位，名字才能对齐 */}
+                          {!search && customThemes.length > 1 && <span className="w-[22px] shrink-0" aria-hidden />}
                           <div className="min-w-0">
                             <p className="text-sm font-medium">{setDef.label}</p>
                             <p className="text-xs text-muted-foreground">
@@ -781,14 +779,21 @@ export default function Dictionary() {
                             </p>
                           </div>
                         </div>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="h-7 gap-1 px-2 text-xs"
-                          onClick={() => void resetBuiltinSet(key)}
-                        >
-                          <RotateCcw className="h-3 w-3" /> {t('dict.reset')}
-                        </Button>
+                        <div className="flex shrink-0 items-center gap-3">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-7 gap-1 px-2 text-xs"
+                            onClick={() => void resetBuiltinSet(key)}
+                          >
+                            <RotateCcw className="h-3 w-3" /> {t('dict.reset')}
+                          </Button>
+                          <Switch
+                            checked={active}
+                            onChange={() => void toggleBuiltinSet(key)}
+                            size="sm"
+                          />
+                        </div>
                       </div>
 
                       {active && activeWords.length > 0 && (
@@ -829,7 +834,8 @@ export default function Dictionary() {
               {!search && hotwords.length === 0 && (
                 <div className="rounded-lg border border-dashed border-border py-8 text-center">
                   <p className="text-sm text-muted-foreground">
-                    {t('dict.empty')}
+                    {/* 已经建过分类却还是 0 个生效词时，叫人「先新建分类」就不对了 */}
+                    {customThemes.length > 0 ? t('dict.emptyWithCategories') : t('dict.empty')}
                   </p>
                 </div>
               )}
