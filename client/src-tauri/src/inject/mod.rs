@@ -1473,6 +1473,16 @@ unsafe fn mark_clipboard_history_excluded() {
     // 该格式只要存在即生效，值内容不限，这里同样写 0。
     let exclude: Vec<u16> = "ExcludeClipboardContentFromMonitorProcessing\0".encode_utf16().collect();
     write_dword_format(&exclude, 0);
+
+    // "Clipboard Viewer Ignore" → 给第三方剪贴板管理器看的，KeePass 2.x 用的也是它。
+    // 上面三个是微软的约定，Ditto 的正式版（截至 3.25.113，2025-09）一个都不认，只认这个。
+    // 它的源码 2025-12 才补上微软那两个，2026-01 又挂到一个可关的选项后面；而这个格式
+    // 一直是无条件跳过（ClipboardViewer.cpp 的 GetIgnoreClipboardChange）。所以别以为
+    // 有了上面三个就可以删掉它。只要存在就生效，值不限。KeePass 早年默认不开它，是因为
+    // 配 .NET/OLE 剪贴板接口时会让 Office 剪贴板扩展崩溃；我们走原生 SetClipboardData，
+    // 不是那条路。（issue #84）
+    let viewer_ignore: Vec<u16> = "Clipboard Viewer Ignore\0".encode_utf16().collect();
+    write_dword_format(&viewer_ignore, 0);
 }
 
 #[cfg(windows)]
