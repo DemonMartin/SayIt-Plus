@@ -150,13 +150,14 @@ export default function WorkModeSection({ value, onChange }: Props) {
                   {t(m.labelKey)}
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">{t(m.descKey)}</div>
-                <div className="mt-2 border-t border-border/50 pt-2 text-xs leading-relaxed text-muted-foreground">
-                  {t(m.privacyKey)}
-                </div>
               </button>
             )
           })}
         </div>
+        {/* 「数据去哪儿」原来三张卡各写一段，一屏六段字。只写当前选中的那个，放在卡组下面 */}
+        <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
+          {t(modes.find((m) => m.value === value)?.privacyKey ?? 'workMode.server.privacy')}
+        </p>
       </CardContent>
     </Card>
   )

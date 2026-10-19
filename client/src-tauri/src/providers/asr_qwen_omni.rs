@@ -6,7 +6,7 @@ use super::diag;
 use super::types::{AsrProviderConfig, AsrResult, TestResult};
 use base64::Engine;
 use futures_util::{FutureExt, SinkExt, StreamExt};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite;
 
 /// `extra.model` 缺失时用哪个。
@@ -24,6 +24,93 @@ const DEFAULT_MODEL: &str = "qwen3.5-omni-flash-realtime";
 const OUTPUT_VOICE: &str = "Tina";
 
 const SCOPE: &str = "qwen/omni";
+
+// ── 上行限速：先放一段突发，之后按固定速率发 ──
+//
+// 实测（2026-10-09，dev-scripts/probe_qwen_omni_long_audio.py，真实接口，plus 与 flash 都一样）：
+// DashScope realtime 对上行流量限速，超了直接关连接：
+//     close code=1007 reason=Input traffic exceeds the limit of 2560KB/s
+// 文档里没写这条。99 秒录音一口气发（约 4.3MB、0.4 秒）必挂；但 80 秒以内（≤3.46MB）
+// 一口气发每次都过，按 ≤50 倍实时（2.16MB/s）发 240 秒也过 —— 服务端是带突发容量的令牌桶。
+// 上行慢于约 20Mbps 的机器 TCP 自己就压住了速度，所以这个问题「有人遇到、有人遇不到」。
+//
+// 为什么不纯限速：60 秒以内的录音本来就不会触发，纯限速会让每一次口述都白等
+// （30 秒多 0.75 秒、99 秒多 2.5 秒）。先突发后限速，60 秒以内零延迟，99 秒只多约 1 秒。
+// 突发容量没写进文档，所以留了余量；万一阿里调小了，`transcribe` 里还有一次纯限速重试兜底。
+// 改包大小没用（实测 500ms 一包同样被掐），能救的只有降速。
+// 被否掉的其他方案与以后「边录边发」的计划见 `.kiro/decisions.md`「千问 Omni 发送限速」。
+
+/// 突发额度，按线上字节算。2.4MB ≈ 55 秒音频，低于每次都能过的 2.6MB（60 秒）。
+const PACING_BURST_BYTES: u64 = 2_400_000;
+/// 突发之后的速率。约 46 倍实时，比服务端的 2560KB/s 低 20%。
+const PACING_RATE_BYTES_PER_SEC: u64 = 2_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pacing {
+    burst_bytes: u64,
+    rate_bytes_per_sec: u64,
+}
+
+impl Pacing {
+    const NORMAL: Pacing = Pacing {
+        burst_bytes: PACING_BURST_BYTES,
+        rate_bytes_per_sec: PACING_RATE_BYTES_PER_SEC,
+    };
+    /// 被限速掐断之后的那次重试：不再突发，从第一包起就按速率发。
+    const THROTTLE_ONLY: Pacing = Pacing {
+        burst_bytes: 0,
+        rate_bytes_per_sec: PACING_RATE_BYTES_PER_SEC,
+    };
+
+    fn mode(&self) -> &'static str {
+        if self.burst_bytes == 0 {
+            "throttle_retry"
+        } else {
+            "burst"
+        }
+    }
+}
+
+/// 下一包最早能在「开始发送之后」的哪个时刻发出。`None` = 还在突发额度内，立刻发。
+///
+/// 返回的是相对发送起点的**绝对**偏移，不是「再睡多久」：调用方 `sleep_until(起点 + 偏移)`。
+/// 这样醒晚了不会累积 —— Windows 定时器精度约 15.6ms，醒来时后面几包的截止时刻
+/// 往往已经过了，会直接连着发掉，平均速率仍是设定值。
+/// ⚠️ 别改成「每包 sleep 一个固定间隔」：46 倍实时下一包只隔 2ms，按 15.6ms 的精度睡，
+/// 990 包会被拖到 15 秒。
+fn pacing_due(sent_bytes: u64, next_bytes: u64, pacing: Pacing) -> Option<Duration> {
+    let needed = sent_bytes + next_bytes;
+    if needed <= pacing.burst_bytes {
+        return None;
+    }
+    let over = needed - pacing.burst_bytes;
+    Some(Duration::from_secs_f64(
+        over as f64 / pacing.rate_bytes_per_sec.max(1) as f64,
+    ))
+}
+
+/// 这条错误是不是「上行超速被掐」。只认服务端的原话和 close 1007，别的错误一律不重试 ——
+/// 密钥错、额度用完、超时重试一遍只会让用户多等一轮，结果不会变。
+fn is_rate_limited(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("input traffic exceeds") || lower.contains("code=1007")
+}
+
+/// 一次尝试的失败，带上「值不值得换纯限速再试一次」。
+struct AttemptError {
+    error: String,
+    retryable: bool,
+}
+
+impl From<String> for AttemptError {
+    /// 绝大多数失败点都是 `diag::fail(...)?`，在这里按错误原文统一判定。
+    /// 判据只看服务端说的原因，所以 close 帧在发送途中读到、还是 commit 之后才读到，
+    /// 都走同一条路。
+    fn from(error: String) -> Self {
+        let retryable = is_rate_limited(&error);
+        AttemptError { error, retryable }
+    }
+}
 
 fn ws_url(model: &str) -> String {
     format!(
@@ -264,20 +351,6 @@ pub async fn transcribe(
         instructions.push_str("\n\n请特别注意以下专业术语/词汇的识别：");
         instructions.push_str(&ctx);
     }
-    let url = ws_url(&model);
-
-    // 构建 WebSocket 请求
-    let request = tungstenite::http::Request::builder()
-        .uri(&url)
-        .header("Authorization", format!("Bearer {}", config.api_key))
-        .header("Sec-WebSocket-Key", tungstenite::handshake::client::generate_key())
-        .header("Sec-WebSocket-Version", "13")
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Host", "dashscope.aliyuncs.com")
-        .body(())
-        .map_err(|e| diag::fail(SCOPE, "build_request", format!("Failed to build request: {}", e)))?;
-
     let audio_sec = pcm.len() as f64 / 32000.0; // 16kHz / 16bit / mono
     diag::log(
         SCOPE,
@@ -292,6 +365,70 @@ pub async fn transcribe(
     );
 
     let start = Instant::now();
+    let session = OmniSession {
+        api_key: &config.api_key,
+        model: &model,
+        instructions: &instructions,
+        pcm: &pcm,
+        audio_sec,
+        start,
+    };
+
+    match run_attempt(&session, Pacing::NORMAL).await {
+        Ok(result) => Ok(result),
+        // 只重试一次，而且只为「上行超速」这一种原因。重试不再突发，99 秒录音约多等 2 秒 ——
+        // 比让用户整段重录强得多。重试也失败就如实报出来，不再兜圈子。
+        Err(first) if first.retryable => {
+            diag::log(
+                SCOPE,
+                "rate_limited_retry",
+                &format!(
+                    "retrying once without burst: {}",
+                    diag::truncate(&first.error, 200)
+                ),
+            );
+            run_attempt(&session, Pacing::THROTTLE_ONLY)
+                .await
+                .map_err(|again| again.error)
+        }
+        Err(first) => Err(first.error),
+    }
+}
+
+/// 一次转写里各次尝试共用的东西。
+struct OmniSession<'a> {
+    api_key: &'a str,
+    model: &'a str,
+    instructions: &'a str,
+    pcm: &'a [u8],
+    audio_sec: f64,
+    /// 第一次尝试开始的时刻。重试时不重置，返回的 elapsed 是用户实际等的总时长。
+    start: Instant,
+}
+
+/// 建一次连接、发完音频、收完结果。
+async fn run_attempt(session: &OmniSession<'_>, pacing: Pacing) -> Result<AsrResult, AttemptError> {
+    let OmniSession {
+        api_key,
+        model,
+        instructions,
+        pcm,
+        audio_sec,
+        start,
+    } = *session;
+    let url = ws_url(model);
+
+    // 构建 WebSocket 请求。每次尝试都要新建：http::Request 不能 clone。
+    let request = tungstenite::http::Request::builder()
+        .uri(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Sec-WebSocket-Key", tungstenite::handshake::client::generate_key())
+        .header("Sec-WebSocket-Version", "13")
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Host", "dashscope.aliyuncs.com")
+        .body(())
+        .map_err(|e| diag::fail(SCOPE, "build_request", format!("Failed to build request: {}", e)))?;
 
     let (mut ws, _) = tokio_tungstenite::connect_async(request)
         .await
@@ -345,22 +482,49 @@ pub async fn transcribe(
     // response.create 能触发响应），但真发生了必须停下来 —— 继续发完再 commit 会开第二轮，
     // 而主接收循环等不到新的 response.done，只能挂满 60 秒超时。
     let mut completed_while_sending = false;
+    // 限速记账。按线上字节（序列化后的 JSON 文本长度）算，不按 PCM 字节：服务端量的是
+    // 收到的流量，base64 + JSON 让每包从 3200 字节涨到约 4.33KB。WS 帧头每包十几字节，忽略。
+    let send_start = Instant::now();
+    let mut wire_sent: u64 = 0;
+    let mut waits: u32 = 0;
+    let mut waited = Duration::ZERO;
     'sending: for (idx, chunk) in pcm.chunks(chunk_size).enumerate() {
         let audio_b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
         let append_event = serde_json::json!({
             "type": "input_audio_buffer.append",
             "audio": audio_b64
         });
-        ws.send(tungstenite::Message::Text(append_event.to_string().into()))
+        let frame = append_event.to_string();
+        let frame_len = frame.len() as u64;
+        if let Some(due) = pacing_due(wire_sent, frame_len, pacing) {
+            let deadline = send_start + due;
+            let now = Instant::now();
+            if deadline > now {
+                waits += 1;
+                waited += deadline - now;
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            }
+        }
+        ws.send(tungstenite::Message::Text(frame.into()))
             .await
             // 带上第几包：长音频中途被切断和第一包就发不出去，成因完全不同
-            .map_err(|e| {
-                diag::fail(
+            .map_err(|e| AttemptError {
+                error: diag::fail(
                     SCOPE,
                     "send_audio",
-                    format!("Failed to send audio chunk {}/{}: {}", idx + 1, total_chunks, e),
-                )
+                    format!(
+                        "Failed to send audio chunk {}/{} (wire_bytes={}): {}",
+                        idx + 1,
+                        total_chunks,
+                        wire_sent,
+                        e
+                    ),
+                ),
+                // TCP 先被重置时读不到 close 帧，原因不会写在错误里。已经发过了突发额度
+                // 还断，最可能就是同一件事 —— 值得用纯限速再试一次。
+                retryable: wire_sent > pacing.burst_bytes,
             })?;
+        wire_sent += frame_len;
 
         // ── 边发边读。**不能只发不收。** ──
         //
@@ -401,7 +565,8 @@ pub async fn transcribe(
                                     "Qwen Omni error [{}] while sending chunk {}/{} (audio={:.1}s): {}",
                                     code, idx + 1, total_chunks, audio_sec, message
                                 ),
-                            ));
+                            )
+                            .into());
                         }
                     }
                 }
@@ -413,7 +578,8 @@ pub async fn transcribe(
                             "Server closed the connection while sending chunk {}/{} (audio={:.1}s): {}",
                             idx + 1, total_chunks, audio_sec, close_frame_reason(frame)
                         ),
-                    ));
+                    )
+                    .into());
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -424,17 +590,36 @@ pub async fn transcribe(
                             "Read failed while sending chunk {}/{} (audio={:.1}s): {}",
                             idx + 1, total_chunks, audio_sec, e
                         ),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
     }
 
+    // 这一行是「限速真的生效了」的证据：排查时先看它在不在、mode 是哪个、waits 是不是 >0。
+    // 没有这一行就说明跑的不是这份代码，别再去怀疑速率或额度。
+    diag::log(
+        SCOPE,
+        "pacing",
+        &format!(
+            "mode={} wire_bytes={} chunks={} burst={} rate={} waits={} waited_ms={} send_ms={}",
+            pacing.mode(),
+            wire_sent,
+            total_chunks,
+            pacing.burst_bytes,
+            pacing.rate_bytes_per_sec,
+            waits,
+            waited.as_millis(),
+            send_start.elapsed().as_millis()
+        ),
+    );
+
     // 发送途中这一轮就结束了：手里已经有结果，绝不能再 commit（那会开第二轮）。
     if completed_while_sending {
         let _ = ws.close(None).await;
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        return finish_omni(
+        return Ok(finish_omni(
             acc,
             OmniEnd::Completed,
             elapsed_ms,
@@ -442,7 +627,7 @@ pub async fn transcribe(
                 "audio_sec={:.1} elapsed={}ms model={} chunks={} ended_while_sending=true",
                 audio_sec, elapsed_ms, model, total_chunks
             ),
-        );
+        )?);
     }
 
     // 提交音频并请求响应
@@ -476,7 +661,8 @@ pub async fn transcribe(
                         audio_sec,
                         acc.result_text.chars().count()
                     ),
-                ));
+                )
+                .into());
             }
             Ok(None) => {
                 end = OmniEnd::StreamEnded;
@@ -493,7 +679,7 @@ pub async fn transcribe(
                     end = OmniEnd::Completed;
                     break;
                 }
-                return Err(diag::fail(SCOPE, "recv", format!("Failed to receive message: {}", e)));
+                return Err(diag::fail(SCOPE, "recv", format!("Failed to receive message: {}", e)).into());
             }
             Ok(Some(Ok(m))) => m,
         };
@@ -516,7 +702,8 @@ pub async fn transcribe(
                             SCOPE,
                             "server_error",
                             format!("Qwen Omni error [{}]: {}", code, message),
-                        ));
+                        )
+                        .into());
                     }
                 }
             }
@@ -539,10 +726,10 @@ pub async fn transcribe(
 
     // 空结果算失败还是算「真没说话」，判断全在 finish_omni 里（那里有长注释）。
     //
-    // ⚠️ 服务端为什么会在长音频上掐断，**尚未用真实接口验证过**。这次改动只保证一件事：
-    // 下次发生时错误信息里带着 close code / reason，而不是一句「未检测到有效声音」
-    // 把用户引去查麦克风。
-    finish_omni(acc, end, elapsed_ms, &context)
+    // 长音频被掐断的原因已用真实接口查清：上行超速（见文件头「上行限速」）。
+    // 限速没压住时 close 帧可能在 commit 之后才读到，于是从这里以 closed_before_response
+    // 报出来 —— 错误原文里带着 1007 的 reason，`AttemptError::from` 会把它判成可重试。
+    Ok(finish_omni(acc, end, elapsed_ms, &context)?)
 }
 
 /// 等待指定类型的事件
@@ -867,5 +1054,162 @@ mod empty_ending_tests {
             Some("stream_ended_before_response"),
             "连 close 帧都没有同样是协议没跑完",
         );
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    /// 一包 100ms 音频在线上的真实大小（base64 + JSON），和发送循环里算的是同一个东西。
+    fn wire_len_of_one_chunk() -> u64 {
+        let audio_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 3200]);
+        serde_json::json!({ "type": "input_audio_buffer.append", "audio": audio_b64 })
+            .to_string()
+            .len() as u64
+    }
+
+    /// 按发送循环的算法走一遍，返回最后一包的截止时刻（不真睡）。
+    fn last_due(seconds: u64, pacing: Pacing) -> Option<Duration> {
+        let frame = wire_len_of_one_chunk();
+        let mut sent = 0;
+        let mut last = None;
+        for _ in 0..seconds * 10 {
+            last = pacing_due(sent, frame, pacing);
+            sent += frame;
+        }
+        last
+    }
+
+    #[test]
+    fn nothing_waits_inside_the_burst_budget() {
+        assert_eq!(pacing_due(0, 4_000, Pacing::NORMAL), None);
+        assert_eq!(pacing_due(PACING_BURST_BYTES - 4_000, 4_000, Pacing::NORMAL), None);
+    }
+
+    #[test]
+    fn after_the_burst_the_deadline_follows_the_rate() {
+        // 超出突发额度整整 2MB = 按 2MB/s 要在第 1 秒发出
+        assert_eq!(
+            pacing_due(PACING_BURST_BYTES, PACING_RATE_BYTES_PER_SEC, Pacing::NORMAL),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    /// 截止时刻是相对发送起点的绝对偏移：只取决于已发字节，跟上一次醒得早还是晚无关。
+    /// 这是「醒晚了不累积」的前提 —— 改成返回增量间隔，这条就红。
+    #[test]
+    fn deadlines_are_absolute_offsets_that_grow_linearly() {
+        let rate = PACING_RATE_BYTES_PER_SEC;
+        let at = |sent: u64| pacing_due(PACING_BURST_BYTES + sent, rate, Pacing::NORMAL).unwrap();
+        assert_eq!(at(0), Duration::from_secs(1));
+        assert_eq!(at(rate), Duration::from_secs(2));
+        assert_eq!(at(3 * rate), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn the_retry_paces_from_the_first_byte() {
+        assert_eq!(
+            pacing_due(0, PACING_RATE_BYTES_PER_SEC, Pacing::THROTTLE_ONLY),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(Pacing::THROTTLE_ONLY.mode(), "throttle_retry");
+        assert_eq!(Pacing::NORMAL.mode(), "burst");
+    }
+
+    /// 选这组参数的理由：55 秒以内一点不等；用户报的 99 秒只多 1 秒左右。
+    #[test]
+    fn short_recordings_never_wait_and_99_seconds_waits_about_one_second() {
+        assert_eq!(last_due(55, Pacing::NORMAL), None);
+        let due = last_due(99, Pacing::NORMAL).expect("99 秒超出了突发额度");
+        assert!(
+            due > Duration::from_millis(800) && due < Duration::from_millis(1100),
+            "99 秒录音的发送应在 1 秒左右结束，实际 {:?}",
+            due
+        );
+    }
+
+    /// 平均速率必须低于服务端的 2560KB/s，否则限速等于没加。
+    #[test]
+    fn the_paced_rate_stays_under_the_server_limit() {
+        const SERVER_LIMIT: u64 = 2560 * 1024;
+        assert!(PACING_RATE_BYTES_PER_SEC * 10 <= SERVER_LIMIT * 8, "至少留 20% 余量");
+        // 突发额度要低于实测每次都能过的 2.6MB
+        assert!(PACING_BURST_BYTES < 2_600_000);
+    }
+
+    #[test]
+    fn only_the_rate_limit_close_is_retried() {
+        let real = "Server closed the connection while sending chunk 936/990 (audio=99.0s): \
+                    code=1007 reason=Input traffic exceeds the limit of 2560KB/s";
+        assert!(is_rate_limited(real));
+        assert!(is_rate_limited("reason=INPUT TRAFFIC EXCEEDS the limit"));
+        assert!(is_rate_limited(
+            "Server closed the connection before returning any transcript (code=1007 reason=x)"
+        ));
+
+        assert!(!is_rate_limited("Qwen Omni error [InvalidApiKey]: Invalid API-key provided."));
+        assert!(!is_rate_limited("Qwen Omni error [quota_exceeded]: insufficient balance"));
+        assert!(!is_rate_limited("Timed out waiting for a response (60s)"));
+        assert!(!is_rate_limited("code=1011 reason=internal"));
+    }
+
+    #[test]
+    fn attempt_errors_built_from_messages_use_the_classifier() {
+        let retry: AttemptError = "code=1007 reason=Input traffic exceeds".to_string().into();
+        assert!(retry.retryable);
+        let stop: AttemptError = "code=1011 reason=internal".to_string().into();
+        assert!(!stop.retryable);
+    }
+
+    /// 真实接口验证，默认不跑（要密钥、要花钱）。
+    ///
+    ///     $env:SAYIT_QWEN_KEY=...   $env:SAYIT_LONG_WAV=<16k mono s16 wav>
+    ///     $env:SAYIT_LONG_SECONDS=99   （可选）$env:SAYIT_QWEN_MODEL=...
+    ///     cargo test --bins live_long_audio -- --ignored --nocapture
+    ///
+    /// 判据不止「成功」：还要去 sayit.log 看这次的 `pacing mode=burst ... waits=` 那一行，
+    /// 确认是限速让它成功的，而不是别的原因。
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn live_long_audio_against_the_real_endpoint() {
+        let key = std::env::var("SAYIT_QWEN_KEY").expect("SAYIT_QWEN_KEY");
+        let wav = std::fs::read(std::env::var("SAYIT_LONG_WAV").expect("SAYIT_LONG_WAV"))
+            .expect("read wav");
+        let seconds: usize = std::env::var("SAYIT_LONG_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(99);
+        let model = std::env::var("SAYIT_QWEN_MODEL")
+            .unwrap_or_else(|_| "qwen3.5-omni-plus-realtime".to_string());
+
+        let data_at = wav
+            .windows(4)
+            .position(|w| w == b"data")
+            .expect("wav has a data chunk")
+            + 8;
+        let pcm = &wav[data_at..];
+        let pcm = &pcm[..pcm.len().min(seconds * 32000)];
+
+        let config = AsrProviderConfig {
+            provider: "qwen_omni".to_string(),
+            api_key: key,
+            app_id: String::new(),
+            extra: serde_json::json!({ "model": model }),
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pcm);
+        let result = transcribe(&b64, 16000, &config, &[]).await;
+        match &result {
+            Ok(r) => println!(
+                "LIVE seconds={} model={} chars={} elapsed_ms={}",
+                seconds,
+                model,
+                r.text.chars().count(),
+                r.elapsed_ms
+            ),
+            Err(e) => println!("LIVE seconds={} model={} error={}", seconds, model, e),
+        }
+        let result = result.expect("long audio must transcribe");
+        assert!(!result.text.trim().is_empty());
     }
 }

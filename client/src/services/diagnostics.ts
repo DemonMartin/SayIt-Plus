@@ -62,33 +62,32 @@ export async function getDiagnosticsPreview(issueOccurrence: DiagnosticOccurrenc
   return preview
 }
 
+/** 打包诊断：截图以原始字节发给 Rust（不再转成 JSON 数字数组）。 */
+async function buildDiagnosticsZip(data: DiagnosticsSubmission): Promise<string> {
+  const rawSettings = await bridge.collectSettings()
+  const settings = sanitizeObject(rawSettings || {})
+  const images = await Promise.all(
+    data.images.map(async (file) => ({
+      name: file.name,
+      type: file.type,
+      bytes: new Uint8Array(await file.arrayBuffer()),
+    })),
+  )
+  return bridge.createDiagnosticsZipRaw({
+    description: data.description,
+    issueType: data.issueType,
+    settings: settings || {},
+    issueOccurrence: data.issueOccurrence,
+  }, images)
+}
+
 export async function submitDiagnostics(data: DiagnosticsSubmission): Promise<string> {
   const validation = validateDiagnosticImages(data.images)
   if (!validation.valid) {
     throw new Error(validation.errors.join('\n'))
   }
 
-  const rawSettings = await bridge.collectSettings()
-  const settings = sanitizeObject(rawSettings || {})
-  const images = await Promise.all(
-    data.images.map(async (file) => {
-      const arrayBuffer = await file.arrayBuffer()
-      return {
-        name: file.name,
-        type: file.type,
-        size: file.size,
-        data: Array.from(new Uint8Array(arrayBuffer)),
-      }
-    }),
-  )
-
-  const zipPath = await bridge.createDiagnosticsZip({
-    description: data.description,
-    issueType: data.issueType,
-    settings: settings || {},
-    issueOccurrence: data.issueOccurrence,
-    images,
-  })
+  const zipPath = await buildDiagnosticsZip(data)
 
   if (!zipPath) {
     throw new Error('Failed to create diagnostics zip')
@@ -103,27 +102,7 @@ export async function downloadDiagnostics(data: DiagnosticsSubmission): Promise<
     throw new Error(validation.errors.join('\n'))
   }
 
-  const rawSettings = await bridge.collectSettings()
-  const settings = sanitizeObject(rawSettings || {})
-  const images = await Promise.all(
-    data.images.map(async (file) => {
-      const arrayBuffer = await file.arrayBuffer()
-      return {
-        name: file.name,
-        type: file.type,
-        size: file.size,
-        data: Array.from(new Uint8Array(arrayBuffer)),
-      }
-    }),
-  )
-
-  const zipPath = await bridge.createDiagnosticsZip({
-    description: data.description,
-    issueType: data.issueType,
-    settings: settings || {},
-    issueOccurrence: data.issueOccurrence,
-    images,
-  })
+  const zipPath = await buildDiagnosticsZip(data)
 
   if (!zipPath) {
     throw new Error('Failed to create diagnostics zip')
@@ -133,14 +112,14 @@ export async function downloadDiagnostics(data: DiagnosticsSubmission): Promise<
 }
 
 async function uploadDiagnosticsZip(zipPath: string): Promise<string> {
-  const zipData = await bridge.readDiagnosticsZip(zipPath)
+  const zipData = await bridge.readDiagnosticsZipBytes(zipPath)
 
   if (!zipData) {
     throw new Error('Failed to read diagnostics zip')
   }
 
   const formData = new FormData()
-  const blob = new Blob([new Uint8Array(zipData)], { type: 'application/zip' })
+  const blob = new Blob([zipData], { type: 'application/zip' })
   formData.append('diagnostics', blob, 'diagnostics.zip')
 
   const response = await fetch(`${getBackendBaseUrl()}/api/diagnostics`, {

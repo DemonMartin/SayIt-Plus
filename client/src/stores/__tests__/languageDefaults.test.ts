@@ -16,10 +16,10 @@ import { initLocaleDefaults } from '../language'
 describe('首次运行的地区默认值', () => {
   beforeEach(() => bridgeState.values.clear())
 
-  it('英文环境使用官方 Hugging Face 与 OpenAI-compatible', async () => {
+  it('英文环境使用官方 Hugging Face 与 OpenRouter', async () => {
     await initLocaleDefaults('en')
     expect(bridgeState.values.get('localAsr.downloadSource')).toBe('HuggingFace')
-    expect(bridgeState.values.get('cloudAi.provider')).toBe('openai_compat')
+    expect(bridgeState.values.get('cloudAi.provider')).toBe('openrouter')
     expect(bridgeState.values.get('ai.builtinPromptLanguage')).toBe('en')
   })
 

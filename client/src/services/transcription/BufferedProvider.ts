@@ -4,7 +4,6 @@
  * 子类只需实现 onConnect() 和 processAudio()。
  */
 
-import { uint8ArrayToBase64 } from '@/lib/encoding'
 import { addRuntimeEvent } from '../debugLog'
 import type {
   TranscriptionProvider,
@@ -92,10 +91,10 @@ export abstract class BufferedProvider implements TranscriptionProvider {
 
   /**
    * 处理合并后的音频数据。
-   * @param audioB64 base64 编码的 PCM 数据
+   * @param pcm 16 kHz Int16 LE 的原始 PCM 字节（直接走二进制 IPC，不转 base64）
    * @param durationSec 音频时长（秒）
    */
-  protected abstract processAudio(audioB64: string, durationSec: number, runId: number): Promise<void>
+  protected abstract processAudio(pcm: Uint8Array, durationSec: number, runId: number): Promise<void>
 
   protected isRunCurrent(runId: number): boolean {
     return runId !== 0 && this.activeRunId === runId
@@ -133,8 +132,7 @@ export abstract class BufferedProvider implements TranscriptionProvider {
         return
       }
 
-      const audioB64 = uint8ArrayToBase64(merged)
-      await this.processAudio(audioB64, durationSec, runId)
+      await this.processAudio(merged, durationSec, runId)
       if (this.isRunCurrent(runId)) this.activeRunId = 0
     } catch (err) {
       if (!this.isRunCurrent(runId)) return

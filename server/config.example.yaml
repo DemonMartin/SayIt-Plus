@@ -10,6 +10,14 @@ server:
   port: 8000
   cors_origins:                      # Allowed CORS origins
     - "*"                            # Default: allow all. Restrict in production.
+  # Max HTTP request body size, counted on the bytes actually received (oversize -> 413).
+  # WebSocket audio is not affected. Uncomment to override the defaults shown here.
+  # body_limits:
+  #   diagnostics_mib: 52              # POST /api/diagnostics (the endpoint itself also caps the zip at 50 MiB)
+  #   asr_corrections_mib: 11          # POST /api/asr-corrections (audio itself is capped at 10 MiB)
+  #   feedback_kib: 512                # POST /api/feedback
+  #   admin_mib: 8                     # /admin/... (only exists on deployments with the admin dashboard)
+  #   default_kib: 1024                # everything else
 
 # HTTPS reverse proxy (when not using ALB/CDN)
 gateway:
@@ -84,7 +92,7 @@ public_site:
 # --- Browser Demo ---
 web_demo:
   enabled: true
-  max_duration_sec: 600              # Max recording length per session (sec)
+  max_duration_sec: 300              # Max recording length per session (sec), same as the desktop app
   max_concurrency_per_ip: 3
 
 # --- Admin Dashboard ---
@@ -111,3 +119,57 @@ telemetry:
   collect_window_title: true
   collect_exe_path: true
   node_id: "single-node-01"
+
+# --- Abuse guard (WebSocket transcription) ---
+# Every check is off here. Roll each one out as off -> log -> enforce: "log" only writes
+# `guard violation ...` lines, "enforce" actually rejects (or skips AI polishing).
+# Quote the modes: bare off / on are YAML booleans.
+# The numbers below only illustrate the format; pick your own limits from your own traffic.
+guard:
+  # Reverse proxies in front of the backend (CIDR). X-Forwarded-For is resolved right-to-left
+  # across these hops (nginx real_ip_recursive). Add your load balancer subnet, e.g. "10.0.0.0/16".
+  trusted_proxies:
+    - "127.0.0.1/32"
+    - "::1/128"
+  # Switch the existing per-IP limits (WebSocket connections, HTTP rate limit, uploads) to the
+  # resolved client IP. Leave false until `guard netid` lines show the right IP for every entry point.
+  use_real_ip: false
+  netid_log: false                   # One `guard netid` line per client IP every 10 minutes
+  allow_ips: []                      # Matched against the resolved client IP only
+  pace:                              # Live audio arriving faster than real time
+    mode: "off"                      # off / log / enforce
+    max_ratio: 1.5                   # Reject when audio_sec > elapsed_sec * max_ratio + grace_sec
+    grace_sec: 3
+  admission:                         # Client format checks: device id, version, PTT duration
+    mode: "off"
+  quota:                             # Audio minutes per rolling 24 hours; 0 = no limit
+    mode: "off"
+    device_minutes: 100
+    ip_minutes: 400
+    nonlive_device_minutes: 20       # Non-live sessions count here and toward device / ip too
+    nonlive_ip_minutes: 50
+    demo_ip_minutes: 10              # Browser demo, per IP
+    internal_minutes: 1000           # Sessions from allow_ips (replaces the limits above)
+    demo_global_minutes: 100         # Browser demo, whole site (desktop clients are not affected)
+    # Session counts (number of starts), 0 = no limit. Rejected starts are not counted.
+    demo_ip_sessions_per_hour: 5
+    demo_ip_sessions_per_day: 20
+    demo_global_sessions_per_hour: 100
+    device_sessions_per_minute: 10   # Desktop, per device: a short window tolerates bursts,
+    device_sessions_per_hour: 100    # the longer windows stop round-the-clock automation
+    device_sessions_per_day: 500
+    ip_sessions_per_hour: 300        # Desktop, per IP (several devices behind one NAT)
+    ip_sessions_per_day: 2000
+    device_empty_per_hour: 10        # Desktop sessions whose transcript is empty or a single character
+  ai_budget:                         # AI polishing per rolling 24 hours; 0 = no limit
+    mode: "off"                      # Over the limit: transcription still works, polishing is skipped
+    device_tokens: 300000            # Tokens reported by the LLM API (input + output); estimated from characters if absent
+    ip_tokens: 800000
+    max_system_prompt_chars: 10000   # Sessions with a longer client system prompt skip polishing
+  web_demo:                          # The browser demo must come from these sites (WebSocket Origin header)
+    mode: "off"
+    allowed_origins: []              # e.g. ["https://your-site.example"]
+  alert:                             # One WARNING line per hour when the last hour exceeds; 0 = off
+    audio_minutes_per_hour: 0
+    ai_tokens_per_hour: 0
+    hits_per_hour: 0

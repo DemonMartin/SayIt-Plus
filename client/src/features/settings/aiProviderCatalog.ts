@@ -26,6 +26,8 @@ export interface AiProvider {
    */
   label: string
   defaultUrl: string
+  /** A blank URL uses the provider's default when saving. */
+  urlOptional?: boolean
   /** 建议的模型，第一个作为新建时的默认值；同时作为表单里的快速选择 */
   defaultModels: string[]
   /** 不需要 API Key（目前只有本机 Ollama） */
@@ -89,6 +91,14 @@ export const AI_PROVIDERS: AiProvider[] = [
     consoleUrl: 'https://console.groq.com/keys',
   },
   {
+    value: 'openrouter',
+    label: 'OpenRouter',
+    defaultUrl: 'https://openrouter.ai/api/v1',
+    urlOptional: true,
+    defaultModels: ['deepseek/deepseek-v4.1-flash'],
+    consoleUrl: 'https://openrouter.ai/settings/keys',
+  },
+  {
     value: 'openai_compat',
     get label() { return t('aiProvider.openaiCompat') },
     defaultUrl: 'https://api.openai.com',
@@ -103,12 +113,16 @@ export const AI_PROVIDERS: AiProvider[] = [
   },
 ]
 
-/** 新建服务时的地区默认；只影响还没选择过供应商的场景。 */
+/**
+ * 新建服务时的地区默认；只影响还没选择过供应商的场景。
+ * 英文默认 OpenRouter，与英文界面推荐的 DeepSeek V4.1 Flash（经 OpenRouter）一致；
+ * 中文不跟：国内付款和访问 OpenRouter 都不方便，直连 DeepSeek 更合适。
+ */
 export function preferredAiProviderValue(): string {
-  return getLocale() === 'en' ? 'openai_compat' : 'deepseek'
+  return getLocale() === 'en' ? 'openrouter' : 'deepseek'
 }
 
-/** 英文界面优先展示可直接接海外端点的通用入口，原数组顺序保持不变供迁移逻辑使用。 */
+/** 把地区默认那家排到最前，原数组顺序保持不变供迁移逻辑使用。 */
 export function aiProvidersForDisplay(): AiProvider[] {
   const preferred = preferredAiProviderValue()
   if (AI_PROVIDERS[0]?.value === preferred) return AI_PROVIDERS

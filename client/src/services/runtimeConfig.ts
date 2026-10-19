@@ -74,7 +74,7 @@ export function getBackendBaseUrl(): string {
  *  · 自建后端的用户，他的服务器上没有 manifest。**所以 checkVersionUpdate 必须保留
  *    回落到官方地址的那一步** —— 没有它，这些用户会拿到 404、被静默当成"没有新版"，
  *    从此永远收不到更新。那一步不是优化，是这个设计能成立的前提。
- *  · 更新包没有签名（main.rs 的 updater 插件因此禁用），manifest 的 SHA-512 只证明
+ *  · 更新包没有签名（所以没用 Tauri 的 updater 插件），manifest 的 SHA-512 只证明
  *    "下载的字节与 manifest 一致"、不证明"这个包是我们发的"。也就是说这个地址同时
  *    决定了「谁能在这台机器上装程序」。因此非官方地址时，关于页必须把更新来源显示
  *    出来（见 isOfficialUpdateChannel 的用处），别让它悄无声息。

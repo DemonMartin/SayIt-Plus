@@ -240,6 +240,27 @@ pub fn model_dir(model_id: &str) -> PathBuf {
     models_dir().join(model_id)
 }
 
+/// 模型 id 会直接拼进路径。来自前端的 id 必须先过这一关：
+/// `..\..` 能跳出模型目录，绝对路径会让 join 把前缀整个换掉 —— 而 delete_model 拿它去
+/// `remove_dir_all`，传一个 `C:\Users\<name>` 就是删掉整个用户目录。
+/// 目录里的 id 都是字母、数字、`-`、`.`、`_` 组成的短串。
+pub fn is_valid_model_id(model_id: &str) -> bool {
+    !model_id.is_empty()
+        && model_id.len() <= 96
+        && !model_id.starts_with('.')
+        && !model_id.contains("..")
+        && model_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// 校验过的 model_dir：id 不合规就报错，不碰磁盘。
+pub fn checked_model_dir(model_id: &str) -> Result<PathBuf, String> {
+    if is_valid_model_id(model_id) {
+        Ok(model_dir(model_id))
+    } else {
+        Err(format!("Invalid model id: {}", crate::providers::diag::truncate(model_id, 60)))
+    }
+}
+
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1626,175 +1647,20 @@ pub async fn download_file(
     }
 }
 
-/// 下载 tar.bz2 压缩包并解压到模型目录
-/// 解压时会跳过顶层目录（如 sherpa-onnx-funasr-nano-int8-2025-12-30/）
-/// 并跳过 test_wavs/ 目录和 README.md
-/// 为 GitHub Release 地址生成候选下载列表：国内加速代理优先，直连兜底。
-/// 非 GitHub 地址（如 ModelScope）原样返回。
-fn build_archive_candidates(url: &str) -> Vec<String> {
-    if url.starts_with("https://github.com/") {
-        vec![
-            format!("https://gh-proxy.com/{}", url),
-            format!("https://ghfast.top/{}", url),
-            url.to_string(),
-        ]
-    } else {
-        vec![url.to_string()]
-    }
-}
+#[cfg(test)]
+mod model_id_tests {
+    use super::{checked_model_dir, is_valid_model_id};
 
-/// 从单个 URL 下载压缩包到 temp_path（支持断点续传）。下载完整返回 Ok。
-async fn download_archive_once(
-    app: &AppHandle,
-    model_id: &str,
-    url: &str,
-    temp_path: &Path,
-) -> Result<(), String> {
-    let mut downloaded: u64 = if temp_path.exists() {
-        std::fs::metadata(temp_path).map(|m| m.len()).unwrap_or(0)
-    } else {
-        0
-    };
-
-    let client = build_http_client()?;
-    let mut request = client.get(url);
-    if downloaded > 0 {
-        request = request.header("Range", format!("bytes={}-", downloaded));
-        log::info!("Resuming archive download from {} bytes ({})", downloaded, url);
-    }
-
-    emit_progress(app, model_id, "archive", downloaded, 0, "downloading", None, 1, 1);
-
-    let resp = request
-        .send()
-        .await
-        .map_err(|e| download_error("download_network", format!("Download request failed: {}", e)))?;
-
-    if !resp.status().is_success() && resp.status().as_u16() != 206 {
-        return Err(download_error("download_network", format!("Download failed with HTTP {}", resp.status())));
-    }
-
-    let content_length = resp.content_length().unwrap_or(0);
-    let total = downloaded + content_length;
-
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(temp_path)
-        .map_err(|e| download_io_error("Failed to open partial archive", e))?;
-
-    let mut stream = resp.bytes_stream();
-    use futures_util::StreamExt;
-    let mut last_emit = std::time::Instant::now();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| download_error("download_network", format!("Download interrupted: {}", e)))?;
-        file.write_all(&chunk).map_err(|e| download_io_error("Failed to write partial archive", e))?;
-        downloaded += chunk.len() as u64;
-
-        if last_emit.elapsed().as_millis() >= 300 {
-            emit_progress(app, model_id, "archive", downloaded, total, "downloading", None, 1, 1);
-            last_emit = std::time::Instant::now();
+    #[test]
+    fn catalog_style_ids_pass_and_paths_are_rejected() {
+        for ok in ["sensevoice-small-gguf", "qwen3-asr-0.6b", "fun_asr.nano"] {
+            assert!(is_valid_model_id(ok), "{ok}");
+        }
+        for bad in ["", "..", "../x", r"..\..", r"C:\Users\someone", "/etc", "a/b", r"a\b", ".hidden", "x..y"] {
+            assert!(!is_valid_model_id(bad), "{bad}");
+            assert!(checked_model_dir(bad).is_err(), "{bad}");
         }
     }
-
-    file.flush().map_err(|e| download_io_error("Failed to flush partial archive", e))?;
-    drop(file);
-    Ok(())
-}
-
-pub async fn download_and_extract_tar_bz2(
-    app: AppHandle,
-    model_id: &str,
-    url: &str,
-) -> Result<(), String> {
-    let dest_dir = model_dir(model_id);
-    let archive_path = dest_dir.with_extension("tar.bz2");
-    let temp_path = dest_dir.with_extension("tar.bz2.part");
-
-    std::fs::create_dir_all(&dest_dir)
-        .map_err(|e| download_io_error("Failed to create model directory", e))?;
-
-    // 如果已经解压过（目录中有 onnx 文件），跳过下载
-    // funasr-nano: encoder_adaptor.int8.onnx / paraformer: model.int8.onnx / qwen3-asr: encoder.int8.onnx
-    if dest_dir.join("encoder_adaptor.int8.onnx").exists()
-        || dest_dir.join("model.int8.onnx").exists()
-        || dest_dir.join("encoder.int8.onnx").exists()
-    {
-        emit_progress(&app, model_id, "archive", 1, 1, "completed", None, 1, 1);
-        return Ok(());
-    }
-
-    // 多源下载：GitHub 地址自动优先走国内加速代理，失败再回退直连。
-    // 各镜像内容一致，可跨源断点续传（沿用已有 .part）。
-    let candidates = build_archive_candidates(url);
-    let mut last_err = download_error("download_network", "No download source is available");
-    let mut ok = false;
-    for (idx, cand) in candidates.iter().enumerate() {
-        match download_archive_once(&app, model_id, cand, &temp_path).await {
-            Ok(()) => { ok = true; break; }
-            Err(e) => {
-                log::warn!("Archive source {}/{} failed: {}", idx + 1, candidates.len(), e);
-                last_err = e;
-            }
-        }
-    }
-    if !ok {
-        emit_progress(&app, model_id, "archive", 0, 0, "failed", Some(&last_err), 1, 1);
-        return Err(last_err);
-    }
-
-    std::fs::rename(&temp_path, &archive_path)
-        .map_err(|e| download_io_error("Failed to finalize downloaded archive", e))?;
-
-    log::info!("Archive downloaded: {}", model_id);
-    emit_progress(&app, model_id, "extracting", 0, 0, "downloading", None, 1, 1);
-
-    // 解压 tar.bz2
-    let archive_file = std::fs::File::open(&archive_path)
-        .map_err(|e| download_io_error("Failed to open downloaded archive", e))?;
-    let bz_decoder = bzip2::read::BzDecoder::new(archive_file);
-    let mut archive = tar::Archive::new(bz_decoder);
-
-    for entry in archive.entries().map_err(|e| download_error("download_failed", format!("Failed to read archive: {}", e)))? {
-        let mut entry = entry.map_err(|e| download_error("download_failed", format!("Failed to read archive entry: {}", e)))?;
-        let path = entry.path().map_err(|e| download_error("download_failed", format!("Failed to read archive path: {}", e)))?;
-        let path_str = path.to_string_lossy().to_string();
-
-        // 跳过 test_wavs/ 和 README.md
-        if path_str.contains("test_wavs/") || path_str.ends_with("README.md") {
-            continue;
-        }
-
-        // 去掉顶层目录（如 sherpa-onnx-funasr-nano-int8-2025-12-30/）
-        let components: Vec<_> = path.components().collect();
-        if components.len() <= 1 {
-            continue; // 跳过顶层目录本身
-        }
-        let relative: std::path::PathBuf = components[1..].iter().collect();
-        let dest = dest_dir.join(&relative);
-
-        if entry.header().entry_type().is_dir() {
-            std::fs::create_dir_all(&dest).ok();
-        } else {
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent).ok();
-            }
-            let mut out = std::fs::File::create(&dest)
-                .map_err(|e| download_io_error(&format!("Failed to create extracted file {:?}", relative), e))?;
-            std::io::copy(&mut entry, &mut out)
-                .map_err(|e| download_io_error(&format!("Failed to extract file {:?}", relative), e))?;
-        }
-    }
-
-    // 删除压缩包
-    std::fs::remove_file(&archive_path).ok();
-
-    emit_progress(&app, model_id, "archive", 1, 1, "completed", None, 1, 1);
-    log::info!("Archive extracted: {}", model_id);
-
-    Ok(())
 }
 
 #[cfg(test)]

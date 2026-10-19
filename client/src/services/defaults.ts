@@ -26,8 +26,9 @@ export const DEFAULTS: Record<string, unknown> = {
   // （详见 lib/shortcutKeys.ts 的 PTT_FORBIDDEN_CODES）。这里曾经是 'ShiftRight'，
   // 于是每台新装的机器开箱就绑在那个键上。右 Ctrl 位置相近、没有辅助功能陷阱，
   // 也不和免提的默认键（右 Alt）撞。
-  // ⚠️ 改这里要同步 Rust：src-tauri/src/storage/mod.rs 的种子默认值、main.rs 的兜底、
-  // keyboard/mod.rs 的 PttKeyConfig::fallback()。
+  // ⚠️ 改这里要同步 Rust：src-tauri/src/defaults.rs 和 storage/mod.rs 的种子。
+  // defaults.rs 里有读本文件的对账测试，漏改 cargo test 会红。
+  // 对账测试按「key: '值',」逐行解析，这几行保持单行字面量。
   shortcutPTT: 'ControlRight',
   shortcutHandsFree: 'AltRight', // 免提模式。默认右 Alt 单键。也支持组合键格式如 'Control+Shift+S'
   // AI 整理总开关。留空 = 不注册，避免升级时意外占用用户已有的全局组合键。
@@ -49,6 +50,7 @@ export const DEFAULTS: Record<string, unknown> = {
   aiMinDurationSec: 0,
   // 读取光标附近文字/选区并交给 AI，用于上下文续写与语音编辑。涉及正文读取，默认关闭。
   contextAwareWritingEnabled: false,
+  contextSelectionAiProfileId: '', // 空字符串 = 选区编辑沿用当前 AI；否则引用已保存的 AI 服务
   aiPromptAppend: '', // 全局附加 prompt
   'ai.builtinPromptLanguage': 'zh-CN', // 内置 Prompt 内容语言；与界面语言相互独立
 
@@ -87,6 +89,7 @@ export const DEFAULTS: Record<string, unknown> = {
   // 服务列表：一张卡 = 一份完整配置（供应商 + 该平台凭据），同一家可存多份
   'cloudAsr.profiles': [],
   'cloudAsr.activeProfileId': '',
+  'asr.fallback': { enabled: false, steps: [] },
   // 已经自动补建过哪些服务。刻意不是「迁移完成」那种布尔标记 —— 记「补过谁」才能
   // 既在逻辑修好后自愈，又不把用户主动删掉的卡救回来。
   'cloudAsr.autoCreatedProviders': [],
@@ -155,9 +158,9 @@ export const DEFAULTS: Record<string, unknown> = {
   // ── WebDAV 备份 ──
   // 备份包一定含配置，历史与录音可选。两个都默认 false：录音库能有几个 GB，而网盘
   // （尤其坚果云免费版）有月流量额度，默认打开等于替用户做了一个很贵的决定。
-  // ⚠️ Rust 侧 commands/webdav.rs 里也有一份默认值（setting_bool 的 unwrap_or(false)
-  // 与 DEFAULT_KEEP_COUNT），改这里要一起改 —— 两份不一致时界面显示的和实际上传的
-  // 就不是一回事了。
+  // ⚠️ Rust 侧在 src-tauri/src/defaults.rs 有一份（includeHistory / includeAudio / keepCount），
+  // 改这里要一起改 —— 两份不一致时界面显示的和实际上传的就不是一回事了。那边有读本文件的
+  // 对账测试，漏改 cargo test 会红。
   'webdav.enabled': false, // 自动定期备份。可选: true | false
   'webdav.url': '', // 目录地址，只接受 https（Basic 认证等于明文发密码）
   'webdav.username': '',

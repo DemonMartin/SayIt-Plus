@@ -24,6 +24,16 @@ import type {
   StopOptions,
 } from './types'
 
+/**
+ * 攒够这么多字节才发一个 WebSocket 包：16 kHz、16 bit 单声道下正好 200 ms。
+ *
+ * 采集端每 8 ms 左右给一帧（AudioWorklet 一个渲染块），原来收到就发，每秒 125 个
+ * 256 字节的小包，回落路径更碎（每秒约 375 个 85 字节）。服务端松键之前只是把音频攒着，
+ * 没有流式结果，所以合批不影响识别结果和速度；云 API 模式一直就是 200 ms 一批。
+ * 松键时剩下的不足 200 ms 一定在 stop 之前发掉（见 flushAudio）。
+ */
+const SEND_BATCH_BYTES = 6400
+
 export class ServerProvider implements TranscriptionProvider {
   readonly mode = 'server' as const
 
@@ -37,6 +47,8 @@ export class ServerProvider implements TranscriptionProvider {
   /** 松键时随 stop 传入的本次策略；与线上那个 disable_ai 布尔同出一源。 */
   private activePolicy: AiPolicy | undefined
   private activeConnectionId: string | undefined
+  private pendingAudio: ArrayBuffer[] = []
+  private pendingAudioBytes = 0
 
   async connect(callbacks: TranscriptionCallbacks): Promise<void> {
     this.callbacks = callbacks
@@ -150,8 +162,10 @@ export class ServerProvider implements TranscriptionProvider {
   }
 
   start(opts: StartOptions): boolean {
-    // 设置页可在不切换工作模式的情况下改变来源；每次 start 都同步取运行时真值。
-    this.aiSource = getRuntimeServerAiSource()
+    // 选区模型只覆盖本次录音；普通录音沿用开始时冻结的来源或当前运行时设置。
+    this.aiSource = opts.aiConfig?.selectionAiOverride
+      ? 'custom'
+      : opts.aiConfig?.serverAiSource ?? getRuntimeServerAiSource()
     this.activeRunId = opts.runId
     this.activeStartOpts = {
       ...opts,
@@ -160,12 +174,14 @@ export class ServerProvider implements TranscriptionProvider {
     }
     this.customFinalPending = false
     this.serverDonePending = false
+    this.dropPendingAudio()
 
     const wireOptions = this.aiSource === 'custom'
       ? {
         ...opts,
         // 自定义 AI 由本机调用：服务端只做 ASR，也不需要收到 Prompt 或编辑器正文。
         disableAi: true,
+        selectionAiConfig: undefined,
         systemPrompt: undefined,
         textContext: undefined,
       }
@@ -181,13 +197,41 @@ export class ServerProvider implements TranscriptionProvider {
   }
 
   sendAudio(buffer: ArrayBuffer): void {
-    ws.sendAudio(buffer)
+    this.pendingAudio.push(buffer)
+    this.pendingAudioBytes += buffer.byteLength
+    if (this.pendingAudioBytes >= SEND_BATCH_BYTES) this.flushAudio()
+  }
+
+  private flushAudio(): void {
+    if (this.pendingAudio.length === 0) return
+    const chunks = this.pendingAudio
+    const total = this.pendingAudioBytes
+    this.pendingAudio = []
+    this.pendingAudioBytes = 0
+    if (chunks.length === 1) {
+      ws.sendAudio(chunks[0])
+      return
+    }
+    const merged = new Uint8Array(total)
+    let offset = 0
+    for (const chunk of chunks) {
+      merged.set(new Uint8Array(chunk), offset)
+      offset += chunk.byteLength
+    }
+    ws.sendAudio(merged.buffer)
+  }
+
+  private dropPendingAudio(): void {
+    this.pendingAudio = []
+    this.pendingAudioBytes = 0
   }
 
   stop(opts?: StopOptions): boolean {
     // 留住完整策略，别再把它压成 activeStartOpts.disableAi —— 那样一来"路由是自配"
     // 和"低于门槛"就都变成同一个布尔，结束时再也分不出这次为什么没整理。
     if (opts?.aiPolicy) this.activePolicy = opts.aiPolicy
+    // 尾巴必须先于 stop 发出：服务端收到 stop 就开始识别，之后到的音频不算数。
+    this.flushAudio()
     return ws.sendStop(this.aiSource === 'custom' ? { ...opts, disableAi: true } : opts)
   }
 
@@ -203,6 +247,7 @@ export class ServerProvider implements TranscriptionProvider {
       aiEnabled: snapshot?.aiEnabled ?? !(this.activeStartOpts?.disableAi ?? false),
       aiMinDurationSec: snapshot?.aiMinDurationSec ?? this.activeStartOpts?.aiMinDurationSec ?? 0,
       serverAiSource: snapshot?.serverAiSource ?? this.aiSource,
+      selectionAiOverride: snapshot?.selectionAiOverride,
       audioDurationSec: durationSec,
     })
     this.activePolicy = fallback
@@ -258,6 +303,7 @@ export class ServerProvider implements TranscriptionProvider {
   }
 
   private resetRun(): void {
+    this.dropPendingAudio()
     if (this.activeRunId !== 0 && this.customFinalPending) {
       addRuntimeEvent('info', 'server', 'Discarded pending custom AI result for stale run', {
         runId: this.activeRunId,

@@ -45,6 +45,8 @@ export interface AiConfigSnapshot {
   aiMinDurationSec: number
   /** 仅服务器模式有意义；其它模式整理一律由客户端执行。 */
   serverAiSource: 'managed' | 'custom'
+  /** A selected-text edit explicitly chooses a separate client AI profile. */
+  selectionAiOverride?: boolean
 }
 
 export interface AiPolicyInput extends AiConfigSnapshot {
@@ -98,13 +100,14 @@ export function resolveAiPolicy(input: AiPolicyInput): AiPolicy {
 
   // 路由只看配置，与「这次跑不跑」无关。日志里保留它才能回答
   // 「AI 开着但没整理，本来该谁做」。
-  const route: AiRoute = input.integratedAsr
+  const integratedAsr = input.integratedAsr && !input.selectionAiOverride
+  const route: AiRoute = integratedAsr
     ? 'integrated_asr'
-    : input.workMode === 'server' && input.serverAiSource === 'managed'
+    : !input.selectionAiOverride && input.workMode === 'server' && input.serverAiSource === 'managed'
       ? 'managed'
       : 'custom'
 
-  if (input.integratedAsr) {
+  if (integratedAsr) {
     return { ...base, route, allowCall: false, reason: 'integrated_asr' }
   }
   if (minAudioMs > 0 && audioMs < minAudioMs) {
@@ -262,6 +265,7 @@ export function policyFromSnapshot(
     aiEnabled: snapshot?.aiEnabled ?? true,
     aiMinDurationSec: snapshot?.aiMinDurationSec ?? 0,
     serverAiSource: snapshot?.serverAiSource ?? 'managed',
+    selectionAiOverride: snapshot?.selectionAiOverride,
     audioDurationSec,
     integratedAsr,
   })

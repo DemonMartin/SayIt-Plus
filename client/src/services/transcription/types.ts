@@ -4,6 +4,7 @@
 import type { ActiveAppContext, TextContext } from '../../types/appContext'
 import type { ClientRuntimeInfo } from '../../types/appApi'
 import type { AiConfigSnapshot, AiPolicy } from './aiPolicy'
+import type { ClientAiConfig } from './selectionAi'
 
 export type WorkMode = 'server' | 'cloud_api' | 'local'
 
@@ -32,6 +33,8 @@ export interface ASRResult {
 }
 
 export interface FinalResult {
+  asrFallback?: boolean
+  workMode?: WorkMode
   asrText: string
   llmText: string
   asrMs: number
@@ -65,6 +68,8 @@ export interface FinalResult {
 }
 
 export interface TranscriptionCallbacks {
+  /** A backup attempt is starting; the recorder grants it a fresh, bounded timeout. */
+  onFallbackStart?: (mode: WorkMode) => void
   onStateChange?: (state: ProviderState) => void
   onReady?: (info: { connectionId?: string; asr: boolean; llm: boolean }) => void
   /** 流式识别过程中的中间结果（实时上屏用），text 为到目前为止的累计文本 */
@@ -85,6 +90,8 @@ export interface StartOptions {
    * 这条记录的原因也不能跟着变。
    */
   aiConfig?: AiConfigSnapshot
+  /** Frozen selection-edit credentials for this run only. Never serialize to logs or history. */
+  selectionAiConfig?: ClientAiConfig | null
   systemPrompt?: string
   disableAi?: boolean
   /** 录音未达到该时长时只做识别，不调用 AI。0 / undefined = 不设门槛。 */

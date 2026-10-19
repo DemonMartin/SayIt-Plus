@@ -299,15 +299,72 @@ fn file_sha512_base64(path: &std::path::Path) -> Result<String, String> {
 /// 会让每次开机都把整包重下一遍 —— 旧流程下载完立刻安装，所以从来没暴露过。
 #[tauri::command]
 pub fn verify_update_package(file_path: String, sha512: Option<String>) -> Result<bool, String> {
-    let path = std::path::Path::new(&file_path);
-    if !path.is_file() {
+    // 没记哈希的包（0.1.x 早期下载的）不再复用，宁可重下一遍：
+    // 「只确认文件在」正是恶意备份能把任意 exe 塞进待安装的那个口子。
+    let (Ok(path), Some(expected)) = (resolve_update_package(&file_path), non_empty(sha512.as_deref())) else {
         return Ok(false);
+    };
+    Ok(file_sha512_base64(&path)? == expected)
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// 更新包只放在这一个目录里。安装前一律核对路径确实在这里面。
+fn update_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("sayit-update")
+}
+
+/// 安装包落盘用的文件名：只取 URL 路径的最后一段，而且必须是普通的 `xxx.exe`。
+/// 原来直接 `url.split('/').last()`，一个带查询串或奇怪字符的地址就能让文件名跑偏。
+fn installer_file_name(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let last = parsed.path_segments()?.last()?.to_string();
+    let valid = last.len() <= 128
+        && last.to_ascii_lowercase().ends_with(".exe")
+        && !last.starts_with('.')
+        && last.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    valid.then_some(last)
+}
+
+/// 把前端或设置里给的安装包路径解析成真实路径，并确认它在更新目录里、是 .exe。
+///
+/// 安装程序是以用户身份静默执行的，所以这里是"SayIt 会运行哪个文件"的最后一道关。
+/// 恶意备份曾经能把 pendingUpdate 指到 audio 目录里伪装成录音的 exe（审核 S3）。
+fn resolve_update_package(file_path: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::fs::canonicalize(file_path)
+        .map_err(|_| "The installer file does not exist".to_string())?;
+    let dir = std::fs::canonicalize(update_dir())
+        .map_err(|_| "The update directory does not exist".to_string())?;
+    let is_exe = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+    if !path.is_file() || path.parent() != Some(dir.as_path()) || !is_exe {
+        return Err("The installer is not in the update directory".to_string());
     }
-    match sha512.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        Some(expected) => Ok(file_sha512_base64(path)? == expected),
-        // 没记哈希的包（本次改造之前下载的）只能确认文件在
-        None => Ok(true),
+    Ok(path)
+}
+
+/// 安装前的完整核对：路径在更新目录里，且哈希等于设置里 pendingUpdate 记的那个值。
+/// 用户主动安装和退出兜底安装共用，两条路都不能跳过。
+fn checked_pending_installer(storage: &Storage, file_path: &str) -> Result<std::path::PathBuf, String> {
+    let path = resolve_update_package(file_path)?;
+    let pending = storage.get("pendingUpdate", None);
+    let pending_path = pending
+        .get("filePath")
+        .and_then(Value::as_str)
+        .and_then(|p| std::fs::canonicalize(p).ok());
+    if pending_path.as_deref() != Some(path.as_path()) {
+        return Err("The installer does not match the downloaded update".to_string());
     }
+    let expected = non_empty(pending.get("sha512").and_then(Value::as_str))
+        .ok_or_else(|| "The downloaded update has no checksum".to_string())?;
+    if file_sha512_base64(&path)? != expected {
+        return Err("Update package integrity check failed (SHA-512 mismatch)".to_string());
+    }
+    Ok(path)
 }
 
 #[derive(Serialize, Clone)]
@@ -340,11 +397,36 @@ fn emit_update_progress(app: &AppHandle, downloaded: u64, total: u64, status: &s
 }
 
 /// 下载更新安装包到临时目录，下载过程中通过 update-download-progress 事件上报真实字节进度。
-/// 传了 sha512（manifest 里的 Base64）就在落盘后校验，不通过直接删掉并报错。
+/// sha512（manifest 里的 Base64）必须有，落盘后校验，不通过直接删掉并报错。
+/// 下载地址必须与服务器设置或官方地址同源（net_policy::update_url_allowed）。
 #[tauri::command]
-pub async fn download_update(app: AppHandle, url: String, sha512: Option<String>) -> Result<String, String> {
-    use futures_util::StreamExt;
-    use std::io::Write;
+pub async fn download_update(
+    app: AppHandle,
+    storage: State<'_, Storage>,
+    url: String,
+    sha512: Option<String>,
+) -> Result<String, String> {
+
+    let fail = |msg: String| {
+        write_log_line(&format!("[update] download refused: {}", msg));
+        emit_update_progress(&app, 0, 0, "failed", Some(&msg));
+        msg
+    };
+    let configured = storage
+        .get(crate::net_policy::BACKEND_BASE_URL_KEY, None)
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    if !crate::net_policy::update_url_allowed(&url, &configured) {
+        return Err(fail("Update download address is not on the configured or official server".to_string()));
+    }
+    // 两个更新通道的 manifest 都带 sha512（2026-10 核对过）。没有哈希就无从确认下到的是什么，不下。
+    let Some(expected_sha512) = non_empty(sha512.as_deref()).map(str::to_string) else {
+        return Err(fail("Update manifest has no SHA-512 checksum".to_string()));
+    };
+    let Some(filename) = installer_file_name(&url) else {
+        return Err(fail("Update download address does not point to an installer".to_string()));
+    };
 
     // 必须带 User-Agent：生产环境 AWS WAF 的 NoUserAgent_HEADER 规则会拦截无 UA 的请求（403）
     let client = reqwest::Client::builder()
@@ -352,70 +434,26 @@ pub async fn download_update(app: AppHandle, url: String, sha512: Option<String>
         .build()
         .map_err(|e| format!("Failed to initialize download client: {}", e))?;
 
-    emit_update_progress(&app, 0, 0, "downloading", None);
-
-    let resp = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(300))
-        .send()
-        .await
-        .map_err(|e| {
-            let msg = format!("Download failed: {}", e);
-            emit_update_progress(&app, 0, 0, "failed", Some(&msg));
-            msg
-        })?;
-
-    if !resp.status().is_success() {
-        let msg = format!("Download failed: HTTP {}", resp.status());
-        emit_update_progress(&app, 0, 0, "failed", Some(&msg));
-        return Err(msg);
-    }
-
-    let total = resp.content_length().unwrap_or(0);
-
-    // 从 URL 提取文件名
-    let filename = url.split('/').last().unwrap_or("SayIt-Setup.exe").to_string();
-    let temp_dir = std::env::temp_dir().join("sayit-update");
+    let temp_dir = update_dir();
     std::fs::create_dir_all(&temp_dir).map_err(|e| format!("Failed to create temporary directory: {}", e))?;
     let file_path = temp_dir.join(&filename);
-
-    let mut file = std::fs::File::create(&file_path)
-        .map_err(|e| format!("Failed to create file: {}", e))?;
-
-    let mut downloaded: u64 = 0;
-    let mut stream = resp.bytes_stream();
-    let mut last_emit = std::time::Instant::now();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            let msg = format!("Download interrupted: {}", e);
-            emit_update_progress(&app, downloaded, total, "failed", Some(&msg));
-            msg
-        })?;
-        file.write_all(&chunk).map_err(|e| format!("Failed to write file: {}", e))?;
-        downloaded += chunk.len() as u64;
-
-        // 每 200ms 发送一次进度，避免刷屏
-        if last_emit.elapsed().as_millis() >= 200 {
-            emit_update_progress(&app, downloaded, total, "downloading", None);
-            last_emit = std::time::Instant::now();
-        }
-    }
-
-    file.flush().map_err(|e| format!("Failed to flush file: {}", e))?;
-    drop(file);
+    // 先写到 .part，校验通过才改名：半截文件永远不会被当成可安装的包。
+    let part_path = temp_dir.join(format!("{}.part", filename));
+    let (downloaded, total) = fetch_installer_part(&client, &url, &part_path, &mut |done, total, status, error| {
+        emit_update_progress(&app, done, total, status, error)
+    })
+    .await?;
 
     // 校验放在"completed"之前：前端收到 completed 就会把这个包记成待安装，
     // 先报完成再发现哈希不对，等于让一个坏包进入待安装状态。
-    if let Some(expected) = sha512.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        let actual = file_sha512_base64(&file_path).map_err(|e| {
+    {
+        let actual = file_sha512_base64(&part_path).map_err(|e| {
             emit_update_progress(&app, downloaded, total, "failed", Some(&e));
             e
         })?;
-        if actual != expected {
-            // 坏包必须删掉：它会在临时目录里等到用户点更新，留着的话下次启动
-            // verify_update_package 只看文件名，会把它当成"已下载"直接拿去装。
-            let _ = std::fs::remove_file(&file_path);
+        if actual != expected_sha512 {
+            // 坏包必须删掉（续传接错了版本也会走到这里）：下次从头下。
+            let _ = std::fs::remove_file(&part_path);
             let msg = "Update package integrity check failed (SHA-512 mismatch)".to_string();
             write_log_line("[update] downloaded package failed SHA-512 verification, discarded");
             emit_update_progress(&app, downloaded, total, "failed", Some(&msg));
@@ -426,11 +464,112 @@ pub async fn download_update(app: AppHandle, url: String, sha512: Option<String>
     // 新包已经校验通过，把同目录里其它版本的安装包删掉。
     // 旧流程下载完立刻安装，包只存在几秒；现在它按设计等到用户点更新或退出时才用，
     // 于是每升一次版就在 %TEMP% 里多躺一个十几 MB 的安装包，没人清。
+    std::fs::rename(&part_path, &file_path)
+        .map_err(|e| format!("Failed to finalize the downloaded installer: {}", e))?;
     prune_stale_packages(&temp_dir, &filename);
 
     emit_update_progress(&app, downloaded, total.max(downloaded), "completed", None);
 
     Ok(file_path.to_string_lossy().to_string())
+}
+
+/// 把安装包下载（或接着下载）到 `part_path`。返回 (已下载字节, 总字节)。
+///
+/// 已有 .part 就用 Range 续传；服务器回 200 就整包重下。没有总超时，只在 60 秒收不到
+/// 任何数据时判定中断，.part 留着下次接着下。拆成独立函数是为了能用本地 HTTP 服务器测。
+async fn fetch_installer_part(
+    client: &reqwest::Client,
+    url: &str,
+    part_path: &std::path::Path,
+    progress: &mut (dyn FnMut(u64, u64, &str, Option<&str>) + Send),
+) -> Result<(u64, u64), String> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+
+    let resume_from = std::fs::metadata(part_path).map(|m| m.len()).unwrap_or(0);
+
+    progress(resume_from, 0, "downloading", None);
+
+    // 不设整次请求的总超时：原来是 300 秒，网慢的用户（14.8 MB 在 50 KB/s 下要 5 分钟）
+    // 永远下不完、每次都从头来。现在只限制连接和「多久一个字节都没收到」（见下面的 STALL）。
+    let mut request = client.get(url);
+    if resume_from > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={}-", resume_from));
+    }
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| {
+            let msg = format!("Download failed: {}", e);
+            progress(resume_from, 0, "failed", Some(&msg));
+            msg
+        })?;
+
+    if !resp.status().is_success() {
+        let msg = format!("Download failed: HTTP {}", resp.status());
+        progress(resume_from, 0, "failed", Some(&msg));
+        // 416：.part 已经比服务器上的文件还长（多半是换了版本、同名），扔掉重来。
+        if resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            let _ = std::fs::remove_file(part_path);
+        }
+        return Err(msg);
+    }
+
+    // 206 = 服务器接着给；200 = 不支持续传，整包重下。
+    let resumed = resume_from > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let mut downloaded: u64 = if resumed { resume_from } else { 0 };
+    let total = resp.content_length().map(|len| len + downloaded).unwrap_or(0);
+    if resume_from > 0 {
+        write_log_line(&format!(
+            "[update] resuming download from {} bytes: server {}",
+            resume_from,
+            if resumed { "accepted the range" } else { "ignored the range, starting over" }
+        ));
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resumed)
+        .truncate(!resumed)
+        .open(part_path)
+        .map_err(|e| format!("Failed to create file: {}", e))?;
+
+    let mut stream = resp.bytes_stream();
+    let mut last_emit = std::time::Instant::now();
+    // 60 秒一个字节都没收到才算断：慢网照样能下完，真断线也不会一直挂着。
+    const STALL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    loop {
+        let next = match tokio::time::timeout(STALL, stream.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                let msg = "Download stalled: no data for 60 seconds".to_string();
+                progress(downloaded, total, "failed", Some(&msg));
+                // .part 留着，下次接着下
+                return Err(msg);
+            }
+        };
+        let Some(chunk) = next else { break };
+        let chunk = chunk.map_err(|e| {
+            let msg = format!("Download interrupted: {}", e);
+            progress(downloaded, total, "failed", Some(&msg));
+            msg
+        })?;
+        file.write_all(&chunk).map_err(|e| format!("Failed to write file: {}", e))?;
+        downloaded += chunk.len() as u64;
+
+        // 每 200ms 发送一次进度，避免刷屏
+        if last_emit.elapsed().as_millis() >= 200 {
+            progress(downloaded, total, "downloading", None);
+            last_emit = std::time::Instant::now();
+        }
+    }
+
+    file.flush().map_err(|e| format!("Failed to flush file: {}", e))?;
+    drop(file);
+
+    Ok((downloaded, total))
 }
 
 /// 删掉更新目录里除 keep 之外的所有文件。
@@ -521,13 +660,26 @@ fn spawn_installer(installer_path: &str, relaunch: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// 系统是否正在关机或注销（GetSystemMetrics(SM_SHUTTINGDOWN)）。
+#[cfg(target_os = "windows")]
+fn system_is_shutting_down() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
+    unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+}
+
 /// 用户主动点「立即更新」：装完重新拉起应用。
 #[tauri::command]
-pub fn install_downloaded_update(file_path: String, relaunch: bool, app: AppHandle) -> Result<(), String> {
-    let path = std::path::Path::new(&file_path);
-    if !path.exists() {
-        return Err("The installer file does not exist".to_string());
-    }
+pub fn install_downloaded_update(
+    file_path: String,
+    relaunch: bool,
+    app: AppHandle,
+    storage: State<'_, Storage>,
+) -> Result<(), String> {
+    let checked = checked_pending_installer(storage.inner(), &file_path).map_err(|e| {
+        write_log_line(&format!("[update] install refused: {}", e));
+        e
+    })?;
+    let file_path = checked.to_string_lossy().trim_start_matches(r"\\?\").to_string();
 
     #[cfg(target_os = "windows")]
     {
@@ -563,7 +715,9 @@ pub fn install_downloaded_update(file_path: String, relaunch: bool, app: AppHand
 /// （pendingUpdate 装完即清），代价比"永远不知道更新了什么"小。取舍记在
 /// .kiro/decisions.md。
 ///
-/// 只做存在性检查，不重算哈希：退出路径上不能卡几百毫秒，完整性在下载时已经验过。
+/// 装之前与用户主动安装同一套核对（路径在更新目录里 + 哈希对得上）。原来这里只看文件在不在，
+/// 理由是退出路径不能卡几百毫秒；实际 15 MB 的包算一次 SHA-512 是几十毫秒，
+/// 而"只看文件在不在"正是恶意备份能让退出时运行任意 exe 的那个口子（审核 S3）。
 pub fn install_pending_update_on_exit(app: &AppHandle) {
     use std::sync::atomic::Ordering;
     use tauri::Manager;
@@ -574,15 +728,27 @@ pub fn install_pending_update_on_exit(app: &AppHandle) {
         return;
     }
 
+    // 关机 / 注销时不装：系统几秒内就会结束所有进程，安装程序可能被杀在一半，
+    // 下次开机就是一个装了一半的 SayIt。待安装包留着，下次正常退出时再装。
+    #[cfg(target_os = "windows")]
+    if system_is_shutting_down() {
+        write_log_line("[update] system is shutting down; leaving the pending update for the next exit");
+        return;
+    }
+
     let storage: State<Storage> = app.state();
     let pending = storage.get("pendingUpdate", None);
     let file_path = match pending.get("filePath").and_then(|v| v.as_str()) {
         Some(value) if !value.is_empty() => value.to_string(),
         _ => return,
     };
-    if !std::path::Path::new(&file_path).is_file() {
-        return;
-    }
+    let file_path = match checked_pending_installer(storage.inner(), &file_path) {
+        Ok(path) => path.to_string_lossy().trim_start_matches(r"\\?\").to_string(),
+        Err(e) => {
+            write_log_line(&format!("[update] exit-path install skipped: {}", e));
+            return;
+        }
+    };
 
     #[cfg(target_os = "windows")]
     {
@@ -654,6 +820,11 @@ pub fn save_audio_to_downloads(base64_data: String, filename: String) -> Result<
     let downloads = dirs::download_dir()
         .ok_or_else(|| "Could not locate the Downloads directory".to_string())?;
 
+    // filename 会拼进下载目录，带 `..\` 就能写到别处（比如开机启动目录）。只收单段的 .wav 名字。
+    if !crate::path_guard::is_plain_file_name(&filename, "wav") {
+        return Err("Invalid audio file name".to_string());
+    }
+
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&base64_data)
         .map_err(|e| format!("Failed to decode base64 audio: {}", e))?;
@@ -669,6 +840,12 @@ pub fn save_audio_to_downloads(base64_data: String, filename: String) -> Result<
 /// 打开文件所在的文件夹（并选中文件）
 #[tauri::command]
 pub fn reveal_file_in_folder(file_path: String) -> Result<(), String> {
+    // 只对真实存在的本地文件/目录调 explorer。explorer 的参数里塞 URL 或 shell: 路径
+    // 会被它当成要打开的东西，不再是"在文件夹里选中"。
+    let path = std::path::Path::new(&file_path);
+    if !path.is_absolute() || !path.exists() {
+        return Err(format!("File does not exist: {}", file_path));
+    }
     #[cfg(target_os = "windows")]
     {
         // explorer /select, 会打开文件夹并高亮选中文件
@@ -725,4 +902,141 @@ pub fn open_folder(folder_path: String) -> Result<(), String> {
         .map_err(|e| format!("Failed to open folder: {}", e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod update_path_tests {
+    use super::*;
+
+    #[test]
+    fn installer_name_comes_from_the_last_path_segment_only() {
+        assert_eq!(
+            installer_file_name("https://sayitapp.site/api/desktop-updates/win32/x64/SayIt_0.2.2_x64-setup.exe").as_deref(),
+            Some("SayIt_0.2.2_x64-setup.exe")
+        );
+        assert_eq!(
+            installer_file_name("https://sayitapp.site/a/SayIt.exe?x=../../evil").as_deref(),
+            Some("SayIt.exe")
+        );
+        assert!(installer_file_name("https://sayitapp.site/a/run.bat").is_none());
+        assert!(installer_file_name("https://sayitapp.site/a/..%5Cevil.exe").is_none());
+        assert!(installer_file_name("https://sayitapp.site/").is_none());
+    }
+
+    #[test]
+    fn packages_outside_the_update_directory_are_rejected() {
+        let outside = std::env::temp_dir().join(format!("sayit-not-update-{}.exe", uuid::Uuid::new_v4()));
+        std::fs::write(&outside, b"MZ").unwrap();
+        assert!(resolve_update_package(&outside.to_string_lossy()).is_err());
+        let _ = std::fs::remove_file(&outside);
+
+        std::fs::create_dir_all(update_dir()).unwrap();
+        let inside_txt = update_dir().join(format!("sayit-test-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&inside_txt, b"x").unwrap();
+        assert!(resolve_update_package(&inside_txt.to_string_lossy()).is_err());
+        let _ = std::fs::remove_file(&inside_txt);
+    }
+
+    #[test]
+    fn package_without_a_recorded_hash_is_not_reused() {
+        std::fs::create_dir_all(update_dir()).unwrap();
+        let pkg = update_dir().join(format!("sayit-test-{}.exe", uuid::Uuid::new_v4()));
+        std::fs::write(&pkg, b"MZ").unwrap();
+        let path = pkg.to_string_lossy().to_string();
+        assert_eq!(verify_update_package(path.clone(), None).unwrap(), false);
+        let good = file_sha512_base64(&pkg).unwrap();
+        assert_eq!(verify_update_package(path.clone(), Some(good)).unwrap(), true);
+        assert_eq!(verify_update_package(path, Some("AAAA".into())).unwrap(), false);
+        let _ = std::fs::remove_file(&pkg);
+    }
+}
+
+#[cfg(test)]
+mod resume_download_tests {
+    use super::fetch_installer_part;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// 每个连接回一个预先写好的响应，并把收到的请求头记下来。
+    fn serve(responses: Vec<Vec<u8>>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 { break; }
+                    req.extend_from_slice(&buf[..n]);
+                }
+                requests.push(String::from_utf8_lossy(&req).to_lowercase());
+                stream.write_all(&response).unwrap();
+            }
+            requests
+        });
+        (format!("http://{}/SayIt.exe", addr), handle)
+    }
+
+    fn part_file(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sayit-resume-{}-{}", tag, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("SayIt.exe.part")
+    }
+
+    #[tokio::test]
+    async fn resumes_from_an_existing_part_file() {
+        let part = part_file("resume");
+        std::fs::write(&part, b"HELLO ").unwrap();
+        let (url, server) = serve(vec![
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 6-10/11\r\nConnection: close\r\n\r\nWORLD".to_vec(),
+        ]);
+        let client = reqwest::Client::new();
+        let (done, total) = fetch_installer_part(&client, &url, &part, &mut |_, _, _, _| {}).await.unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), b"HELLO WORLD");
+        assert_eq!((done, total), (11, 11));
+        let requests = server.join().unwrap();
+        assert!(requests[0].contains("range: bytes=6-"), "{}", requests[0]);
+    }
+
+    #[tokio::test]
+    async fn starts_over_when_the_server_ignores_the_range() {
+        let part = part_file("restart");
+        std::fs::write(&part, b"STALE BYTES").unwrap();
+        let (url, server) = serve(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nNEW!".to_vec(),
+        ]);
+        let client = reqwest::Client::new();
+        fetch_installer_part(&client, &url, &part, &mut |_, _, _, _| {}).await.unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), b"NEW!");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_download_sends_no_range() {
+        let part = part_file("fresh");
+        let (url, server) = serve(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc".to_vec(),
+        ]);
+        let client = reqwest::Client::new();
+        fetch_installer_part(&client, &url, &part, &mut |_, _, _, _| {}).await.unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), b"abc");
+        let requests = server.join().unwrap();
+        assert!(!requests[0].contains("range:"));
+    }
+
+    #[tokio::test]
+    async fn range_not_satisfiable_discards_the_part_file() {
+        let part = part_file("416");
+        std::fs::write(&part, b"TOO LONG ALREADY").unwrap();
+        let (url, server) = serve(vec![
+            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ]);
+        let client = reqwest::Client::new();
+        assert!(fetch_installer_part(&client, &url, &part, &mut |_, _, _, _| {}).await.is_err());
+        assert!(!part.exists());
+        server.join().unwrap();
+    }
 }

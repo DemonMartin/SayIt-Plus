@@ -18,7 +18,8 @@ pub async fn cloud_polish(request: CloudPolishRequest) -> Result<AiResult, Strin
         //
         // ⚠️ 这个清单是白名单：前端 AI_PROVIDERS 里新增一家却漏了这里，用户会拿到
         // 「Unknown AI provider: xxx」，而那句话看不出问题在路由层。两处必须一起改。
-        "openai_compat" | "deepseek" | "doubao" | "qwen" | "mimo" | "groq" | "zhipu" => {
+        "openai_compat" | "deepseek" | "doubao" | "qwen" | "mimo" | "groq" | "zhipu"
+        | "openrouter" => {
             ai_openai_compat::polish(
                 &request.text,
                 config,
@@ -49,7 +50,8 @@ pub async fn test_ai_connection(config: AiProviderConfig) -> Result<TestResult, 
     match config.provider.as_str() {
         // 与 cloud_polish 的清单必须一致：只加一处会出现「测试通了但校对报未知供应商」
         // 或者反过来，两种都很难从错误信息看出是路由问题。
-        "openai_compat" | "deepseek" | "doubao" | "qwen" | "mimo" | "groq" | "zhipu" => {
+        "openai_compat" | "deepseek" | "doubao" | "qwen" | "mimo" | "groq" | "zhipu"
+        | "openrouter" => {
             Ok(ai_openai_compat::test_connection(&config).await)
         }
         "ollama" => Ok(ai_ollama::test_connection(&config).await),
@@ -58,6 +60,18 @@ pub async fn test_ai_connection(config: AiProviderConfig) -> Result<TestResult, 
             format!("Unknown AI provider: {}", other),
         )),
     }
+}
+
+/// 同 cloud_transcribe，但音频以原始 PCM 字节发过来（见 ipc_body）。
+///
+/// 各家接口本身要 base64（JSON 请求体），所以在这里转：Rust 转 10 MB 是几毫秒，
+/// 网页里那个逐字节拼字符串的转码要 0.7 秒，还跑在主窗主线程上。
+#[tauri::command]
+pub async fn cloud_transcribe_raw(request: tauri::ipc::Request<'_>) -> Result<AsrResult, String> {
+    use base64::Engine;
+    let (mut meta, pcm): (CloudTranscribeRequest, Vec<u8>) = crate::ipc_body::split_framed(&request)?;
+    meta.audio_b64 = base64::engine::general_purpose::STANDARD.encode(&pcm);
+    cloud_transcribe(meta).await
 }
 
 /// 云端 ASR 转写（Tauri command）
@@ -233,7 +247,8 @@ pub fn dispatch_keys_for_test() -> Vec<&'static str> {
 /// 而这行常量定义本身也在同一个文件里。写全了就等于在源码里埋下第二个匹配点，
 /// 哪天这行挪到 `cloud_transcribe` 上面去，截出来的就是这行所在的位置。
 #[cfg(test)]
-const CLOUD_TRANSCRIBE_SIGNATURE: &str = concat!("pub async fn ", "cloud_transcribe");
+// 带上左括号：同文件里还有 cloud_transcribe_raw，只按前缀找会先找到它。
+const CLOUD_TRANSCRIBE_SIGNATURE: &str = concat!("pub async fn ", "cloud_transcribe", "(");
 
 /// 截出某个顶层函数的源码片段。
 ///

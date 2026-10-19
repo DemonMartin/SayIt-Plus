@@ -6,6 +6,7 @@ import { addRuntimeEvent } from '../debugLog'
 import { ServerProvider } from './ServerProvider'
 import { CloudAPIProvider } from './CloudAPIProvider'
 import { LocalProvider } from './LocalProvider'
+import { AsrFallbackProvider } from './AsrFallbackProvider'
 import type { TranscriptionProvider, WorkMode } from './types'
 
 export type {
@@ -25,7 +26,7 @@ export { MID_SESSION_DISCONNECT_ERROR } from './types'
 let currentProvider: TranscriptionProvider | null = null
 let currentMode: WorkMode = 'server'
 
-function createProvider(mode: WorkMode): TranscriptionProvider {
+function createPrimaryProvider(mode: WorkMode): TranscriptionProvider {
   switch (mode) {
     case 'server':
       return new ServerProvider()
@@ -37,6 +38,11 @@ function createProvider(mode: WorkMode): TranscriptionProvider {
       addRuntimeEvent('warn', 'transcription', `Unknown processing mode "${mode}"; falling back to server mode`)
       return new ServerProvider()
   }
+}
+
+/** Compose cross-provider behavior once, at the provider boundary. */
+function createProvider(mode: WorkMode): TranscriptionProvider {
+  return new AsrFallbackProvider(createPrimaryProvider(mode))
 }
 
 /** 获取当前 Provider 实例（懒初始化） */

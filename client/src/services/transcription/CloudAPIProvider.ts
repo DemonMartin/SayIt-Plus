@@ -12,7 +12,7 @@ import { listen } from '@tauri-apps/api/event'
 import { getSetting } from '../store'
 import { restoreHotwordSpacing } from '../textPostProcess'
 import { addRuntimeEvent } from '../debugLog'
-import { notifyAsrCapabilityMaybeChanged } from '../bridge'
+import { cloudTranscribeRaw, notifyAsrCapabilityMaybeChanged } from '../bridge'
 import { polishWithClientAi } from './clientAiPolish'
 import { policyFromSnapshot, resolveAndLogAiOutcome, type AiOutcomeContext } from './aiPolicy'
 import type {
@@ -529,8 +529,6 @@ export class CloudAPIProvider implements TranscriptionProvider {
           merged.set(new Uint8Array(buf), offset)
           offset += buf.byteLength
         }
-        const audioB64 = uint8ArrayToBase64(merged)
-
         const asrApiKey = await getSetting('cloudAsr.apiKey', '') as string
         const asrAppId = await getSetting('cloudAsr.appId', '') as string
         const asrModel = await getSetting('cloudAsr.model', '') as string
@@ -566,13 +564,10 @@ export class CloudAPIProvider implements TranscriptionProvider {
           model: extra?.model ?? '(provider default)',
           durationSec,
         })
-        const asrResult = await invoke<AsrResult>('cloud_transcribe', {
-          request: {
-            audio_b64: audioB64,
-            sample_rate: 16000,
-            asr_config: asrConfig,
-            hotwords: startOpts.hotwords ?? [],
-          },
+        const asrResult = await cloudTranscribeRaw<AsrResult>(merged, {
+          sample_rate: 16000,
+          asr_config: asrConfig,
+          hotwords: startOpts.hotwords ?? [],
         })
         // 「OpenAI 兼容」的 auto 协议是在这条调用**内部**探测出来的（结果进
         // asr_openai_compat 的 PROTOCOL_CACHE）。热词页只在挂载时查过一次能力，
@@ -618,7 +613,7 @@ export class CloudAPIProvider implements TranscriptionProvider {
       }
 
       // AI 校对（Qwen Omni 已内置 AI，由 policy 判成不允许调用，这里走同一条返回）
-      const polish = isQwenOmni
+      const polish = policy.route === 'integrated_asr'
         ? (() => {
           const outcome = resolveAndLogAiOutcome(outcomeContext, policy)
           return {

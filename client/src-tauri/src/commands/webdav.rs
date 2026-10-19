@@ -36,7 +36,7 @@ const KEY_LAST_RESULT: &str = "webdav.lastResult";
 
 /// 备份文件名前缀，与本地导出一致，便于用户对着看。
 const BACKUP_PREFIX: &str = "sayit-backup-";
-const DEFAULT_KEEP_COUNT: u64 = 5;
+const DEFAULT_KEEP_COUNT: u64 = crate::defaults::WEBDAV_KEEP_COUNT;
 const PROGRESS_EVENT: &str = "webdav-backup-progress";
 
 /// 元数据类请求（PROPFIND / MKCOL / MOVE / DELETE）的超时。
@@ -133,8 +133,8 @@ fn setting_string(storage: &Storage, key: &str) -> String {
         .to_string()
 }
 
-fn setting_bool(storage: &Storage, key: &str) -> bool {
-    storage.get(key, None).as_bool().unwrap_or(false)
+fn setting_bool(storage: &Storage, key: &str, default: bool) -> bool {
+    storage.get(key, None).as_bool().unwrap_or(default)
 }
 
 /// 备份档位一律从设置读，不接受调用方传参。
@@ -146,8 +146,8 @@ fn setting_bool(storage: &Storage, key: &str) -> bool {
 /// 几个 GB 音频。
 fn scope_from_settings(storage: &Storage) -> BackupScope {
     BackupScope {
-        include_history: setting_bool(storage, KEY_INCLUDE_HISTORY),
-        include_audio: setting_bool(storage, KEY_INCLUDE_AUDIO),
+        include_history: setting_bool(storage, KEY_INCLUDE_HISTORY, crate::defaults::WEBDAV_INCLUDE_HISTORY),
+        include_audio: setting_bool(storage, KEY_INCLUDE_AUDIO, crate::defaults::WEBDAV_INCLUDE_AUDIO),
     }
 }
 
@@ -947,8 +947,8 @@ mod tests {
 
     /// 设置没配过时，scope 必须是「只有配置」。
     ///
-    /// 这条要用真的 Storage 跑：默认值在 defaults.ts 和这里各有一份，靠
-    /// `setting_bool` 的 `unwrap_or(false)` 兜底。一旦有人把兜底改成 true，
+    /// 这条要用真的 Storage 跑：读不到设置时靠 `crate::defaults` 的兜底（与 defaults.ts 有对账测试）。
+    /// 一旦有人把兜底改成 true，
     /// 后果是每台机器悄悄开始上传整个音频库，而界面上的勾还是没勾的。
     #[test]
     fn scope_defaults_to_config_only_when_unset() {

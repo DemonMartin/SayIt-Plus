@@ -3,9 +3,8 @@
 import * as bridge from '@/services/bridge'
 import { refreshPTTSetting } from '@/services/webviewKeyboardFallback'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Info, Pencil, RotateCcw } from 'lucide-react'
+import { Info } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
-import { Modal } from '@/components/ui/modal'
 import { Tooltip } from '@/components/ui/tooltip'
 import { listMicrophones, normalizeSelectedMicId } from '@/services/audio'
 import { refreshRecorderSettings } from '@/services/recorder'
@@ -24,11 +23,6 @@ import { pttShortcutConflictsWithAccelerator } from '@/lib/shortcutKeys'
 import { t, type LanguagePreference, type TranslationKey } from '@/i18n'
 import { useT } from '@/i18n/useT'
 import { getLanguagePreference, switchLanguage } from '@/stores/language'
-import {
-  CONTEXT_SELECTION_EDIT_PROMPT,
-  CONTEXT_SELECTION_EDIT_PROMPT_SETTING_KEY,
-  normalizeContextSelectionEditPrompt,
-} from '@/services/contextAware'
 
 /** 语言名一律用该语言自己的写法（English / 简体中文），不做翻译 —— 看不懂当前
  *  界面语言的人，正是靠认出自己的语言名才能切回去的。 */
@@ -63,11 +57,6 @@ export default function GeneralSettingsPage() {
   const [micError, setMicError] = useState('')
   const [muteSystemAudio, setMuteSystemAudio] = useState(false)
   const [protectClipboard, setProtectClipboard] = useState(true)
-  const [contextAwareWriting, setContextAwareWriting] = useState(false)
-  const [contextPromptOpen, setContextPromptOpen] = useState(false)
-  const [contextSelectionEditPrompt, setContextSelectionEditPrompt] = useState(CONTEXT_SELECTION_EDIT_PROMPT)
-  const [contextPromptDraft, setContextPromptDraft] = useState(CONTEXT_SELECTION_EDIT_PROMPT)
-  const [contextPromptSaving, setContextPromptSaving] = useState(false)
   // 兜底值统一从 defaults 取，不在这里写第二份字面量
   const [pttKey, setPttKey] = useState(() => getDefault<string>('shortcutPTT', ''))
   const [handsFreeKey, setHandsFreeKey] = useState('AltRight')
@@ -95,11 +84,10 @@ export default function GeneralSettingsPage() {
     // 每项自带 catch 兜底：Promise.all 是 fail-fast，只要一项 reject 就会在其余项
     // 还没回来时提前放行 ready。也不用 rAF，避免 setReady 与赋值分到不同批次。
     void (async () => {
-      const [launch, mute, clip, contextAware, history, retention, readySound, audioDays, logDays] = await Promise.all([
+      const [launch, mute, clip, history, retention, readySound, audioDays, logDays] = await Promise.all([
         bridge.getAutoLaunch().catch(() => false),
         getSetting('muteSystemAudioWhileRecording', false).catch(() => false),
         getSetting('protectClipboard', true).catch(() => true),
-        getSetting('contextAwareWritingEnabled', false).catch(() => false),
         getSetting('historyEnabled', true).catch(() => true),
         getSetting('audioRetentionEnabled', true).catch(() => true),
         getSetting('readySoundEnabled', true).catch(() => true),
@@ -110,7 +98,6 @@ export default function GeneralSettingsPage() {
       setAutoLaunch(Boolean(launch))
       setMuteSystemAudio(Boolean(mute))
       setProtectClipboard(Boolean(clip))
-      setContextAwareWriting(Boolean(contextAware))
       setHistoryEnabled(Boolean(history))
       setAudioRetentionEnabled(Boolean(retention))
       setReadySoundEnabled(Boolean(readySound))
@@ -139,13 +126,6 @@ export default function GeneralSettingsPage() {
     getSetting<string>('shortcutPTT').then((value) => setPttKey(value))
     getSetting('shortcutHandsFree', 'AltRight').then((value) => setHandsFreeKey(value as string))
     getSetting('shortcutToggleAi', '').then((value) => setAiToggleKey(value as string))
-    getSetting(CONTEXT_SELECTION_EDIT_PROMPT_SETTING_KEY, CONTEXT_SELECTION_EDIT_PROMPT)
-      .then((value) => {
-        const prompt = normalizeContextSelectionEditPrompt(value)
-        setContextSelectionEditPrompt(prompt)
-        setContextPromptDraft(prompt)
-      })
-      .catch(() => { })
     listMicrophones().then(setMics).catch(() => { })
     return () => { cancelled = true }
   }, [])
@@ -166,36 +146,6 @@ export default function GeneralSettingsPage() {
   const handleMicChange = async (deviceId: string) => { setSelectedMic(deviceId); await setSetting('selectedMic', deviceId); await refreshRecorderSettings() }
   const toggleMuteSystemAudio = async () => { const next = !muteSystemAudio; setMuteSystemAudio(next); await setSetting('muteSystemAudioWhileRecording', next); await refreshRecorderSettings() }
   const toggleProtectClipboard = async () => { const next = !protectClipboard; setProtectClipboard(next); await setSetting('protectClipboard', next); await refreshRecorderSettings() }
-  const toggleContextAwareWriting = async () => { const next = !contextAwareWriting; setContextAwareWriting(next); await setSetting('contextAwareWritingEnabled', next); await refreshRecorderSettings() }
-  const openContextPrompt = () => {
-    setContextPromptDraft(contextSelectionEditPrompt)
-    setContextPromptOpen(true)
-  }
-  const saveContextPrompt = async () => {
-    const prompt = contextPromptDraft.trim()
-    if (!prompt || contextPromptSaving) return
-    setContextPromptSaving(true)
-    try {
-      await setSetting(CONTEXT_SELECTION_EDIT_PROMPT_SETTING_KEY, prompt)
-      setContextSelectionEditPrompt(prompt)
-      await refreshRecorderSettings()
-      setContextPromptOpen(false)
-    } finally {
-      setContextPromptSaving(false)
-    }
-  }
-  const resetContextPrompt = async () => {
-    if (contextPromptSaving) return
-    setContextPromptSaving(true)
-    try {
-      await setSetting(CONTEXT_SELECTION_EDIT_PROMPT_SETTING_KEY, CONTEXT_SELECTION_EDIT_PROMPT)
-      setContextSelectionEditPrompt(CONTEXT_SELECTION_EDIT_PROMPT)
-      setContextPromptDraft(CONTEXT_SELECTION_EDIT_PROMPT)
-      await refreshRecorderSettings()
-    } finally {
-      setContextPromptSaving(false)
-    }
-  }
   const toggleHistoryEnabled = async () => { const next = !historyEnabled; setHistoryEnabled(next); await setSetting('historyEnabled', next) }
   const toggleAudioRetention = async () => { const next = !audioRetentionEnabled; setAudioRetentionEnabled(next); await setSetting('audioRetentionEnabled', next) }
   const toggleReadySound = async () => { const next = !readySoundEnabled; setReadySoundEnabled(next); await setSetting('readySoundEnabled', next); await refreshRecorderSettings() }
@@ -371,97 +321,6 @@ export default function GeneralSettingsPage() {
             </div>
           </CardContent>
         </Card>
-
-        <Card>
-          <CardContent className="p-6">
-            <div className="flex items-start justify-between gap-4">
-              <div className="min-w-0">
-                <div className="flex items-center gap-1.5">
-                  <h2 className="text-lg font-semibold">{t('settings.contextAware.title')}</h2>
-                  <Tooltip
-                    variant="light"
-                    content={(
-                      <div className="w-[32rem] max-w-[calc(100vw-3rem)] space-y-2">
-                        <p>{t('settings.contextAware.infoFunction')}</p>
-                        <p>{t('settings.contextAware.infoUsage')}</p>
-                        <p>{t('settings.contextAware.infoPrinciple')}</p>
-                      </div>
-                    )}
-                  >
-                    <Info
-                      aria-label={t('settings.contextAware.infoAria')}
-                      className="h-3.5 w-3.5 shrink-0 cursor-help text-muted-foreground/50 transition-colors hover:text-muted-foreground"
-                    />
-                  </Tooltip>
-                </div>
-                <div className="mt-1.5 space-y-1 text-xs leading-relaxed text-muted-foreground">
-                  <p>{t('settings.contextAware.descContinue')}</p>
-                  <p>{t('settings.contextAware.descSelection')}</p>
-                </div>
-                <button
-                  type="button"
-                  onClick={openContextPrompt}
-                  className="mt-2 inline-flex items-center gap-1.5 py-1 text-xs font-medium text-primary transition-colors hover:text-primary/75 hover:underline hover:underline-offset-4"
-                >
-                  <Pencil className="h-3.5 w-3.5" aria-hidden />
-                  {t('settings.contextAware.editPrompt')}
-                </button>
-              </div>
-              <Switch checked={contextAwareWriting} onChange={() => void toggleContextAwareWriting()} noAnimation={!animate} hidden={!ready} />
-            </div>
-          </CardContent>
-        </Card>
-
-        {contextPromptOpen && (
-          <Modal
-            title={t('settings.contextAware.promptTitle')}
-            onClose={() => setContextPromptOpen(false)}
-            locked={contextPromptSaving}
-            showCloseButton
-            panelClassName="w-[720px]"
-          >
-            <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-              {t('settings.contextAware.promptDesc')}
-            </p>
-            <textarea
-              value={contextPromptDraft}
-              onChange={(event) => setContextPromptDraft(event.target.value)}
-              aria-label={t('settings.contextAware.promptEditorAria')}
-              spellCheck={false}
-              rows={14}
-              className="mt-4 w-full resize-y rounded-md border border-input-border bg-input-bg px-3 py-2 text-xs leading-normal"
-            />
-            <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
-              <button
-                type="button"
-                onClick={() => void resetContextPrompt()}
-                disabled={contextPromptSaving || contextPromptDraft === CONTEXT_SELECTION_EDIT_PROMPT}
-                className="inline-flex items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                <RotateCcw className="h-3.5 w-3.5" aria-hidden />
-                {t('settings.contextAware.resetPrompt')}
-              </button>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => setContextPromptOpen(false)}
-                  disabled={contextPromptSaving}
-                  className="rounded-md border px-3 py-1 text-xs transition-colors hover:bg-accent disabled:opacity-50"
-                >
-                  {t('common.cancel')}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void saveContextPrompt()}
-                  disabled={contextPromptSaving || !contextPromptDraft.trim()}
-                  className="rounded-md bg-primary px-3 py-1 text-xs text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
-                >
-                  {contextPromptSaving ? t('settings.contextAware.savingPrompt') : t('common.save')}
-                </button>
-              </div>
-            </div>
-          </Modal>
-        )}
 
         <AppSection autoLaunch={autoLaunch} onToggleAutoLaunch={toggleAutoLaunch} ready={ready} animate={animate} />
 

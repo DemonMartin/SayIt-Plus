@@ -1,0 +1,9 @@
+{
+  "identifier": "main-window-plugins",
+  "description": "Plugin permissions used by the main window's frontend: file pickers (dialog) and opening links in the browser (shell open). fs / clipboard-manager / global-shortcut / autostart are only used from Rust and need no frontend permission.",
+  "windows": ["main"],
+  "permissions": [
+    "shell:allow-open",
+    "dialog:default"
+  ]
+}

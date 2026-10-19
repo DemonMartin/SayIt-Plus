@@ -8,11 +8,14 @@ import secrets
 import shutil
 import time
 import zipfile
-from collections import defaultdict
 from pathlib import Path
 
 from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import JSONResponse
+
+from .netutil import request_ip_override
+from .errors import public_error_message
+from .ratelimit import KeyedWindowLimiter
 
 router = APIRouter()
 
@@ -29,7 +32,8 @@ MAX_ZIP_ENTRIES = 200
 # Upload rate limit: per-IP, max uploads per window
 _UPLOAD_RATE_WINDOW = 3600  # 1 hour
 _UPLOAD_RATE_MAX = 5
-_upload_log: dict[str, list[float]] = defaultdict(list)
+# 原来是 defaultdict(list)，换 IP（XFF 可伪造）就只增不减；KeyedWindowLimiter 带清理和条数上限
+_upload_limiter = KeyedWindowLimiter(window_sec=_UPLOAD_RATE_WINDOW, limit=_UPLOAD_RATE_MAX)
 
 # One-time upload tokens (issued via WebSocket, consumed on upload)
 _upload_tokens: dict[str, float] = {}  # token -> expiry timestamp
@@ -38,7 +42,15 @@ _UPLOAD_TOKEN_TTL = 300  # 5 minutes
 _TICKET_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
 
+class DiagnosticsArchiveError(ValueError):
+    """我们自己的压缩包校验失败。提示是固定文字、不含内部信息，可以原样返回给客户端。"""
+
+
 def _client_ip(request: Request) -> str:
+    # guard.use_real_ip 生效时用按可信代理解析的 IP；否则下面是原来的取法（XFF 最左值，可被伪造）
+    real = request_ip_override(request)
+    if real is not None:
+        return real
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         return forwarded.split(",")[0].strip()
@@ -46,14 +58,7 @@ def _client_ip(request: Request) -> str:
 
 
 def _check_upload_rate(ip: str) -> bool:
-    now = time.monotonic()
-    log = _upload_log[ip]
-    # Prune old entries
-    _upload_log[ip] = [t for t in log if now - t < _UPLOAD_RATE_WINDOW]
-    if len(_upload_log[ip]) >= _UPLOAD_RATE_MAX:
-        return False
-    _upload_log[ip].append(now)
-    return True
+    return _upload_limiter.allow(ip)
 
 
 def _total_disk_usage() -> int:
@@ -119,16 +124,16 @@ def _extract_zip(zip_path: Path, dest_dir: Path) -> None:
     with zipfile.ZipFile(zip_path, "r") as archive:
         infos = archive.infolist()
         if len(infos) > MAX_ZIP_ENTRIES:
-            raise ValueError("Too many files in diagnostics archive")
+            raise DiagnosticsArchiveError("Too many files in diagnostics archive")
 
         total_size = sum(info.file_size for info in infos)
         if total_size > MAX_TOTAL_UNZIPPED_SIZE:
-            raise ValueError("Diagnostics archive is too large after extraction")
+            raise DiagnosticsArchiveError("Diagnostics archive is too large after extraction")
 
         for info in infos:
             extracted_path = (dest_dir / info.filename).resolve()
             if not str(extracted_path).startswith(str(dest_dir.resolve())):
-                raise ValueError("Unsafe file path in diagnostics archive")
+                raise DiagnosticsArchiveError("Unsafe file path in diagnostics archive")
 
         archive.extractall(dest_dir)
 
@@ -186,23 +191,32 @@ async def upload_diagnostics(request: Request, diagnostics: UploadFile = File(..
             },
         )
     except Exception as exc:
+        # index.json 会被状态查询接口原样返回，所以这里和响应一样不能放异常原文。
+        # 我们自己的校验提示与"不是 zip"是固定文字，照常返回；其余异常给编号，原文进日志。
+        if isinstance(exc, DiagnosticsArchiveError):
+            status, error_code, message, ref = 400, "invalid_archive", str(exc), None
+        elif isinstance(exc, zipfile.BadZipFile):
+            status, error_code, message, ref = 400, "bad_zip", "Not a valid zip file", None
+        else:
+            message, ref = public_error_message(exc, where="diagnostics_upload", sid=ticket_id)
+            status, error_code = 500, "internal"
+        record = {
+            "ticket_id": ticket_id,
+            "status": "invalid",
+            "error_code": error_code,
+            "error": message,
+            "received_at": int(time.time()),
+            "zip_size": len(content),
+        }
+        if ref:
+            record["ref"] = ref
         (save_dir / "index.json").write_text(
-            json.dumps(
-                {
-                    "ticket_id": ticket_id,
-                    "status": "invalid",
-                    "error": str(exc),
-                    "received_at": int(time.time()),
-                    "zip_size": len(content),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps(record, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         return JSONResponse(
-            status_code=400,
-            content={"error": str(exc), "ticket_id": ticket_id},
+            status_code=status,
+            content={"error": message, "ticket_id": ticket_id},
         )
 
 

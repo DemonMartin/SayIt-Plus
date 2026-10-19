@@ -1,6 +1,6 @@
 {
   "identifier": "default",
-  "description": "Default capabilities for SayIt",
+  "description": "Core window/event permissions shared by every SayIt window. Plugin permissions the frontend actually uses live in main.json (main window only).",
   "windows": ["main", "overlay", "tray-menu", "update-notification"],
   "permissions": [
     "core:default",
@@ -20,13 +20,6 @@
     "core:event:default",
     "core:event:allow-emit",
     "core:event:allow-emit-to",
-    "core:event:allow-listen",
-    "shell:allow-open",
-    "clipboard-manager:default",
-    "dialog:default",
-    "fs:default",
-    "fs:allow-write-file",
-    "autostart:default",
-    "global-shortcut:default"
+    "core:event:allow-listen"
   ]
 }

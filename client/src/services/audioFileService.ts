@@ -3,7 +3,6 @@
  */
 
 import * as bridge from './bridge'
-import { uint8ArrayToBase64 } from '@/lib/encoding'
 
 /**
  * Save PCM chunks (Int16 LE) as WAV file.
@@ -38,19 +37,20 @@ export async function saveRecordingAudio(
     offset += chunk.byteLength
   }
 
-  // 转 base64 传给 Rust，Rust 侧编码 WAV header 并写入文件
-  const pcmBase64 = uint8ArrayToBase64(merged)
-
-  return bridge.savePcmAsWav(id, pcmBase64, sampleRate)
+  // 原始字节直接传给 Rust（不再转 base64，见 bridge.framedBody），Rust 侧编码 WAV header 并写入文件
+  return bridge.savePcmAsWavRaw(id, merged, sampleRate)
 }
 
 /**
- * Load audio file as a data URL for playback.
+ * 读录音并生成 Blob URL 供 <audio> 播放。调用方用完要 URL.revokeObjectURL。
+ *
+ * 原来是 base64 data URL：五分钟录音是 13 MB 的字符串，Rust 转一遍、IPC 传一遍、
+ * 浏览器再解一遍。现在 Rust 直接回字节。
  */
-export async function loadAudioAsDataUrl(filePath: string): Promise<string | null> {
-  const base64 = await bridge.readAudioFile(filePath)
-  if (!base64) return null
-  return `data:audio/wav;base64,${base64}`
+export async function loadAudioAsObjectUrl(filePath: string): Promise<string | null> {
+  const bytes = await bridge.readAudioFileBytes(filePath)
+  if (!bytes) return null
+  return URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }))
 }
 
 /**

@@ -5,14 +5,16 @@ import { Card, CardContent } from '@/components/ui/card'
 import { type HistoryRecord } from '@/services/store'
 import * as bridge from '@/services/bridge'
 import { pickVoiceDurationSec } from '@/services/timeModel'
-import { loadAudioAsDataUrl } from '@/services/audioFileService'
 import { invoke } from '@tauri-apps/api/core'
 import { getLocale, t } from '@/i18n'
 import { useT } from '@/i18n/useT'
 import { historyFailureReasonDisplay } from '@/i18n/displayNames'
+import { errorDetailText } from '@/lib/errorMessages'
+import { addRuntimeEvent } from '@/services/debugLog'
 import { useRecordingPlayback } from './useRecordingPlayback'
 import { AudioProgressBar } from './AudioProgressBar'
 import { AsrCorrectionDialog } from './AsrCorrectionDialog'
+import { groupByDay } from './dayGroups'
 
 /** 云 API 内部 key → 用户友好的模型 ID */
 const ASR_PROVIDER_DISPLAY: Record<string, string> = {
@@ -112,6 +114,7 @@ function HistoryItem({
   const [editing, setEditing] = useState(false)
   const [editText, setEditText] = useState('')
   const [reprocessing, setReprocessing] = useState(false)
+  const [reprocessError, setReprocessError] = useState('')
   const [downloading, setDownloading] = useState(false)
   const [downloadStatus, setDownloadStatus] = useState<'idle' | 'ok' | 'fail'>('idle')
   const [downloadPath, setDownloadPath] = useState('')
@@ -143,12 +146,19 @@ function HistoryItem({
   const handleReprocess = useCallback(async () => {
     if (!onReprocess || reprocessing) return
     setReprocessing(true)
+    setReprocessError('')
     try {
       await onReprocess()
+    } catch (error) {
+      // 原来没有 catch：失败只在日志里留一行 Unhandled promise rejection，按钮转完就没下文，
+      // 用户以为点了没反应（2026-10-19 本地模型把显卡跑挂那次，连着点了十来次）。
+      const reason = errorDetailText(error)
+      setReprocessError(reason)
+      addRuntimeEvent('warn', 'history', 'Transcribe again failed', { recordId: record.id, error: reason })
     } finally {
       setReprocessing(false)
     }
-  }, [onReprocess, reprocessing])
+  }, [onReprocess, reprocessing, record.id])
 
   // ── 编辑：自动保存（失焦 / 离开页面即存，无需按钮）──
   // 用 ref 保存最新值，供失焦回调与卸载清理读取，避免闭包拿到旧值。
@@ -191,8 +201,7 @@ function HistoryItem({
     setDownloadStatus('idle')
     setDownloadPath('')
     try {
-      const dataUrl = await loadAudioAsDataUrl(record.audioFilePath)
-      if (!dataUrl) {
+      if (!(await bridge.audioFileExists(record.audioFilePath))) {
         setDownloadStatus('fail')
         setDownloadPath(t('record.audioMissing'))
         setTimeout(() => setDownloadStatus('idle'), 3000)
@@ -203,12 +212,8 @@ function HistoryItem({
       const dateStr = `${ts.getFullYear()}${String(ts.getMonth() + 1).padStart(2, '0')}${String(ts.getDate()).padStart(2, '0')}_${String(ts.getHours()).padStart(2, '0')}${String(ts.getMinutes()).padStart(2, '0')}${String(ts.getSeconds()).padStart(2, '0')}`
       const filename = `sayit_${dateStr}.wav`
 
-      // Extract base64 from data URL
-      const base64Data = dataUrl.split(',')[1]
-      const savedPath = await invoke<string>('save_audio_to_downloads', {
-        base64Data,
-        filename,
-      })
+      // Rust 直接复制文件，不再把整段录音读成 base64 再发回去
+      const savedPath = await bridge.saveRecordingToDownloads(record.audioFilePath, filename)
 
       setDownloadStatus('ok')
       setDownloadPath(savedPath)
@@ -382,6 +387,9 @@ function HistoryItem({
                       <span className="rounded border border-border px-1.5 py-0.5 text-xs">
                         {record.workMode === 'server' ? t('record.modeServer') : record.workMode === 'cloud_api' ? t('record.modeCloudApi') : t('record.modeLocal')}
                       </span>
+                      {record.asrFallback && (
+                        <span className="text-xs text-primary">{t('fallback.title')}</span>
+                      )}
                       {record.asrProvider && (
                         <span className="text-xs">ASR: {ASR_PROVIDER_DISPLAY[record.asrProvider] || record.asrProvider}</span>
                       )}
@@ -501,6 +509,11 @@ function HistoryItem({
                     {t('record.downloadFailed', { path: downloadPath })}
                   </div>
                 )}
+                {reprocessError && !reprocessing && (
+                  <div role="alert" className="col-span-2 mt-1 text-xs text-destructive break-all">
+                    {t('record.reprocessFailed', { reason: reprocessError })}
+                  </div>
+                )}
                 {/* 音频进度条 + 倍速 */}
                 {playback.ready && <AudioProgressBar playback={playback} className="col-span-2 mt-2" />}
               </div>
@@ -575,32 +588,7 @@ export default function HistoryRecordList({
   useT()
   // 默认值不能写在参数里：默认参数在模块作用域求值不了 t()，写死中文串又会在英文界面漏出来。
   const resolvedEmptyText = emptyText ?? t('history.empty')
-  const grouped = useMemo(() => {
-    return records.reduce((acc, record) => {
-      const label = getDayLabel(record.timestamp)
-      if (!acc[label]) acc[label] = []
-      acc[label].push(record)
-      return acc
-    }, {} as Record<string, HistoryRecord[]>)
-  }, [records])
-
-  const sortedDays = useMemo(() => {
-    return Object.keys(grouped).sort((a, b) => {
-      // 判据跟着译文走：分组标签就是 getDayLabel 拼出来的，硬编码「今天」在英文下永远不命中，
-      // 结果是今天的记录被按字母序丢到中间。
-      const todayLabel = t('record.today')
-      const yesterdayLabel = t('record.yesterday')
-      const aIsToday = a.startsWith(todayLabel)
-      const bIsToday = b.startsWith(todayLabel)
-      const aIsYesterday = a.startsWith(yesterdayLabel)
-      const bIsYesterday = b.startsWith(yesterdayLabel)
-      if (aIsToday) return -1
-      if (bIsToday) return 1
-      if (aIsYesterday) return -1
-      if (bIsYesterday) return 1
-      return b.localeCompare(a)
-    })
-  }, [grouped])
+  const dayGroups = useMemo(() => groupByDay(records, getDayLabel), [records])
 
   if (records.length === 0) {
     return <p className="py-12 text-center text-muted-foreground">{resolvedEmptyText}</p>
@@ -608,11 +596,11 @@ export default function HistoryRecordList({
 
   return (
     <div className="space-y-3">
-      {sortedDays.map((day) => (
+      {dayGroups.map((group) => (
         <DayGroup
-          key={day}
-          label={day}
-          records={grouped[day]}
+          key={group.dayStart}
+          label={group.label}
+          records={group.records}
           onDelete={onDelete}
           onToggleFavorite={onToggleFavorite}
           onReprocess={onReprocess}

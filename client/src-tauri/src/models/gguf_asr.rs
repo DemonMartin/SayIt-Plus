@@ -4,8 +4,10 @@
 //   - 模型是 GGUF 块量化（Q8_0 等），kernel 直接吃量化权重，不像 ORT 的 INT8
 //     动态量化每步都要 quantize/dequantize —— 自回归模型（Qwen3-ASR）差一个量级。
 //   - 计算后端是运行时注册的：有 GPU 模块就能用 GPU，没有就自动 CPU。
-//   - 长音频不需要我们自己切：families 自报 max_audio_ms（Qwen3 约 87 分钟），
-//     超限才需要分段。
+//   - families 自报 max_audio_ms（Qwen3 约 87 分钟），但「吃得下」不等于「该一次喂」：
+//     整段长录音一次推理会让集成显卡单个任务超过 Windows 看门狗的 2 秒而被重置。
+//     所以 local_asr 先按停顿切成 ≤30 s 的块再调这里（见 MAX_CHUNK_SEC）；
+//     这里的超限分段只是兜底。
 //
 // 线程模型：Session 是 Send 但不是 Sync，run 要 &mut self；同一个 Model 同时
 // 只允许一个 run 在飞（库内部用 per-model 锁保证）。所以这里用一个全局
@@ -22,6 +24,8 @@ use transcribe_cpp::{
 #[cfg(test)]
 use transcribe_cpp::TimestampKind;
 
+// 生产路径一律走 checked_model_dir（先校验 id 再拼路径），未校验的版本只留给测试。
+#[cfg(test)]
 use super::downloader::model_dir;
 
 /// 已加载的引擎。Session 内部持有 Model 的 Arc，所以重复推理不会重新加载权重。
@@ -448,7 +452,8 @@ fn ensure_loaded(model_id: &str, accelerator: &str, gpu_device: &str) -> Result<
     // 先释放旧引擎再建新的，避免同时驻留两份权重（GGUF 动辄几百 MB ~ 数 GB）。
     *cache = None;
 
-    let path = find_gguf(&model_dir(model_id))?;
+    // model_id 来自前端（设置里的 localAsr.modelId），先校验再拼路径。
+    let path = find_gguf(&crate::models::downloader::checked_model_dir(model_id)?)?;
     log::info!("Loading GGUF ASR model: {} ({})", model_id, path.display());
     let start = Instant::now();
 
@@ -670,23 +675,85 @@ fn transcribe_with_cache(
             .session
             .run(chunk, &opts)
             .map_err(|e| format!("Inference failed: {}", e))?;
-        let t = text.text.trim();
-        if t.is_empty() {
-            continue;
-        }
-        if !out.is_empty() && !out.ends_with(|c: char| "，。！？、,.!?".contains(c)) {
-            out.push(' ');
-        }
-        out.push_str(t);
+        append_segment_text(&mut out, &text.text);
     }
     Ok(out)
 }
 
+/// 把分段识别出的一段文字接到结果后面。前一段没以标点收尾时补一个空格，
+/// 免得两段英文粘成一个词。超上限分段和 local_asr 按停顿切块共用这一份。
+pub(crate) fn append_segment_text(out: &mut String, text: &str) {
+    let t = text.trim();
+    if t.is_empty() {
+        return;
+    }
+    if !out.is_empty() && !out.ends_with(|c: char| "，。！？、,.!?".contains(c)) {
+        out.push(' ');
+    }
+    out.push_str(t);
+}
+
 // ── 对外接口（被 local_asr.rs 的命令层分派调用）──
+
+/// 显卡在本进程里出过后端错误，之后一律改用 CPU。
+///
+/// 典型来源是 Windows 显卡看门狗把显卡重置了（LiveKernelEvent 141，Vulkan 报
+/// DeviceLost）。重置之后本进程拿到的 Vulkan 设备就废了，ggml 不会重建它：
+/// 2026-10-19 实测，之后不管识别多短、换哪个模型，加载和推理都立刻报
+/// `backend error (status 8)`，只能重启 SayIt。改用 CPU 至少还能用，只是慢。
+/// 只记在内存里：重启后显卡是好的，下次照常用 GPU。
+static GPU_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn effective_accelerator(requested: &str) -> &str {
+    if GPU_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        "cpu"
+    } else {
+        requested
+    }
+}
+
+/// 库把显卡层面的失败统一报成 `backend error`（status 8）。错误串里看不到
+/// DeviceLost 本身（那句只出现在库自己的日志里），所以按这个类别判。
+fn is_backend_error(error: &str) -> bool {
+    error.contains("backend error")
+}
+
+/// 刚才那次是不是跑在显卡上（或者本来要上显卡、加载就失败了）。
+fn was_on_gpu(accelerator: &str) -> bool {
+    match current_backend() {
+        Some(backend) => !backend.to_lowercase().contains("cpu"),
+        None => accelerator != "cpu",
+    }
+}
+
+/// 在显卡上出了后端错误时，标记显卡不可用并用 CPU 重试一次。
+fn with_gpu_fallback<T>(
+    model_id: &str,
+    accelerator: &str,
+    gpu_device: &str,
+    run: impl Fn(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    let accel = effective_accelerator(accelerator);
+    match run(accel) {
+        Err(error) if accel != "cpu" && is_backend_error(&error) && was_on_gpu(accel) => {
+            GPU_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            log::error!(
+                "GPU backend failed; local ASR switches to CPU until SayIt restarts model={} gpu_device={} error={}",
+                model_id,
+                gpu_device,
+                error
+            );
+            run("cpu")
+        }
+        other => other,
+    }
+}
 
 /// 预加载模型。
 pub fn preload(model_id: &str, accelerator: &str, gpu_device: &str) -> Result<(), String> {
-    ensure_loaded(model_id, accelerator, gpu_device)
+    with_gpu_fallback(model_id, accelerator, gpu_device, |accel| {
+        ensure_loaded(model_id, accel, gpu_device)
+    })
 }
 
 /// 释放常驻引擎，交还几百 MB ~ 数 GB 内存。
@@ -727,8 +794,10 @@ pub fn transcribe(
     samples: &[f32],
     sample_rate: usize,
 ) -> Result<String, String> {
-    ensure_loaded(model_id, accelerator, gpu_device)?;
-    transcribe_with_cache(samples, sample_rate, language)
+    with_gpu_fallback(model_id, accelerator, gpu_device, |accel| {
+        ensure_loaded(model_id, accel, gpu_device)?;
+        transcribe_with_cache(samples, sample_rate, language)
+    })
 }
 
 // ── 空闲卸载 ──
@@ -1246,6 +1315,18 @@ mod tests {
     /// registry 索引 0 是上游的"自动"哨兵，没有办法显式选中它。
     /// 这条钉住的是我们**知道**这个限制并按 0 传 —— 传 0 只是让库按探测顺序挑
     /// （独显优先），所以界面上必须靠 `current_device` 显示真实结果，
+    /// 显卡被重置后库返回的两种错误（2026-10-19 sayit.log 原样）都要被认成后端错误，
+    /// 否则不会回落到 CPU；模型没下载、语种不支持这类错误不能触发回落。
+    #[test]
+    fn device_lost_errors_trigger_cpu_fallback_and_others_do_not() {
+        assert!(is_backend_error("Inference failed: backend error: run: backend error (status 8)"));
+        assert!(is_backend_error(
+            "Failed to load model (sensevoice-small-gguf): backend error: load C:\\x\\SenseVoiceSmall-Q8_0.gguf: backend error (status 8)"
+        ));
+        assert!(!is_backend_error("No .gguf file found in model directory"));
+        assert!(!is_backend_error("Inference failed: unsupported language (status 10)"));
+    }
+
     /// 不能假设"选了就是用了"。详见 `resolve_gpu_device` 的文档注释。
     #[test]
     fn registry_index_zero_is_the_automatic_sentinel() {

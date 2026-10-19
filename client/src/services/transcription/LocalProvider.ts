@@ -3,6 +3,7 @@
 // ASR 完成后可选调用云端 AI 校对
 
 import { invoke } from '@tauri-apps/api/core'
+import * as bridge from '../bridge'
 import { getSetting } from '../store'
 import { addRuntimeEvent } from '../debugLog'
 import { BufferedProvider } from './BufferedProvider'
@@ -10,8 +11,17 @@ import { polishWithClientAi } from './clientAiPolish'
 import { policyFromSnapshot, resolveAndLogAiOutcome, type AiOutcomeContext } from './aiPolicy'
 import type { TranscriptionCallbacks } from './types'
 
+interface LocalProviderOptions {
+  modelId?: string
+  preload?: boolean
+}
+
 export class LocalProvider extends BufferedProvider {
   readonly mode = 'local' as const
+
+  constructor(private readonly options: LocalProviderOptions = {}) {
+    super()
+  }
 
   /**
    * 本地模式的"就绪"= 选中的模型已完整下载到本地。
@@ -24,7 +34,7 @@ export class LocalProvider extends BufferedProvider {
    * 里该模型是否 complete，避免同屏两处结论不同。
    */
   protected async onConnect(callbacks: TranscriptionCallbacks): Promise<boolean> {
-    const modelId = await getSetting('localAsr.modelId', 'sensevoice-small-gguf') as string
+    const modelId = this.options.modelId ?? (await getSetting('localAsr.modelId', 'sensevoice-small-gguf'))
     if (!modelId) {
       addRuntimeEvent('warn', 'local', 'No local model selected; provider is not ready')
       callbacks.onReady?.({ asr: false, llm: false })
@@ -48,6 +58,12 @@ export class LocalProvider extends BufferedProvider {
       return false
     }
 
+    // Recorded-audio attempts load their model inside local_transcribe, only when inference starts.
+    if (this.options.preload === false) {
+      callbacks.onReady?.({ asr: true, llm: false })
+      return true
+    }
+
     // 已下载：预加载失败（如文件损坏、显卡后端异常）不代表不能用，
     // 真正的失败会在识别阶段带着具体原因报出来，这里仍按就绪处理。
     try {
@@ -61,7 +77,7 @@ export class LocalProvider extends BufferedProvider {
     return true
   }
 
-  protected async processAudio(audioB64: string, durationSec: number, runId: number): Promise<void> {
+  protected async processAudio(pcm: Uint8Array, durationSec: number, runId: number): Promise<void> {
     if (!this.isRunCurrent(runId)) return
     const startOpts = this.startOpts
     const startTime = performance.now()
@@ -71,7 +87,7 @@ export class LocalProvider extends BufferedProvider {
     let asrMs = 0
 
     try {
-      const modelId = await getSetting('localAsr.modelId', 'sensevoice-small-gguf')
+      const modelId = this.options.modelId ?? (await getSetting('localAsr.modelId', 'sensevoice-small-gguf'))
       if (!this.isRunCurrent(runId)) return
       const language = await getSetting('localAsr.language', 'auto')
       if (!this.isRunCurrent(runId)) return
@@ -82,8 +98,7 @@ export class LocalProvider extends BufferedProvider {
       const gpuDevice = await getSetting('localAsr.gpuDevice', '')
       if (!this.isRunCurrent(runId)) return
 
-      const result = await invoke<{ text: string; elapsed_ms: number }>('local_transcribe', {
-        audioB64,
+      const result = await bridge.localTranscribeRaw(pcm, {
         modelId,
         language,
         accelerator,

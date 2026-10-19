@@ -24,8 +24,38 @@ const FORMAT_VERSION: i64 = 1;
 const SELECTED_CONFIG_FORMAT_VERSION: i64 = 2;
 const MAX_HOTWORDS: usize = 1000;
 const BUILTIN_PRESET_IDS: &[&str] = &["intent", "faithful", "zh2en", "casual"];
-/// 「配置」档不导出/导入的 app_settings key（使用统计属于使用数据，不属于配置）。
-const CONFIG_EXCLUDE: &[&str] = &["stats"];
+/// 只属于这台机器的 app_settings key：导出不带、导入（含 WebDAV 恢复）不写。
+///
+/// 备份文件可能来自别人（"这是我调好的热词，导入就能用"），所以导入时这些 key 一律当不可信：
+///  · `pendingUpdate` —— 退出时会静默安装它指向的文件。恶意备份曾经能借它运行任意 exe（审核 S3）。
+///  · `backendBaseUrl` —— 更新来源跟随这个地址，导入一个陌生地址就等于把"往这台机器装什么"交给对方，
+///    口述的音频也会发过去。代价：换机恢复后要重新填一次服务器地址。
+///  · 设备 id、开机自启的迁移标记、WebDAV 上次结果 —— 本机状态，带过去只会让两台机器互相冒名或误报。
+const MACHINE_LOCAL_KEYS: &[&str] = &[
+    "pendingUpdate",
+    "backendBaseUrl",
+    "deviceId",
+    "clientDeviceId",
+    "autoLaunch",
+    "autoLaunchArgsMigrated",
+    "autoLaunchInitialized",
+    "webdav.lastAttemptAt",
+    "webdav.lastResult",
+];
+/// 「配置」档不导出/导入的 app_settings key：本机专属的那些，加上使用统计（属于使用数据，不属于配置）。
+/// 与 MACHINE_LOCAL_KEYS 的包含关系有测试钉住。
+const CONFIG_EXCLUDE: &[&str] = &[
+    "stats",
+    "pendingUpdate",
+    "backendBaseUrl",
+    "deviceId",
+    "clientDeviceId",
+    "autoLaunch",
+    "autoLaunchArgsMigrated",
+    "autoLaunchInitialized",
+    "webdav.lastAttemptAt",
+    "webdav.lastResult",
+];
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -293,7 +323,7 @@ fn build_full_value(storage: &Storage, scope: BackupScope) -> Value {
             "includeHistory": scope.include_history,
             "includeAudio": scope.include_audio,
         },
-        "appSettings": storage.export_app_settings(&[]),
+        "appSettings": storage.export_app_settings(MACHINE_LOCAL_KEYS),
         "promptPresets": storage.get("promptPresets", None),
         "appPromptRules": storage.get("appPromptRules", None),
     });
@@ -369,15 +399,25 @@ fn apply_config_part(
         .map_err(|error| format!("Failed to write configuration: {}", error))
 }
 
+/// 备份里的录音文件名只认 `<录音 id>.wav`。原来什么名字都照写，`evil.exe` 也会被当成录音
+/// 落到 audio 目录里，再配合 pendingUpdate 就能在退出时被运行（审核 S3）。
+fn is_backup_audio_name(name: &str) -> bool {
+    name.strip_suffix(".wav")
+        .is_some_and(crate::path_guard::is_record_id)
+}
+
 /// 重写单条历史记录的音频路径：把目录段换成本机 audio 目录，文件名不变。
+/// 文件名不合规的录音不会被释放出来，记录里的路径也一并去掉，免得指向一个不存在或不该碰的文件。
 fn rewrite_audio_path(rec: &Value, adir: &Path) -> Value {
     let mut rec = rec.clone();
     if let Some(obj) = rec.as_object_mut() {
         if let Some(p) = obj.get("audioFilePath").and_then(|v| v.as_str()).map(|s| s.to_string()) {
             let base = basename(&p);
-            if !base.is_empty() {
+            if is_backup_audio_name(&base) {
                 let new_path = adir.join(&base).to_string_lossy().to_string();
                 obj.insert("audioFilePath".to_string(), Value::String(new_path));
+            } else if !p.is_empty() {
+                obj.remove("audioFilePath");
             }
         }
     }
@@ -1302,7 +1342,11 @@ pub fn apply_full_backup(storage: &Storage, in_path: &str) -> Result<(), String>
                 continue;
             }
             let base = basename(rest);
-            if base.is_empty() {
+            if !is_backup_audio_name(&base) {
+                log::warn!(
+                    "[backup] skipped an archive entry that is not a recording: {}",
+                    crate::providers::diag::truncate(&base, 80)
+                );
                 continue;
             }
             let mut buf = Vec::new();
@@ -1311,8 +1355,8 @@ pub fn apply_full_backup(storage: &Storage, in_path: &str) -> Result<(), String>
         }
     }
 
-    // 3. 应用配置部分（含 stats）
-    apply_config_part(storage, &data, &[])?;
+    // 3. 应用配置部分（含 stats，不含本机专属设置）
+    apply_config_part(storage, &data, MACHINE_LOCAL_KEYS)?;
 
     // 4. 历史：重写音频路径后整表替换
     if let Some(history) = data.get("history").and_then(|v| v.as_array()) {
@@ -1408,6 +1452,57 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_exclude_covers_every_machine_local_key() {
+        for key in MACHINE_LOCAL_KEYS {
+            assert!(CONFIG_EXCLUDE.contains(key), "CONFIG_EXCLUDE is missing {key}");
+        }
+    }
+
+    /// 恶意备份的两条腿：设置里塞 pendingUpdate / backendBaseUrl，录音目录里塞 exe。
+    /// 导入完整备份时设置部分必须跳过本机专属 key，其余设置照常写入。
+    #[test]
+    fn full_backup_does_not_import_machine_local_settings() {
+        let (storage, dir) = temp_storage("machine-local");
+        storage.set("deviceId", &json!("local-device")).unwrap();
+        let data = json!({
+            "appSettings": {
+                "pendingUpdate": { "version": "9.9.9", "filePath": "C:\\x\\audio\\evil.exe" },
+                "backendBaseUrl": "https://attacker.example",
+                "deviceId": "someone-else",
+                "overlayWidth": "long",
+            }
+        });
+        apply_config_part(&storage, &data, MACHINE_LOCAL_KEYS).unwrap();
+
+        assert!(storage.get("pendingUpdate", None).is_null());
+        assert!(storage.get("backendBaseUrl", None).is_null());
+        assert_eq!(storage.get("deviceId", None), json!("local-device"));
+        assert_eq!(storage.get("overlayWidth", None), json!("long"));
+
+        let exported = build_full_value(&storage, BackupScope { include_history: false, include_audio: false });
+        let settings = exported.get("appSettings").and_then(Value::as_object).unwrap();
+        assert!(!settings.contains_key("deviceId"));
+        assert!(settings.contains_key("overlayWidth"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_recording_names_are_accepted_from_backups() {
+        assert!(is_backup_audio_name("mshhzwhhyxxw.wav"));
+        assert!(!is_backup_audio_name("evil.exe"));
+        assert!(!is_backup_audio_name("evil.exe.wav.exe"));
+        assert!(!is_backup_audio_name("a.b.wav"));
+        assert!(!is_backup_audio_name(".wav"));
+
+        let adir = Path::new("C:\\local\\audio");
+        let ok = rewrite_audio_path(&json!({ "audioFilePath": "D:\\old\\audio\\abc123.wav" }), adir);
+        assert_eq!(ok["audioFilePath"], json!(adir.join("abc123.wav").to_string_lossy()));
+        let bad = rewrite_audio_path(&json!({ "audioFilePath": "D:\\old\\audio\\evil.exe" }), adir);
+        assert!(bad.get("audioFilePath").is_none());
     }
 
     /// 不含音频时不去扫 audio 目录，也就不会把别的备份的录音塞进来。

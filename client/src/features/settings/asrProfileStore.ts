@@ -26,7 +26,6 @@ import {
   parseAsrProfilesDetailed,
   resolveActiveAsrProfile,
   resolveAsrApiModel,
-  resolveAsrModelOption,
   resolveAsrRuntimeProvider,
   type AsrPlatform,
   type AsrProfile,
@@ -263,4 +262,5 @@ export async function saveAsrProfiles(state: AsrProfileState): Promise<void> {
     setSetting(ASR_ACTIVE_PROFILE_KEY, active?.id ?? ''),
   ])
   await syncRuntimeActive(active)
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('asr-profiles-changed'))
 }

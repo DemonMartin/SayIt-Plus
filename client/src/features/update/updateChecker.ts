@@ -56,6 +56,24 @@ export async function checkVersionUpdate(currentVersion: string): Promise<Versio
   return fallback.latestVersion ? fallback : configured
 }
 
+/**
+ * 安装包地址只能是 manifest 所在服务器上的路径。
+ *
+ * 原来是 `${baseUrl}${download_path}` 直接拼字符串：download_path 写成 `.attacker.example/x.exe`，
+ * 拼出来就是 `https://sayitapp.site.attacker.example/x.exe`，域名已经换了。
+ * 现在按 URL 解析后比 origin，不同源就当没有下载地址。Rust 的 download_update 下载前还会再查一次。
+ */
+export function resolveDownloadUrl(baseUrl: string, downloadPath: string | undefined | null): string | null {
+  if (!downloadPath || !downloadPath.startsWith('/') || downloadPath.startsWith('//')) return null
+  try {
+    const base = new URL(baseUrl)
+    const resolved = new URL(downloadPath, base)
+    return resolved.origin === base.origin ? resolved.toString() : null
+  } catch {
+    return null
+  }
+}
+
 async function fetchManifest(currentVersion: string, baseUrl: string): Promise<VersionInfo> {
   const base: VersionInfo = {
     hasUpdate: false,
@@ -89,9 +107,10 @@ async function fetchManifest(currentVersion: string, baseUrl: string): Promise<V
     base.latestVersion = latestVersion
     base.releaseDate = manifest.releaseDate || null
     base.sha512 = manifest.sha512 || null
-    base.downloadUrl = manifest.download_path
-      ? `${baseUrl}${manifest.download_path}`
-      : null
+    base.downloadUrl = resolveDownloadUrl(baseUrl, manifest.download_path)
+    if (manifest.download_path && !base.downloadUrl) {
+      base.error = 'manifest download_path is not on this server'
+    }
     base.hasUpdate = compareVersions(currentVersion, latestVersion) > 0
     return base
   } catch (err) {

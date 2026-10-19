@@ -52,7 +52,6 @@ interface ModelInfo {
   total_size_bytes: number
   languages: string[]
   sources: DownloadSource[]
-  archive_url?: string
   speed?: number
   accuracy?: number
   recommended?: boolean
@@ -222,14 +221,7 @@ function OfflineGuideDialog({ models, onClose }: { models: ModelInfo[]; onClose:
             // 某模型没有当前标签对应的源时，回退到它的第一个源（防御，正常不会发生：
             // catalog 的测试保证所有模型提供同一组源）
             const source = model.sources[selectedSource] ?? model.sources[0]
-            const isArchive = !source && !!model.archive_url
-            if (!source && !isArchive) return null
-            // GitHub 地址用国内代理加速手动下载
-            const archiveUrl = model.archive_url
-              ? (model.archive_url.startsWith('https://github.com/')
-                ? `https://gh-proxy.com/${model.archive_url}`
-                : model.archive_url)
-              : ''
+            if (!source) return null
             return (
               <div key={model.id}>
                 <div className="mb-2 flex items-center gap-2">
@@ -247,18 +239,9 @@ function OfflineGuideDialog({ models, onClose }: { models: ModelInfo[]; onClose:
                   </Tooltip>
                 </div>
                 <div className="space-y-1.5">
-                  {source ? (
-                    source.files.map((file) => (
-                      <CopyLink key={file.name} url={file.url} label={file.name} />
-                    ))
-                  ) : (
-                    <>
-                      <p className="text-xs leading-relaxed text-muted-foreground">
-                        {t('local.archiveNote')}
-                      </p>
-                      <CopyLink url={archiveUrl} label={t('local.archiveLabel')} />
-                    </>
-                  )}
+                  {source.files.map((file) => (
+                    <CopyLink key={file.name} url={file.url} label={file.name} />
+                  ))}
                 </div>
               </div>
             )
@@ -597,7 +580,7 @@ export default function LocalModeSection() {
 
           {selectedModelId && downloadedIds.has(selectedModelId) && (
             <p className="mb-2 text-sm text-muted-foreground">
-              {t('local.currentModel', { name: availableModels.find((m) => m.id === selectedModelId)?.name || selectedModelId })}
+              {t('local.currentModel', { name: localModelDisplayName(availableModels.find((m) => m.id === selectedModelId) || { id: selectedModelId, name: selectedModelId }) })}
             </p>
           )}
           {selectedModelId && !downloadedIds.has(selectedModelId) && listState === 'ready' && (

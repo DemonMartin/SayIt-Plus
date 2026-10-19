@@ -31,9 +31,11 @@ import {
 } from '@/services/store'
 import AIProofreadToggle from './AIProofreadToggle'
 import HotwordPromptInjectToggle from './HotwordPromptInjectToggle'
+import ContextAwareSection from './ContextAwareSection'
 import AppPromptRulesSection from './AppPromptRulesSection'
 import PromptPresetSection from './PromptPresetSection'
 import { useT } from '@/i18n/useT'
+import { PageTitle } from '@/components/ui/info-tip'
 
 export default function AIInstructionsPage() {
   const t = useT()
@@ -256,13 +258,11 @@ export default function AIInstructionsPage() {
 
   return (
     <div className="mx-auto max-w-4xl">
-      <h1 className="mb-2 text-2xl font-bold">{t('nav.aiInstructions')}</h1>
-      <p className="mb-6 text-sm text-muted-foreground">
-        {t('aiInstructions.subtitle')}
-      </p>
+      <PageTitle title={t('nav.aiInstructions')} info={t('aiInstructions.subtitle')} />
 
       <div className="space-y-6">
         <AIProofreadToggle />
+        <ContextAwareSection />
         <HotwordPromptInjectToggle />
 
         <PromptPresetSection
