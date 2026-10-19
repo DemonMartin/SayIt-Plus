@@ -12,6 +12,7 @@ import { historyFailureReasonDisplay } from '@/i18n/displayNames'
 import { useRecordingPlayback } from './useRecordingPlayback'
 import { AudioProgressBar } from './AudioProgressBar'
 import { AsrCorrectionDialog } from './AsrCorrectionDialog'
+import { groupByDay } from './dayGroups'
 
 /** 云 API 内部 key → 用户友好的模型 ID */
 const ASR_PROVIDER_DISPLAY: Record<string, string> = {
@@ -569,32 +570,7 @@ export default function HistoryRecordList({
   useT()
   // 默认值不能写在参数里：默认参数在模块作用域求值不了 t()，写死中文串又会在英文界面漏出来。
   const resolvedEmptyText = emptyText ?? t('history.empty')
-  const grouped = useMemo(() => {
-    return records.reduce((acc, record) => {
-      const label = getDayLabel(record.timestamp)
-      if (!acc[label]) acc[label] = []
-      acc[label].push(record)
-      return acc
-    }, {} as Record<string, HistoryRecord[]>)
-  }, [records])
-
-  const sortedDays = useMemo(() => {
-    return Object.keys(grouped).sort((a, b) => {
-      // 判据跟着译文走：分组标签就是 getDayLabel 拼出来的，硬编码「今天」在英文下永远不命中，
-      // 结果是今天的记录被按字母序丢到中间。
-      const todayLabel = t('record.today')
-      const yesterdayLabel = t('record.yesterday')
-      const aIsToday = a.startsWith(todayLabel)
-      const bIsToday = b.startsWith(todayLabel)
-      const aIsYesterday = a.startsWith(yesterdayLabel)
-      const bIsYesterday = b.startsWith(yesterdayLabel)
-      if (aIsToday) return -1
-      if (bIsToday) return 1
-      if (aIsYesterday) return -1
-      if (bIsYesterday) return 1
-      return b.localeCompare(a)
-    })
-  }, [grouped])
+  const dayGroups = useMemo(() => groupByDay(records, getDayLabel), [records])
 
   if (records.length === 0) {
     return <p className="py-12 text-center text-muted-foreground">{resolvedEmptyText}</p>
@@ -602,11 +578,11 @@ export default function HistoryRecordList({
 
   return (
     <div className="space-y-3">
-      {sortedDays.map((day) => (
+      {dayGroups.map((group) => (
         <DayGroup
-          key={day}
-          label={day}
-          records={grouped[day]}
+          key={group.dayStart}
+          label={group.label}
+          records={group.records}
           onDelete={onDelete}
           onToggleFavorite={onToggleFavorite}
           onReprocess={onReprocess}
