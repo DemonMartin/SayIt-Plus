@@ -10,7 +10,7 @@
  */
 
 import { emit } from '@tauri-apps/api/event'
-import { getPTTPhysicalKeyStates } from './bridge'
+import { getPTTPhysicalKeyStates, getTypedEditShortcut } from './bridge'
 import { getSetting } from './store'
 import { getDefault } from './defaults'
 import {
@@ -44,6 +44,15 @@ let started = false
 // 不挂起的话，按到已绑定的键（如免提的右 Alt）会从这里 emit toggle-hands-free，
 // 于是弹出悬浮窗开始录音——而不是把这个键录进设置里。
 let captureActive = false
+let typedEditActive = false
+let typedEditCodes: string[] = []
+let typedEditAutomatic = true
+let typedEditTrigger = ''
+
+export function setTypedEditInputActive(active: boolean) {
+  typedEditActive = active
+  if (active) releasePTT('typed_edit')
+}
 
 function isModifierSetting(setting: string) {
   return ['AltLeft', 'AltRight', 'ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight'].includes(setting)
@@ -158,7 +167,25 @@ function releasePTT(reason: string, triggerCode = pttCodes[0] || '') {
 }
 
 function handleKeyDown(event: KeyboardEvent) {
-  if (captureActive) return
+  if (captureActive || typedEditActive) return
+  const isTypedMember = typedEditCodes.includes(event.code)
+    || (typedEditAutomatic && event.code === 'ShiftRight' && typedEditCodes.includes('ShiftLeft'))
+  const typedChordDown = isTypedMember && typedEditCodes.length > 0 && typedEditCodes.every((code) => {
+    if (code === event.code) return true
+    if (code.startsWith('Shift')) return event.shiftKey
+    if (code.startsWith('Alt')) return event.altKey
+    if (code.startsWith('Control')) return event.ctrlKey
+    if (code.startsWith('Meta')) return event.metaKey
+    return false
+  })
+  if (typedChordDown) {
+    event.preventDefault()
+    if (!event.repeat && !typedEditTrigger) {
+      typedEditTrigger = event.code
+      void emit('open-typed-edit', { source: 'webview_fallback' })
+    }
+    return
+  }
 
   if (pttCodes.includes(event.code)) {
     reconcileStalePTTModifiers(event)
@@ -214,7 +241,12 @@ function handleKeyDown(event: KeyboardEvent) {
 }
 
 function handleKeyUp(event: KeyboardEvent) {
-  if (captureActive) return
+  if (event.code === typedEditTrigger) {
+    typedEditTrigger = ''
+    event.preventDefault()
+    return
+  }
+  if (captureActive || typedEditActive) return
 
   if (pttCodes.includes(event.code)) {
     invalidatePTTStartCheck()
@@ -251,6 +283,7 @@ function handleKeyUp(event: KeyboardEvent) {
 }
 
 function handleWindowBlur() {
+  typedEditTrigger = ''
   // 焦点转移后，keyup 可能送到别的窗口；立即释放，避免前端 fallback 留下活动录音。
   releasePTT('window_blur')
   hfKeyDown = false
@@ -259,6 +292,12 @@ function handleWindowBlur() {
 
 /** 刷新 PTT 设置（设置页面改键后调用） */
 export async function refreshPTTSetting() {
+  const [typedShortcut, typedSetting] = await Promise.all([
+    getTypedEditShortcut().catch(() => ''),
+    getSetting('shortcutTypedEdit', 'auto').catch(() => 'auto'),
+  ])
+  typedEditCodes = parsePTTShortcut(typedShortcut)
+  typedEditAutomatic = typedSetting === 'auto'
   try {
     // 不传字面量兜底值：默认键只在 services/defaults.ts 里定义一处，getSetting 会去读它。
     const setting = await getSetting<string>('shortcutPTT')

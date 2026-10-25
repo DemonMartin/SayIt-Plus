@@ -1452,5 +1452,21 @@
   "builtinApp.notepad": "Notepad",
   "builtinApp.codex": "Codex",
   "builtinApp.weixin": "WeChat",
-  "builtinApp.qq": "QQ"
+  "builtinApp.qq": "QQ",
+  "typedEdit.title": "Edit selected text",
+  "typedEdit.placeholder": "What would you like to change?",
+  "typedEdit.keyHint": "Enter to apply · Shift+Enter to improve first",
+  "typedEdit.apply": "Apply instruction",
+  "typedEdit.improving": "Improving instruction…",
+  "typedEdit.applying": "Editing selection…",
+  "typedEdit.selectText": "Select some text first. Long selections may need to be shortened.",
+  "typedEdit.configureAi": "Choose an AI service in Settings to use typed editing.",
+  "typedEdit.failed": "Could not finish the edit. Your selection is unchanged. Try again.",
+  "typedEdit.releaseKeys": "Release the shortcut keys to apply the edit.",
+  "typedEdit.shortcutLabel": "Type an editing instruction",
+  "typedEdit.shortcutDesc": "Edit selected text without speaking.",
+  "typedEdit.shortcutHelp": "Opens a text box for an instruction. Enter applies it to your selection. Shift+Enter improves your instruction with the contextual prompt first, then applies it. No speech model is needed.",
+  "typedEdit.resetShortcut": "Use Shift + recording shortcut",
+  "typedEdit.shortcutConflict": "This shortcut is already assigned to another SayIt action.",
+  "typedEdit.keyboardOnly": "Choose a keyboard shortcut for typed editing."
 }

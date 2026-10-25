@@ -1452,5 +1452,21 @@
   "builtinApp.notepad": "记事本",
   "builtinApp.codex": "Codex",
   "builtinApp.weixin": "微信",
-  "builtinApp.qq": "QQ"
+  "builtinApp.qq": "QQ",
+  "typedEdit.title": "编辑选中文字",
+  "typedEdit.placeholder": "想怎样修改？",
+  "typedEdit.keyHint": "Enter 应用 · Shift+Enter 先优化指令",
+  "typedEdit.apply": "应用指令",
+  "typedEdit.improving": "正在优化指令…",
+  "typedEdit.applying": "正在编辑选区…",
+  "typedEdit.selectText": "请先选中要编辑的文字。选区过长时请缩短选区。",
+  "typedEdit.configureAi": "请先在设置中选择 AI 服务，再使用文字编辑。",
+  "typedEdit.failed": "未能完成编辑，原选区保持不变。请重试。",
+  "typedEdit.releaseKeys": "请松开快捷键以应用编辑。",
+  "typedEdit.shortcutLabel": "输入编辑指令",
+  "typedEdit.shortcutDesc": "不用说话，直接编辑选中文字。",
+  "typedEdit.shortcutHelp": "打开文字框输入指令。Enter 将指令应用到选区；Shift+Enter 先用上下文提示词优化指令，再应用到选区。无需加载语音模型。",
+  "typedEdit.resetShortcut": "使用 Shift + 录音快捷键",
+  "typedEdit.shortcutConflict": "此快捷键已用于 SayIt 的其他操作。",
+  "typedEdit.keyboardOnly": "请为文字编辑选择键盘快捷键。"
 }

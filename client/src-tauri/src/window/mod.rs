@@ -82,6 +82,7 @@ fn now_ms() -> i64 {
 
 #[derive(Debug, Clone, PartialEq)]
 enum OverlayLayout {
+    TypedEdit,
     Base,
     BaseWithMicHint,
     Fallback,
@@ -98,7 +99,7 @@ impl OverlayLayout {
     /// ⚠️ 非交互布局会 `set_ignore_cursor_events(true)`，窗口整体点击穿透。
     /// 新增任何"有按钮的"状态都必须在这里返回 true，否则按钮在界面上看得见、点不到。
     fn is_interactive(&self) -> bool {
-        matches!(self, OverlayLayout::Fallback | OverlayLayout::Failure)
+        matches!(self, OverlayLayout::Fallback | OverlayLayout::Failure | OverlayLayout::TypedEdit)
     }
 
     /// 该布局期望的设计尺寸（宽, 高），单位是 CSS px。
@@ -107,6 +108,7 @@ impl OverlayLayout {
     /// （见 OVERLAY_CSS_ZOOM_MIN 的说明），要先乘 css_zoom 才是窗口该有的逻辑尺寸。
     fn dimensions(&self, base_width: f64) -> (f64, f64) {
         match self {
+            OverlayLayout::TypedEdit => (480.0, 224.0),
             OverlayLayout::Base => (base_width, OVERLAY_BASE_HEIGHT),
             OverlayLayout::BaseWithMicHint => (
                 base_width.max(OVERLAY_MIC_HINT_WIDTH),
@@ -276,6 +278,20 @@ impl WindowState {
             .filter(|payload| payload.get("state").and_then(Value::as_str) != Some("blank"))
             .unwrap_or_else(|| json!({ "state": "waiting", "elapsedSec": 0 }));
         self.present_overlay(app, data)
+    }
+
+    pub fn focus_typed_edit(&self, app: &AppHandle, token: u64) -> Result<(), String> {
+        let payload = self.latest_overlay_payload.lock().unwrap_or_else(|p| p.into_inner());
+        let current = payload.as_ref().is_some_and(|data| {
+            data.get("state").and_then(Value::as_str) == Some("typed-edit")
+                && data.get("typedEditToken").and_then(Value::as_u64) == Some(token)
+        });
+        if !current || self.active_show_id.load(Ordering::SeqCst) == 0 {
+            return Err("Typed editor is no longer visible".to_string());
+        }
+        drop(payload);
+        let overlay = app.get_webview_window("overlay").ok_or("Overlay is unavailable")?;
+        overlay.set_focus().map_err(|e| e.to_string())
     }
 
     pub fn hide_overlay(&self, app: &AppHandle) {
@@ -606,7 +622,9 @@ impl WindowState {
             .and_then(Value::as_str)
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
-        let candidate_layout = if state == Some("fallback") {
+        let candidate_layout = if state == Some("typed-edit") {
+            OverlayLayout::TypedEdit
+        } else if state == Some("fallback") {
             OverlayLayout::Fallback
         } else if state == Some("failure") {
             OverlayLayout::Failure
@@ -1400,7 +1418,7 @@ mod tests {
     #[test]
     fn only_card_layouts_receive_mouse_clicks() {
         let expected = |layout: &OverlayLayout| match layout {
-            OverlayLayout::Fallback | OverlayLayout::Failure => true,
+            OverlayLayout::Fallback | OverlayLayout::Failure | OverlayLayout::TypedEdit => true,
             OverlayLayout::Base
             | OverlayLayout::BaseWithMicHint
             | OverlayLayout::Streaming

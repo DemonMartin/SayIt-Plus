@@ -19,7 +19,7 @@ import WebDavSection from './WebDavSection'
 import MicrophoneSection from './MicrophoneSection'
 import type { MicVolumeLevel } from './MicrophoneSection'
 import { ComboShortcutInput, PTTShortcutInput } from './ShortcutInputs'
-import { pttShortcutConflictsWithAccelerator } from '@/lib/shortcutKeys'
+import { pttShortcutConflictsWithAccelerator, typedEditShortcutConflictsWith } from '@/lib/shortcutKeys'
 import { t, type LanguagePreference, type TranslationKey } from '@/i18n'
 import { useT } from '@/i18n/useT'
 import { getLanguagePreference, switchLanguage } from '@/stores/language'
@@ -61,6 +61,8 @@ export default function GeneralSettingsPage() {
   const [pttKey, setPttKey] = useState(() => getDefault<string>('shortcutPTT', ''))
   const [handsFreeKey, setHandsFreeKey] = useState('AltRight')
   const [aiToggleKey, setAiToggleKey] = useState('')
+  const [typedEditKey, setTypedEditKey] = useState('')
+  const [typedEditAutomatic, setTypedEditAutomatic] = useState(true)
   const [historyEnabled, setHistoryEnabled] = useState(true)
   const [audioRetentionEnabled, setAudioRetentionEnabled] = useState(true)
   const [audioRetentionDays, setAudioRetentionDays] = useState(30)
@@ -126,6 +128,8 @@ export default function GeneralSettingsPage() {
     getSetting<string>('shortcutPTT').then((value) => setPttKey(value))
     getSetting('shortcutHandsFree', 'AltRight').then((value) => setHandsFreeKey(value as string))
     getSetting('shortcutToggleAi', '').then((value) => setAiToggleKey(value as string))
+    void Promise.all([getSetting('shortcutTypedEdit', 'auto'), bridge.getTypedEditShortcut()])
+      .then(([saved, resolved]) => { setTypedEditAutomatic(saved === 'auto'); setTypedEditKey(resolved) })
     listMicrophones().then(setMics).catch(() => { })
     return () => { cancelled = true }
   }, [])
@@ -152,12 +156,26 @@ export default function GeneralSettingsPage() {
   const handleAudioRetentionDaysChange = async (value: number) => { setAudioRetentionDays(value); await setSetting('audioRetentionDays', value) }
   const handleLogRetentionDaysChange = async (value: number) => { setLogRetentionDays(value); await setSetting('logRetentionDays', value) }
   const handlePTTChange = async (value: string) => { setPttKey(value); await setSetting('shortcutPTT', value); bridge.notifyShortcutsChanged(); refreshPTTSetting() }
-  const handleHandsFreeChange = async (value: string) => { setHandsFreeKey(value); await setSetting('shortcutHandsFree', value); bridge.notifyShortcutsChanged(); refreshPTTSetting() }
+  const handleHandsFreeChange = async (value: string) => {
+    setHandsFreeKey(value)
+    await setSetting('shortcutHandsFree', value)
+    bridge.notifyShortcutsChanged()
+    refreshPTTSetting()
+    if (typedEditAutomatic) setTypedEditKey(await bridge.getTypedEditShortcut())
+  }
+  const handleTypedEditChange = async (value: string) => {
+    await setSetting('shortcutTypedEdit', value)
+    setTypedEditAutomatic(value === 'auto')
+    setTypedEditKey(await bridge.getTypedEditShortcut())
+    bridge.notifyShortcutsChanged()
+    refreshPTTSetting()
+  }
 
   // 应用内部快捷键互斥：免提和按住说话绑同一个键，两个功能会同时被触发；
   // 预设切换的组合键同理。提交前拦下来，而不是等用户按了才发现行为诡异。
   const validatePTT = useCallback(async (value: string) => {
     if (!value) return null
+    if (typedEditShortcutConflictsWith(typedEditKey, value)) return t('typedEdit.shortcutConflict')
     if (pttShortcutConflictsWithAccelerator(value, handsFreeKey)) {
       return t('settings.shortcuts.conflictHandsFree')
     }
@@ -169,9 +187,10 @@ export default function GeneralSettingsPage() {
       (shortcut) => pttShortcutConflictsWithAccelerator(value, shortcut),
     )) return t('settings.shortcuts.conflictPreset')
     return null
-  }, [handsFreeKey, aiToggleKey])
+  }, [handsFreeKey, aiToggleKey, typedEditKey])
   const validateHandsFree = useCallback(async (value: string) => {
     if (!value) return null
+    if (!typedEditAutomatic && typedEditShortcutConflictsWith(typedEditKey, value)) return t('typedEdit.shortcutConflict')
     if (pttShortcutConflictsWithAccelerator(pttKey, value)) {
       return t('settings.shortcuts.conflictPtt')
     }
@@ -179,7 +198,19 @@ export default function GeneralSettingsPage() {
     const presetShortcuts = await getPresetShortcuts()
     if (Object.values(presetShortcuts).includes(value)) return t('settings.shortcuts.conflictPreset')
     return null
-  }, [pttKey, aiToggleKey])
+  }, [pttKey, aiToggleKey, typedEditKey, typedEditAutomatic])
+
+  const validateTypedEdit = async (value: string) => {
+    if (value.split('+').some((code) => ['MButton', 'XButton1', 'XButton2'].includes(code))) {
+      return t('typedEdit.keyboardOnly')
+    }
+    const presets = await getPresetShortcuts()
+    if ([pttKey, handsFreeKey, aiToggleKey, ...Object.values(presets)]
+      .some((shortcut) => typedEditShortcutConflictsWith(value, shortcut))) {
+      return t('typedEdit.shortcutConflict')
+    }
+    return null
+  }
 
   const drawWaveform = useCallback((analyser: AnalyserNode) => {
     const canvas = canvasRef.current; if (!canvas) return
@@ -286,6 +317,22 @@ export default function GeneralSettingsPage() {
                 label={<ShortcutLabel label={t('settings.shortcuts.ptt')} help={t('settings.shortcuts.pttHelp')} />}
                 description={t('settings.shortcuts.pttDesc')}
               />
+              <div>
+                <PTTShortcutInput
+                  value={typedEditKey}
+                  onChange={handleTypedEditChange}
+                  validate={validateTypedEdit}
+                  allowShift
+                  label={<ShortcutLabel label={t('typedEdit.shortcutLabel')} help={t('typedEdit.shortcutHelp')} />}
+                  description={t('typedEdit.shortcutDesc')}
+                />
+                {!typedEditAutomatic && (
+                  <button type="button" onClick={() => { void handleTypedEditChange('auto') }}
+                    className="mt-2 text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground">
+                    {t('typedEdit.resetShortcut')}
+                  </button>
+                )}
+              </div>
             </div>
           </CardContent>
         </Card>

@@ -46,7 +46,7 @@ interface ClientAiPolishOptions {
   isCurrent?: () => boolean
 }
 
-async function loadClientAiConfig(): Promise<ClientAiConfig> {
+export async function loadClientAiConfig(): Promise<ClientAiConfig> {
   const [provider, apiUrl, apiKey, model] = await Promise.all([
     getSetting('cloudAi.provider', 'openai_compat') as Promise<string>,
     getSetting('cloudAi.apiUrl', '') as Promise<string>,

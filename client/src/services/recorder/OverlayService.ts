@@ -13,6 +13,7 @@ import {
 import type { MicSourceMode } from './micSourceReminder'
 
 type OverlayVisualState =
+  | 'typed-edit'
   | 'waiting'
   | 'listening'
   | 'thinking'
@@ -300,6 +301,24 @@ export class OverlayService {
       waitingMessage: message,
       ...this.getMicSourceHintPayload(),
       ...this.getCommonPayload(),
+    })
+  }
+
+  async showTypedEdit(token: number) {
+    this.currentState = 'typed-edit'
+    this.clearMicSourceHint()
+    this.enterTransientState('off', 0)
+    this.clearFallbackHideTimer()
+    await bridge.presentOverlay({
+      state: 'typed-edit', typedEditToken: token, typedEditPhase: 'idle',
+      typedEditError: '', ...this.getCommonPayload(),
+    })
+  }
+
+  async updateTypedEdit(token: number, phase: 'idle' | 'improving' | 'applying', error = '') {
+    await bridge.updateOverlay({
+      state: 'typed-edit', typedEditToken: token, typedEditPhase: phase,
+      typedEditError: error, ...this.getCommonPayload(),
     })
   }
 

@@ -9,6 +9,7 @@ pub(crate) const DEFAULT_SETTINGS: &[(&str, &str)] = &[
     ("shortcutPTT", r#""ControlRight""#),
     ("shortcutPTTCombo", r#""Alt+Q""#),
     ("shortcutHandsFree", r#""AltRight""#),
+    ("shortcutTypedEdit", r#""auto""#),
     ("shortcutToggleAi", r#""""#),
     ("autoLaunch", "true"),
     ("selectedMic", r#""""#),

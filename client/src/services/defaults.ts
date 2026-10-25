@@ -33,6 +33,7 @@ export const DEFAULTS: Record<string, unknown> = {
   shortcutHandsFree: 'AltRight', // 免提模式。默认右 Alt 单键。也支持组合键格式如 'Control+Shift+S'
   // AI 整理总开关。留空 = 不注册，避免升级时意外占用用户已有的全局组合键。
   shortcutToggleAi: '',
+  shortcutTypedEdit: 'auto', // Shift + recording shortcut; a physical-key binding overrides it.
 
   // ── 麦克风 ──
   selectedMic: '', // 设备 ID，空字符串 = 系统默认

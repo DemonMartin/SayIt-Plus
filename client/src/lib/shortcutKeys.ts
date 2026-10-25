@@ -485,8 +485,8 @@ function pttMainCodeToAccelerator(code: string): string {
  * 将可由 Tauri accelerator 表示的 PTT 组合转换为 accelerator。
  * 纯修饰组合以及同时包含 Ctrl 和 Win 的组合没有无损表示，返回 undefined。
  */
-export function pttShortcutToAccelerator(setting: string): string | undefined {
-  if (!isValidPTTShortcut(setting)) return undefined
+export function pttShortcutToAccelerator(setting: string, options: PTTValidationOptions = {}): string | undefined {
+  if (!isValidPTTShortcut(setting, options)) return undefined
   const codes = parsePTTShortcut(canonicalizePTTShortcut(setting))
   const mainKeys = codes.filter((code) => !isPTTModifierCode(code))
   if (mainKeys.length !== 1) return undefined
@@ -521,6 +521,15 @@ function normalizeAccelerator(accelerator: string): string {
     .map((part) => aliases[part] || part)
     .sort((left, right) => (order[left] ?? 3) - (order[right] ?? 3) || left.localeCompare(right))
     .join('+')
+}
+
+/** Compare complete chords; a typed chord may intentionally extend the recording key with Shift. */
+export function typedEditShortcutConflictsWith(shortcut: string, other: string): boolean {
+  if (!shortcut || !other) return false
+  if (canonicalizePTTShortcut(shortcut) === canonicalizePTTShortcut(other)) return true
+  const left = pttShortcutToAccelerator(shortcut, { allowLegacyReservedKeys: true }) ?? shortcut
+  const right = pttShortcutToAccelerator(other, { allowLegacyReservedKeys: true }) ?? other
+  return normalizeAccelerator(left) === normalizeAccelerator(right)
 }
 
 /** 比较 PTT 物理组合与免提/预设 accelerator 是否会触发同一组合。 */

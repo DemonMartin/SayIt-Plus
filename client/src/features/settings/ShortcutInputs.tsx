@@ -94,12 +94,15 @@ export function PTTShortcutInput({
   label,
   description,
   validate,
+  allowShift = false,
 }: {
   value: string
   onChange: (value: string) => void
   label: ReactNode
   description: string
   validate?: ShortcutValidate
+  /** Text editing is a tap action, so it can safely use Shift. */
+  allowShift?: boolean
 }) {
   const [recording, setRecording] = useState(false)
   const [tempValue, setTempValue] = useState('')
@@ -125,7 +128,7 @@ export function PTTShortcutInput({
 
   const commit = useCallback(async (mapped: string) => {
     const canonical = canonicalizePTTShortcut(mapped)
-    const formatError = getPTTShortcutValidationError(canonical)
+    const formatError = getPTTShortcutValidationError(canonical, { allowLegacyReservedKeys: allowShift })
     if (formatError) {
       showValidateError(formatError)
       return false
@@ -138,7 +141,7 @@ export function PTTShortcutInput({
     showValidateError('')
     onChange(canonical)
     return true
-  }, [onChange, validate, showValidateError])
+  }, [onChange, validate, showValidateError, allowShift])
 
   const handleKeyDown = useCallback((event: KeyboardEvent) => {
     if (!isShortcutCaptureOwner(cancelRecording)) return
@@ -194,7 +197,7 @@ export function PTTShortcutInput({
 
   const displayValue = tempValue || value
   const keys = displayValue ? displayPTTShortcut(displayValue) : [t('shortcut.notSet')]
-  const shortcutWarning = !recording ? getPTTShortcutWarning(value) : null
+  const shortcutWarning = !recording && !allowShift ? getPTTShortcutWarning(value) : null
 
   return (
     <div>

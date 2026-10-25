@@ -3,6 +3,11 @@ use tauri::{AppHandle, State};
 
 use crate::window::WindowState;
 
+#[tauri::command]
+pub fn focus_typed_edit(token: u64, app: AppHandle, window_state: State<'_, WindowState>) -> Result<(), String> {
+    window_state.focus_typed_edit(&app, token)
+}
+
 // IMPORTANT: 创建 WebView 的命令必须是 async，避免 Windows 主线程死锁。
 #[tauri::command]
 pub async fn present_overlay(
