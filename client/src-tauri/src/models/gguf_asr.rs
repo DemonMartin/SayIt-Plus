@@ -28,7 +28,7 @@ use transcribe_cpp::TimestampKind;
 #[cfg(test)]
 use super::downloader::model_dir;
 
-/// 已加载的引擎。Session 内部持有 Model 的 Arc，所以重复推理不会重新加载权重。
+/// 已加载的引擎。保留 Model 的 Arc，空闲时可以只释放 Session 的临时计算缓冲。
 ///
 /// 缓存 key 是 (model_id, accelerator, gpu_device)：这三个变了才需要真的重建模型。
 /// language 不在 key 里 —— 它只是 RunOptions 的运行时参数，每次转写传入即可，
@@ -61,7 +61,31 @@ pub(crate) struct Loaded {
     /// `localAsr.language`（只有 auto/zh/en/ja/ko）不能直接透传，得按这份清单
     /// 解析成模型真正认识的那个串。详见 `resolve_language`。
     languages: Vec<String>,
-    session: Session,
+    model: Model,
+    session: Option<Session>,
+}
+
+impl Loaded {
+    fn session(&mut self) -> Result<&mut Session, String> {
+        if self.session.is_none() {
+            let start = Instant::now();
+            self.session = Some(
+                self.model
+                    .session_with(&SessionOptions::default())
+                    .map_err(|e| format!("Failed to create session ({}): {}", self.model_id, e))?,
+            );
+            // The model and its compiled backend pipelines survived idle cleanup.
+            // Rebuilding the session does not need another warm-up transcription.
+            log::info!(
+                "Restored local ASR session in {}ms: {}",
+                start.elapsed().as_millis(),
+                self.model_id
+            );
+        }
+        self.session
+            .as_mut()
+            .ok_or_else(|| "Model session is unavailable".to_string())
+    }
 }
 
 static CACHE: Mutex<Option<Loaded>> = Mutex::new(None);
@@ -435,8 +459,9 @@ fn ensure_loaded(model_id: &str, accelerator: &str, gpu_device: &str) -> Result<
 
     let mut cache = CACHE.lock().map_err(|e| format!("Failed to acquire model cache lock: {}", e))?;
 
-    if let Some(ref c) = *cache {
+    if let Some(ref mut c) = *cache {
         if c.model_id == model_id && c.accelerator == accelerator && c.gpu_device == gpu_device {
+            c.session()?;
             // 与空闲卸载共用同一把锁更新时间，保证守护线程拿到锁后不会
             // 把刚被复用、即将开始推理的模型当成过期模型卸载。
             touch_activity();
@@ -504,7 +529,8 @@ fn ensure_loaded(model_id: &str, accelerator: &str, gpu_device: &str) -> Result<
         supports_itn,
         supports_pnc,
         languages,
-        session,
+        model,
+        session: Some(session),
     };
     let load_ms = start.elapsed().as_millis();
 
@@ -568,7 +594,10 @@ fn warmup(entry: &mut Loaded) -> u128 {
         entry.supports_itn,
         entry.supports_pnc,
     );
-    if let Err(e) = entry.session.run(&pcm, &opts) {
+    if let Err(e) = entry
+        .session()
+        .and_then(|session| session.run(&pcm, &opts).map_err(|e| e.to_string()))
+    {
         log::warn!("Warm-up inference failed; functionality is unaffected, but the first run will be slower: {}", e);
     }
     t0.elapsed().as_millis()
@@ -657,7 +686,7 @@ fn transcribe_with_cache(
 
     if samples.len() <= limit {
         return entry
-            .session
+            .session()?
             .run(samples, &opts)
             .map(|t| t.text.trim().to_string())
             .map_err(|e| format!("Inference failed: {}", e));
@@ -672,7 +701,7 @@ fn transcribe_with_cache(
     let mut out = String::new();
     for chunk in samples.chunks(limit) {
         let text = entry
-            .session
+            .session()?
             .run(chunk, &opts)
             .map_err(|e| format!("Inference failed: {}", e))?;
         append_segment_text(&mut out, &text.text);
@@ -830,6 +859,8 @@ impl Drop for ActivityGuard {
 static IDLE_UNLOAD_MINUTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static IDLE_UNLOADER_STARTED: std::sync::Once = std::sync::Once::new();
+/// Keep weights ready between recordings, but release temporary buffers after a minute idle.
+const SESSION_IDLE_MS: u64 = 60_000;
 
 pub fn set_idle_unload_minutes(idle_minutes: u64) {
     IDLE_UNLOAD_MINUTES.store(idle_minutes, std::sync::atomic::Ordering::SeqCst);
@@ -840,7 +871,31 @@ pub fn set_idle_unload_minutes(idle_minutes: u64) {
     }
 }
 
-/// 启动唯一的空闲守护线程。线程每轮读取最新配置，因此设置页修改后立即生效，
+fn release_idle_resources(cache: &mut Option<Loaded>, idle_minutes: u64, elapsed_ms: u64) {
+    let unload_ms = idle_minutes.saturating_mul(60).saturating_mul(1000);
+    if idle_minutes > 0 && elapsed_ms >= unload_ms {
+        if let Some(entry) = cache.take() {
+            log::info!(
+                "Local model was idle for {} minutes; unloaded to free memory: {}",
+                idle_minutes,
+                entry.model_id
+            );
+            mark_unloaded();
+        }
+    } else if elapsed_ms >= SESSION_IDLE_MS {
+        if let Some(entry) = cache.as_mut() {
+            if entry.session.take().is_some() {
+                log::info!(
+                    "Released idle local ASR buffers; model weights remain loaded: {}",
+                    entry.model_id
+                );
+            }
+        }
+    }
+}
+
+/// 启动唯一的空闲守护线程。先释放 Session 缓冲，到用户设置的时限再释放权重。
+/// 线程每轮读取最新配置，因此设置页修改后立即生效，
 /// 无需重复创建线程。到期判断与 cache.take 在同一次加锁内完成；若推理正在运行，
 /// 守护线程会等待推理释放锁，再看到 ActivityGuard 刷新的时间，不会误卸载。
 ///
@@ -851,12 +906,6 @@ pub fn spawn_idle_unloader(initial_idle_minutes: u64) {
     IDLE_UNLOADER_STARTED.call_once(|| {
         std::thread::spawn(|| loop {
             std::thread::sleep(std::time::Duration::from_secs(60));
-            // 配置为 0 时避免无意义地争用推理锁；拿到锁后还会再读一次，防止
-            // 用户恰在这段间隙切换为“不自动卸载”却仍按旧配置卸载一次。
-            if IDLE_UNLOAD_MINUTES.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                continue;
-            }
-
             let mut cache = match CACHE.lock() {
                 Ok(cache) => cache,
                 Err(error) => {
@@ -866,29 +915,15 @@ pub fn spawn_idle_unloader(initial_idle_minutes: u64) {
             };
             let idle_minutes =
                 IDLE_UNLOAD_MINUTES.load(std::sync::atomic::Ordering::SeqCst);
-            if idle_minutes == 0 {
-                continue;
-            }
-            let idle_ms = idle_minutes.saturating_mul(60).saturating_mul(1000);
             if cache.is_none() {
                 continue;
             }
 
             let last = LAST_USE_MS.load(std::sync::atomic::Ordering::Relaxed);
-            if last == 0 || now_ms().saturating_sub(last) < idle_ms {
+            if last == 0 {
                 continue;
             }
-
-            if let Some(entry) = cache.take() {
-                log::info!(
-                    "Local model was idle for {} minutes; unloaded to free memory: {}",
-                    idle_minutes,
-                    entry.model_id
-                );
-                // 这里是直接 take 而不是走 unload()（已经持着 CACHE 锁了），
-                // 所以状态镜像要自己同步，否则诊断页会一直报着已卸载的后端。
-                mark_unloaded();
-            }
+            release_idle_resources(&mut cache, idle_minutes, now_ms().saturating_sub(last));
         });
     });
 }
@@ -1471,6 +1506,45 @@ mod tests {
         "qwen3-asr-1.7b-gguf",
     ];
 
+    #[test]
+    #[ignore = "requires a downloaded model and the native backends"]
+    fn idle_cleanup_preserves_weights_and_transcription() {
+        let id = "qwen3-asr-1.7b-q4-gguf";
+        if !model_present(id) {
+            eprintln!("skip: {id} is not downloaded");
+            return;
+        }
+        unload();
+        let pcm = read_test_wav();
+        let original = transcribe(id, "auto", "auto", "", &pcm, SR_U).unwrap();
+        assert!(!original.is_empty());
+        let backend = current_backend();
+
+        {
+            let mut cache = CACHE.lock().unwrap();
+            release_idle_resources(&mut cache, 0, SESSION_IDLE_MS - 1);
+            assert!(cache.as_ref().unwrap().session.is_some());
+            release_idle_resources(&mut cache, 0, SESSION_IDLE_MS);
+            assert!(cache.as_ref().unwrap().session.is_none());
+            // Repeated checks must keep weights even when full unloading is disabled.
+            release_idle_resources(&mut cache, 0, 60 * SESSION_IDLE_MS);
+            assert!(cache.is_some());
+        }
+        assert_eq!(current_backend(), backend);
+        preload(id, "auto", "").unwrap();
+        assert_eq!(transcribe(id, "auto", "auto", "", &pcm, SR_U).unwrap(), original);
+
+        {
+            let mut cache = CACHE.lock().unwrap();
+            release_idle_resources(&mut cache, 10, SESSION_IDLE_MS);
+            assert!(cache.as_ref().unwrap().session.is_none());
+            release_idle_resources(&mut cache, 10, 10 * SESSION_IDLE_MS);
+            assert!(cache.is_none());
+        }
+        assert!(current_backend().is_none());
+        assert!(current_device().is_none());
+    }
+
     /// 每个模型加载后的真实内存占用。权重体积 ≠ 内存占用，catalog 里写给用户看的
     /// "内存占用 X" 应该照这里的实测值写。
     #[test]
@@ -1492,7 +1566,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .as_ref()
-                .and_then(|e| e.session.limits().ok());
+                .and_then(|e| e.session.as_ref()?.limits().ok());
             eprintln!(
                 "[mem] {id}: {before} MB -> {after} MB (delta {} MB) limits={:?}",
                 after.saturating_sub(before),
