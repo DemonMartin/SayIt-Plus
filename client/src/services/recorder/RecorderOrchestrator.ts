@@ -63,6 +63,7 @@ import {
   computeProcessingTimeoutMs as _computeProcessingTimeoutMs,
 } from './helpers'
 import { t } from '@/i18n'
+import { TypedEditService, type TypedEditPayload } from '../typedEdit'
 import { describeProviderError } from '@/lib/errorMessages'
 import { describeMicSource, micSourceChanged } from './micSourceReminder'
 import {
@@ -215,6 +216,11 @@ export class RecorderOrchestrator {
 
   private readonly overlayWaveState = createWaveformBarState()
   private readonly overlayService = new OverlayService(() => this.getLiveElapsedSec())
+  private readonly typedEdit = new TypedEditService(this.overlayService, (text, reason, token) => {
+    this.activeFallbackToken = token
+    this.overlayService.showFallback(text, reason, token)
+  })
+  private typedEditListeners: Array<() => void> = []
   /** 音量两档提醒、系统静音判定、本次录音的音频统计。 */
   private readonly micLevel = new MicLevelMonitor({
     overlay: this.overlayService,
@@ -422,7 +428,7 @@ export class RecorderOrchestrator {
       // 立即生效：更新录音器缓存 + 通知 UI + 悬浮窗提示（均无需等待 IPC）
       this.settings.activePresetId = presetId
       setActivePresetKnown(presetId, target.name)
-      if (this.state === 'idle') {
+      if (this.state === 'idle' && !this.typedEdit.active) {
         this.overlayService.showPresetSwitched(target.name)
       }
       addRuntimeEvent('info', 'recorder', 'Cleanup preset switched by shortcut', { presetId, name: target.name })
@@ -441,6 +447,18 @@ export class RecorderOrchestrator {
   async init() {
     if (this.initialized) return
     this.initialized = true
+
+    this.typedEditListeners = await Promise.all([
+      bridge.listen('open-typed-edit', () => {
+        if (this.state === 'idle' && !this.startRecordingLock && !this.textInsertionInFlight
+          && !this.finalizingLateRunId && !this.timedOutProcessingContext && !this.pttSuppressed) {
+          this.activeFallbackToken = 0
+          void this.typedEdit.open()
+        }
+      }),
+      bridge.listen<TypedEditPayload>('typed-edit-submit', ({ payload }) => { void this.typedEdit.submit(payload) }),
+      bridge.listen<{ token: number }>('typed-edit-cancel', ({ payload }) => { this.typedEdit.cancel(payload.token) }),
+    ])
 
     startInsertionTargetTracking()
     await this.refreshRuntimeSettings()
@@ -607,6 +625,9 @@ export class RecorderOrchestrator {
   }
 
   cleanup() {
+    this.typedEdit.dispose()
+    this.typedEditListeners.forEach((remove) => remove())
+    this.typedEditListeners = []
     this.clearProcessingTimeout()
     this.micLevel.clearAutoCancelTimer()
     this.micLevel.invalidateProbes()
@@ -623,7 +644,7 @@ export class RecorderOrchestrator {
   }
 
   showAiEnabledToast(enabled: boolean) {
-    if (this.state === 'idle') this.overlayService.showAiCleanupToggled(enabled)
+    if (this.state === 'idle' && !this.typedEdit.active) this.overlayService.showAiCleanupToggled(enabled)
   }
 
   /** 仅更新当前润色模式（preset）的缓存值，无 IPC/热词/语言等全量刷新。
@@ -1397,6 +1418,7 @@ export class RecorderOrchestrator {
    * 「正在启动」忽略 —— 热键全部失灵直到重启，悬浮窗停在「等待中」，日志里一个字都没有。
    */
   private async startRecording() {
+    if (this.typedEdit.active) return
     try {
       await this.startRecordingInner()
     } catch (error) {
@@ -1462,7 +1484,9 @@ export class RecorderOrchestrator {
 
     // 先给用户即时视觉反馈；overlay 不聚焦，因此后续原生上下文捕获仍指向原目标窗口。
     // 首次 WebView 已在启动空闲期预热，正常情况下这里只剩一次轻量 show + emit。
-    this.overlayService.showWaiting()
+    this.overlayService.showWaiting(
+      this.provider.mode === 'local' ? t('overlay.loadingModel') : t('overlay.preparing'),
+    )
     // 不等待上下文捕获、Provider 建连或 AudioWorklet 初始化：提前拿到系统静音标志，
     // 好让第一帧 PCM 一到就能立刻裁决（标志本身不足以判定，见 pendingOsMicMuted）。
     void this.micLevel.checkConfiguredMicMuted(runId)
@@ -1638,7 +1662,9 @@ export class RecorderOrchestrator {
         startCapture(
           this.settings.micId || undefined,
           (buffer) => {
-            if (!this.isRunCurrent(runId)) return
+            // Capture can begin before the provider finishes loading. Only keep audio
+            // once the session is ready, matching the start sound and recording timer.
+            if (!this.isRunCurrent(runId) || this.state !== 'recording') return
             if (this.run.audioSentSamples === 0) {
               console.log('[ptt-diag] first onData buffer', {
                 byteLength: buffer.byteLength,
@@ -1650,7 +1676,7 @@ export class RecorderOrchestrator {
           },
           undefined,
           (pcmFrame) => {
-            if (!this.isRunCurrent(runId)) return
+            if (!this.isRunCurrent(runId) || this.state !== 'recording') return
             this.run.audioSentSamples += pcmFrame.length
             const bars = computeBarsFromPCM(pcmFrame, this.overlayWaveState, {
               barCount: this.overlayService.getBarCount(),
@@ -2023,6 +2049,7 @@ export class RecorderOrchestrator {
   // ── Toggle / hands-free ──
 
   private pttToggle(isHandsFree = false) {
+    if (this.typedEdit.active) return
     const now = Date.now()
     if (now - this.lastToggleTime < 500) {
       addRuntimeEvent('info', 'ptt', 'Ignored toggle request', {

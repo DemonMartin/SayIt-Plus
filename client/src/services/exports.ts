@@ -32,6 +32,7 @@ const SETTINGS_EXPORT_KEYS = [
   'selectedMic',
   'shortcutHandsFree',
   'shortcutToggleAi',
+  'shortcutTypedEdit',
   'shortcutKey',
   'shortcutPTT',
   'shortcutPTTCombo',

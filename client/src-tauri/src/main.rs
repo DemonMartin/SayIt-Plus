@@ -828,6 +828,9 @@ fn main() {
             commands::storage::history_set_favorite,
             // Window
             commands::window::present_overlay,
+            commands::window::focus_typed_edit,
+            commands::shortcuts::get_typed_edit_shortcut,
+            commands::shortcuts::set_typed_edit_active,
             commands::window::show_overlay,
             commands::window::hide_overlay,
             commands::window::update_overlay_state,

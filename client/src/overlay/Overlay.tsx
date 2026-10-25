@@ -5,6 +5,7 @@ import { isLocale, setLocale } from '@/i18n'
 import { useT } from '@/i18n/useT'
 import { addRuntimeEvent } from '../services/debugLog'
 import { formatRecordingTimer } from '../services/recorder/types'
+import TypedEditInput, { type TypedEditPhase } from './TypedEditInput'
 
 /**
  * `blank` 什么都不渲染，只在**隐藏窗口之前**用一下。
@@ -19,6 +20,7 @@ import { formatRecordingTimer } from '../services/recorder/types'
  * 视觉上没有代价：blank 连胶囊底色都不画，看起来就是"提示消失了"，本来隐藏就是这个样子。
  */
 type OverlayState =
+  | 'typed-edit'
   | 'blank'
   | 'waiting'
   | 'listening'
@@ -33,9 +35,13 @@ type RecordingVisualPhase = 'preparing' | 'listening'
 type OverlayWaveTheme = 'black-white' | 'black-blue' | 'black-rainbow'
 
 interface OverlayPayload {
+  typedEditToken?: number
+  typedEditPhase?: TypedEditPhase
+  typedEditError?: string
   state?: OverlayState
   bars?: number[]
   elapsedSec?: number
+  waitingMessage?: string
   theme?: OverlayWaveTheme
   showDuration?: boolean
   barCount?: number
@@ -114,9 +120,13 @@ export default function Overlay() {
   // 于是第一次真正显示悬浮窗时会先闪一下它 —— 和隐藏后残留旧提示是同一个毛病。
   // 没有状态就什么都不画，才是诚实的。
   const [state, setState] = useState<OverlayState>('blank')
+  const [typedEditToken, setTypedEditToken] = useState(0)
+  const [typedEditPhase, setTypedEditPhase] = useState<TypedEditPhase>('idle')
+  const [typedEditError, setTypedEditError] = useState('')
   const [recordingVisualPhase, setRecordingVisualPhase] = useState<RecordingVisualPhase>('preparing')
   const [bars, setBars] = useState<number[]>(IDLE_BARS)
   const [elapsedSec, setElapsedSec] = useState(0)
+  const [waitingMessage, setWaitingMessage] = useState('')
   const [theme, setTheme] = useState<OverlayWaveTheme>('black-blue')
   const [showDuration, setShowDuration] = useState(true)
   const [barCount, setBarCount] = useState(DEFAULT_BAR_COUNT)
@@ -205,6 +215,9 @@ export default function Overlay() {
 
     const handleOverlayState = (data: unknown) => {
       const payload = data as OverlayPayload
+      if (typeof payload.typedEditToken === 'number') setTypedEditToken(payload.typedEditToken)
+      if (payload.typedEditPhase) setTypedEditPhase(payload.typedEditPhase)
+      if (typeof payload.typedEditError === 'string') setTypedEditError(payload.typedEditError)
       if (typeof payload._overlayShowId === 'number') setPresentationId(payload._overlayShowId)
       // 语言先落地再渲染本帧：悬浮窗没有自己的初始化时机，语言只能随 payload 来。
       // setLocale 对同值是空操作，所以每帧都调也不会造成额外重渲染。
@@ -284,6 +297,7 @@ export default function Overlay() {
       }
       if (typeof payload.micSourceLabel === 'string') setMicSourceLabel(payload.micSourceLabel)
       if (payload.state === 'waiting') {
+        setWaitingMessage(payload.waitingMessage || '')
         setElapsedSec(0)
         setWarning('')
         setWarningTone('warn')
@@ -504,7 +518,9 @@ export default function Overlay() {
       {/* blank：一个子节点都不要（连胶囊底色都不画）。见 OverlayState 上的注释 ——
           它的整个用途就是让"隐藏前留在合成器里的那一帧"是空的。
           ⚠️ 别顺手给它补个占位元素，那就白做了。 */}
-      {state === 'blank' ? null : state === 'fallback' ? (
+      {state === 'blank' ? null : state === 'typed-edit' ? (
+        <TypedEditInput key={typedEditToken} token={typedEditToken} phase={typedEditPhase} error={typedEditError} />
+      ) : state === 'fallback' ? (
         <div
           data-overlay-content
           className="pointer-events-auto flex w-full max-w-[520px] flex-col rounded-xl border px-4 py-4"
@@ -709,7 +725,7 @@ export default function Overlay() {
               传到波形上（bars 的 min-w-0），胶囊本身始终保持完整的胶囊形状。
               用 100vw 而不是 max-w-full：父层宽度也是按内容算的，撑不出约束。 */}
           <div
-            className={`relative flex max-w-[calc(100vw-8px)] items-center overflow-hidden whitespace-nowrap rounded-full px-4 py-2${recordingPhase && recordingVisualPhase === 'preparing' ? ' overlay-pill-recording-waiting' : ''}${recordingPhase && recordingVisualPhase === 'listening' ? ' overlay-pill-recording-listening' : ''}`}
+            className={`relative flex max-w-[calc(100vw-8px)] items-center overflow-hidden whitespace-nowrap rounded-full px-4 py-2${recordingPhase && recordingVisualPhase === 'listening' ? ' overlay-pill-recording-listening' : ''}`}
             style={{ minHeight: '38px' }}
           >
             <span
@@ -726,10 +742,18 @@ export default function Overlay() {
                 className="overlay-recording-stage relative z-[1] min-w-0"
                 style={{ color: 'var(--overlay-text)' }}
               >
-                <div className="overlay-preparing-indicator" aria-hidden>
+                <div
+                  className="overlay-preparing-indicator"
+                  role="status"
+                  aria-hidden={visuallyListening}
+                >
+                  <span className="mr-1 text-xs" style={{ color: 'var(--overlay-text-dim)' }}>
+                    {waitingMessage || t('overlay.preparing')}
+                  </span>
                   {[0, 1, 2].map((index) => (
                     <span
                       key={index}
+                      aria-hidden
                       className="overlay-preparing-dot rounded-full"
                       style={{ animationDelay: `${index * 110}ms` }}
                     />

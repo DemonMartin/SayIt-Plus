@@ -177,13 +177,10 @@
   transform-origin: center;
 }
 
-.overlay-pill-recording-waiting .overlay-pill-surface {
-  clip-path: inset(0 calc(50% - 24px) 0 calc(50% - 24px) round 9999px);
-}
-
 .overlay-recording-stage {
   display: grid;
   align-items: center;
+  min-width: 7.5rem;
 }
 
 .overlay-preparing-indicator,

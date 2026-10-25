@@ -36,6 +36,7 @@ import AppPromptRulesSection from './AppPromptRulesSection'
 import PromptPresetSection from './PromptPresetSection'
 import { useT } from '@/i18n/useT'
 import { PageTitle } from '@/components/ui/info-tip'
+import { typedEditShortcutConflictsWith } from '@/lib/shortcutKeys'
 
 export default function AIInstructionsPage() {
   const t = useT()
@@ -92,6 +93,7 @@ export default function AIInstructionsPage() {
   // 预设之间的重复不在这里拦：handleSetPresetShortcut 会自动把旧的清掉（后设的赢）。
   const validatePresetShortcut = async (value: string): Promise<string | null> => {
     if (!value) return null
+    if (typedEditShortcutConflictsWith(await bridge.getTypedEditShortcut(), value)) return t('typedEdit.shortcutConflict')
     const ptt = await getSetting('shortcutPTT', 'AltRight') as string
     const handsFree = await getSetting('shortcutHandsFree', 'Alt+L') as string
     if (value === ptt) return t('aiInstructions.conflictPtt')

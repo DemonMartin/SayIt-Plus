@@ -12,6 +12,8 @@ pub const SHORTCUT_PTT: &str = "ControlRight";
 pub const SHORTCUT_HANDS_FREE: &str = "AltRight";
 /// AI 整理开关的快捷键。留空 = 不注册，避免升级时意外占用用户已有的全局组合键。
 pub const SHORTCUT_TOGGLE_AI: &str = "";
+/// Follow the recording shortcut, adding Shift, unless explicitly rebound.
+pub const SHORTCUT_TYPED_EDIT: &str = "auto";
 
 /// WebDAV 备份默认只含配置：录音库能有几个 GB，网盘有流量额度，默认打开等于替用户做了很贵的决定。
 pub const WEBDAV_INCLUDE_HISTORY: bool = false;

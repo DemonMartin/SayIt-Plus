@@ -41,6 +41,18 @@ export function close() {
 
 // ─── Overlay ───
 
+export function getTypedEditShortcut() {
+  return invoke<string>('get_typed_edit_shortcut')
+}
+
+export function setTypedEditActive(active: boolean) {
+  return invoke<void>('set_typed_edit_active', { active })
+}
+
+export function focusTypedEdit(token: number) {
+  return invoke<void>('focus_typed_edit', { token })
+}
+
 /**
  * Bug 003 diagnostic helper — log overlay IPC failures to runtime events
  * (which mirror to sayit.log via appendDebugLog).

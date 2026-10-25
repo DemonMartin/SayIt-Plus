@@ -7,7 +7,14 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
+
+// Renewed only while the text editor is open. Expiry prevents a crashed renderer disabling voice keys.
+static TYPED_EDIT_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
+
+pub fn set_typed_edit_active(active: bool) {
+    TYPED_EDIT_UNTIL_MS.store(if active { now_ms() + 30_000 } else { 0 }, Ordering::SeqCst);
+}
 
 // ── 健康监测埋点（悬浮窗/热键间歇性失效排查）──
 // 这些是进程级静态量，与具体某次 hook 实例无关，用于在钩子"悄悄失效"时留下痕迹：
@@ -648,6 +655,9 @@ struct PTTEvent {
 
 /// Shared state between the hook callback and the main thread
 struct HookSharedState {
+    typed_edit_vk_codes: Vec<u32>,
+    typed_edit_auto: bool,
+    typed_edit_consumed_vk: AtomicU32,
     ptt_vk_codes: Vec<u32>,
     ptt_setting: String,
     /// PTT 成员的已按下位图；只有位图首次达到 full_mask 才开始。
@@ -685,6 +695,7 @@ struct HookSharedState {
 #[cfg(windows)]
 #[allow(dead_code)]
 enum HookAction {
+    TypedEdit,
     PttDown { vk: u32, gen: u64 },
     PttUp { vk: u32, gen: u64, reason: &'static str },
     HfToggle { vk: u32 },
@@ -1342,6 +1353,14 @@ impl KeyboardHookManager {
         }
 
         let ptt_config = ptt_key_config(ptt_setting);
+        let storage = app.state::<crate::storage::Storage>();
+        let typed_setting = crate::commands::shortcuts::resolved_typed_edit_shortcut(&storage);
+        let typed_config = ptt_key_config(&typed_setting);
+        let typed_edit_vk_codes = if typed_config.setting == typed_setting {
+            typed_config.vk_codes
+        } else { vec![] };
+        let typed_edit_auto = storage.get("shortcutTypedEdit", None).as_str()
+            .unwrap_or(crate::defaults::SHORTCUT_TYPED_EDIT) == "auto";
         let hf_vk_codes = if is_single_key_setting(hf_setting) {
             vk_codes_for_setting(hf_setting)
         } else {
@@ -1362,6 +1381,9 @@ impl KeyboardHookManager {
             .collect();
 
         let state = Arc::new(HookSharedState {
+            typed_edit_vk_codes,
+            typed_edit_auto,
+            typed_edit_consumed_vk: AtomicU32::new(0),
             ptt_vk_codes: ptt_config.vk_codes,
             ptt_setting: ptt_config.setting,
             ptt_pressed_mask: AtomicU64::new(0),
@@ -1524,6 +1546,9 @@ impl KeyboardHookManager {
             crate::commands::system::write_log_line("[ptt-dispatcher] thread started");
             while let Ok(action) = action_rx.recv() {
                 match action {
+                    HookAction::TypedEdit => {
+                        let _ = dispatch_state.app_handle.emit("open-typed-edit", ());
+                    }
                     HookAction::Shutdown => break,
                     HookAction::Diag { vk, msg_name, flags, scan_code } => {
                         crate::commands::system::write_log_line(
@@ -1858,6 +1883,10 @@ unsafe extern "system" fn low_level_mouse_proc(
         return LRESULT(1);
     }
 
+    if TYPED_EDIT_UNTIL_MS.load(Ordering::SeqCst) > now_ms() {
+        return CallNextHookEx(None, n_code, w_param, l_param);
+    }
+
     let mut consumed = false;
 
     HOOK_STATE.with(|s| {
@@ -2058,6 +2087,9 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 HOOK_STATE.with(|s| {
                     if let Some(state) = s.borrow().as_ref() {
                         // 真实 HF down 的配对 up 偶尔会被远程桌面/驱动标成 synthetic。
+                        if state.typed_edit_consumed_vk.compare_exchange(vk, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                            consume_paired_up = true;
+                        }
                         // 即使不把它当作一次触发，也必须清掉按下状态，否则下一次真实按下
                         // 会被误认成 repeat 而没有反应。
                         if state.hf_vk_codes.contains(&vk) {
@@ -2093,6 +2125,41 @@ unsafe extern "system" fn low_level_keyboard_proc(
             if consume_paired_up {
                 return LRESULT(1);
             }
+            return CallNextHookEx(None, n_code, w_param, l_param);
+        }
+
+        // Text editing takes priority over recording when its chord includes the recording key.
+        // Only check the chord on member key events; never capture or poll ordinary typing.
+        let typed_consumed = HOOK_STATE.with(|s| {
+            let borrowed = s.borrow();
+            let Some(state) = borrowed.as_ref() else { return false; };
+            let consumed_vk = state.typed_edit_consumed_vk.load(Ordering::SeqCst);
+            if consumed_vk == vk {
+                if is_kup { state.typed_edit_consumed_vk.store(0, Ordering::SeqCst); }
+                return true;
+            }
+            if TYPED_EDIT_UNTIL_MS.load(Ordering::SeqCst) > now_ms() { return false; }
+            let matches = |required: u32, actual: u32| required == actual
+                || (state.typed_edit_auto && required == 0xA0 && actual == 0xA1);
+            if !is_kdown || !state.typed_edit_vk_codes.iter().any(|&key| matches(key, vk)) {
+                return false;
+            }
+            let complete = !state.typed_edit_vk_codes.is_empty()
+                && state.typed_edit_vk_codes.iter().all(|&key| {
+                    matches(key, vk) || is_ptt_member_physically_down(key)
+                        || (state.typed_edit_auto && key == 0xA0 && is_ptt_member_physically_down(0xA1))
+                });
+            if !complete { return false; }
+            state.typed_edit_consumed_vk.store(vk, Ordering::SeqCst);
+            HOOK_ACTION_TX.with(|tx| {
+                if let Some(sender) = tx.borrow().as_ref() {
+                    let _ = sender.send(HookAction::TypedEdit);
+                }
+            });
+            true
+        });
+        if typed_consumed { return LRESULT(1); }
+        if TYPED_EDIT_UNTIL_MS.load(Ordering::SeqCst) > now_ms() {
             return CallNextHookEx(None, n_code, w_param, l_param);
         }
 

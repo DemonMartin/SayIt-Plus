@@ -3,6 +3,49 @@ use tauri::{AppHandle, Emitter, State};
 use crate::keyboard::KeyboardHookManager;
 use crate::storage::Storage;
 
+pub fn resolved_typed_edit_shortcut(storage: &Storage) -> String {
+    let saved = storage.get("shortcutTypedEdit", None);
+    let setting = saved.as_str().unwrap_or(crate::defaults::SHORTCUT_TYPED_EDIT);
+    if setting != "auto" { return setting.to_string(); }
+    let saved_hf = storage.get("shortcutHandsFree", None);
+    let hf = saved_hf.as_str().filter(|s| !s.is_empty()).unwrap_or(crate::defaults::SHORTCUT_HANDS_FREE);
+    let mut codes: Vec<String> = hf.split('+').map(|part| match part {
+        "Control" | "Ctrl" | "CommandOrControl" => "ControlLeft".to_string(),
+        "Alt" => "AltLeft".to_string(),
+        "Shift" => "ShiftLeft".to_string(),
+        "Return" => "Enter".to_string(),
+        "Up" => "ArrowUp".to_string(),
+        "Down" => "ArrowDown".to_string(),
+        "Left" => "ArrowLeft".to_string(),
+        "Right" => "ArrowRight".to_string(),
+        key if key.len() == 1 && key.as_bytes()[0].is_ascii_alphabetic() => format!("Key{}", key.to_ascii_uppercase()),
+        key if key.len() == 1 && key.as_bytes()[0].is_ascii_digit() => format!("Digit{}", key),
+        key => key.to_string(),
+    }).collect();
+    // Mouse buttons cannot form keyboard chords. Keep a usable default in that case.
+    if codes.iter().any(|code| matches!(code.as_str(), "MButton" | "XButton1" | "XButton2")) {
+        return "ShiftLeft+AltRight".to_string();
+    }
+    if !codes.iter().any(|code| code.starts_with("Shift")) {
+        codes.insert(0, "ShiftLeft".to_string());
+    } else if !codes.iter().any(|code| code.starts_with("Control")) {
+        codes.insert(0, "ControlLeft".to_string());
+    } else {
+        codes.insert(0, "AltLeft".to_string());
+    }
+    codes.join("+")
+}
+
+#[tauri::command]
+pub fn get_typed_edit_shortcut(storage: State<Storage>) -> String {
+    resolved_typed_edit_shortcut(storage.inner())
+}
+
+#[tauri::command]
+pub fn set_typed_edit_active(active: bool) {
+    crate::keyboard::set_typed_edit_active(active);
+}
+
 #[tauri::command]
 pub fn set_escape_action_mode(mode: String, token: u64) -> Result<(), String> {
     crate::keyboard::set_escape_action_mode(&mode, token)
