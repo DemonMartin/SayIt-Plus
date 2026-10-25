@@ -85,6 +85,8 @@
   "overlay.failureNoRecording": "这次没有留下录音，需要重新说一次。",
   "overlay.liveCaption": "实时识别",
   "overlay.listening": "正在聆听…",
+  "overlay.preparing": "准备中",
+  "overlay.loadingModel": "加载模型中",
   "overlay.processing": "处理中",
   "overlay.genericError": "出错了",
   "overlay.warnLowVolume": "请靠近麦克风",

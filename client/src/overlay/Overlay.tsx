@@ -36,6 +36,7 @@ interface OverlayPayload {
   state?: OverlayState
   bars?: number[]
   elapsedSec?: number
+  waitingMessage?: string
   theme?: OverlayWaveTheme
   showDuration?: boolean
   barCount?: number
@@ -117,6 +118,7 @@ export default function Overlay() {
   const [recordingVisualPhase, setRecordingVisualPhase] = useState<RecordingVisualPhase>('preparing')
   const [bars, setBars] = useState<number[]>(IDLE_BARS)
   const [elapsedSec, setElapsedSec] = useState(0)
+  const [waitingMessage, setWaitingMessage] = useState('')
   const [theme, setTheme] = useState<OverlayWaveTheme>('black-blue')
   const [showDuration, setShowDuration] = useState(true)
   const [barCount, setBarCount] = useState(DEFAULT_BAR_COUNT)
@@ -284,6 +286,7 @@ export default function Overlay() {
       }
       if (typeof payload.micSourceLabel === 'string') setMicSourceLabel(payload.micSourceLabel)
       if (payload.state === 'waiting') {
+        setWaitingMessage(payload.waitingMessage || '')
         setElapsedSec(0)
         setWarning('')
         setWarningTone('warn')
@@ -709,7 +712,7 @@ export default function Overlay() {
               传到波形上（bars 的 min-w-0），胶囊本身始终保持完整的胶囊形状。
               用 100vw 而不是 max-w-full：父层宽度也是按内容算的，撑不出约束。 */}
           <div
-            className={`relative flex max-w-[calc(100vw-8px)] items-center overflow-hidden whitespace-nowrap rounded-full px-4 py-2${recordingPhase && recordingVisualPhase === 'preparing' ? ' overlay-pill-recording-waiting' : ''}${recordingPhase && recordingVisualPhase === 'listening' ? ' overlay-pill-recording-listening' : ''}`}
+            className={`relative flex max-w-[calc(100vw-8px)] items-center overflow-hidden whitespace-nowrap rounded-full px-4 py-2${recordingPhase && recordingVisualPhase === 'listening' ? ' overlay-pill-recording-listening' : ''}`}
             style={{ minHeight: '38px' }}
           >
             <span
@@ -726,10 +729,18 @@ export default function Overlay() {
                 className="overlay-recording-stage relative z-[1] min-w-0"
                 style={{ color: 'var(--overlay-text)' }}
               >
-                <div className="overlay-preparing-indicator" aria-hidden>
+                <div
+                  className="overlay-preparing-indicator"
+                  role="status"
+                  aria-hidden={visuallyListening}
+                >
+                  <span className="mr-1 text-xs" style={{ color: 'var(--overlay-text-dim)' }}>
+                    {waitingMessage || t('overlay.preparing')}
+                  </span>
                   {[0, 1, 2].map((index) => (
                     <span
                       key={index}
+                      aria-hidden
                       className="overlay-preparing-dot rounded-full"
                       style={{ animationDelay: `${index * 110}ms` }}
                     />

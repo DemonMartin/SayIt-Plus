@@ -289,7 +289,7 @@ export class OverlayService {
     } catch { /* 原生钩子不可用时不影响文本插入 */ }
   }
 
-  showWaiting() {
+  showWaiting(message = t('overlay.preparing')) {
     this.currentState = 'waiting'
     this.clearMicSourceHint()
     this.enterTransientState('off', 0)
@@ -297,6 +297,7 @@ export class OverlayService {
     void bridge.presentOverlay({
       state: 'waiting',
       elapsedSec: 0,
+      waitingMessage: message,
       ...this.getMicSourceHintPayload(),
       ...this.getCommonPayload(),
     })

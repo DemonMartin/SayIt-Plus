@@ -85,6 +85,8 @@
   "overlay.failureNoRecording": "No recording was kept this time, so you'll need to say it again.",
   "overlay.liveCaption": "Live",
   "overlay.listening": "Listening…",
+  "overlay.preparing": "Preparing",
+  "overlay.loadingModel": "Loading model",
   "overlay.processing": "Processing",
   "overlay.genericError": "Something went wrong",
   "overlay.warnLowVolume": "Move closer to the mic",

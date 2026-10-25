@@ -1462,7 +1462,9 @@ export class RecorderOrchestrator {
 
     // 先给用户即时视觉反馈；overlay 不聚焦，因此后续原生上下文捕获仍指向原目标窗口。
     // 首次 WebView 已在启动空闲期预热，正常情况下这里只剩一次轻量 show + emit。
-    this.overlayService.showWaiting()
+    this.overlayService.showWaiting(
+      this.provider.mode === 'local' ? t('overlay.loadingModel') : t('overlay.preparing'),
+    )
     // 不等待上下文捕获、Provider 建连或 AudioWorklet 初始化：提前拿到系统静音标志，
     // 好让第一帧 PCM 一到就能立刻裁决（标志本身不足以判定，见 pendingOsMicMuted）。
     void this.micLevel.checkConfiguredMicMuted(runId)
@@ -1638,7 +1640,9 @@ export class RecorderOrchestrator {
         startCapture(
           this.settings.micId || undefined,
           (buffer) => {
-            if (!this.isRunCurrent(runId)) return
+            // Capture can begin before the provider finishes loading. Only keep audio
+            // once the session is ready, matching the start sound and recording timer.
+            if (!this.isRunCurrent(runId) || this.state !== 'recording') return
             if (this.run.audioSentSamples === 0) {
               console.log('[ptt-diag] first onData buffer', {
                 byteLength: buffer.byteLength,
@@ -1650,7 +1654,7 @@ export class RecorderOrchestrator {
           },
           undefined,
           (pcmFrame) => {
-            if (!this.isRunCurrent(runId)) return
+            if (!this.isRunCurrent(runId) || this.state !== 'recording') return
             this.run.audioSentSamples += pcmFrame.length
             const bars = computeBarsFromPCM(pcmFrame, this.overlayWaveState, {
               barCount: this.overlayService.getBarCount(),
